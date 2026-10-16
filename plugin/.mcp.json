@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "umwelt": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/launch-umwelt-server.sh",
+      "args": []
+    }
+  }
+}

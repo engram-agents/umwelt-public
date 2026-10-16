@@ -1,0 +1,1875 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Umwelt — Web Render (M3)</title>
+<!-- Webrender Gadget Charter (docs/web-render/GADGETS.md #352): the first
+     externally-served stylesheet, linked BEFORE the inline block below so
+     the inline block's own (feature-level, content-only) rules can still
+     override on specificity ties if ever needed — see GADGETS.md §4. -->
+<link rel="stylesheet" href="gadgets.css">
+<style>
+  /* umwelt font-selection session (2026-07-21, Lei + Sol, tested against
+     this file's actual --gb-* dark palette): a 4-font type system,
+     self-hosted (no CDN — private-network app, no guaranteed runtime internet access).
+     Roles: Press Start 2P (owner-initial badges, unusable past ~2-3 chars
+     — no current anchor point, see .face-badge below), Silkscreen
+     (menu/buttons), VT323 (crossings + say/talk dialogue — the
+     most-read body text, stays legible small), Share Tech Mono
+     (everything else in the console log — replaces an earlier Pixelify
+     Sans candidate that was too hard to read at small system-log size). */
+  @font-face {
+    font-family: "Press Start 2P";
+    src: url("fonts/PressStart2P.ttf") format("truetype");
+    font-weight: normal;
+    font-style: normal;
+  }
+  @font-face {
+    font-family: "Silkscreen";
+    src: url("fonts/Silkscreen.ttf") format("truetype");
+    font-weight: normal;
+    font-style: normal;
+  }
+  @font-face {
+    font-family: "VT323";
+    src: url("fonts/VT323.ttf") format("truetype");
+    font-weight: normal;
+    font-style: normal;
+  }
+  @font-face {
+    font-family: "Share Tech Mono";
+    src: url("fonts/ShareTechMono.ttf") format("truetype");
+    font-weight: normal;
+    font-style: normal;
+  }
+  body {
+    font-family: system-ui, sans-serif;
+    background: #111;
+    color: #eee;
+    margin: 0;
+    padding: 1rem;
+    padding-right: 320px; /* room for the fixed crossings sidebar */
+  }
+  /* Silkscreen: menu/buttons (2026-07-21 font session) — a single global
+     `button` selector rather than enumerating every button id, so no
+     nav/menu-bar button is missed as new ones are added. */
+  button {
+    font-family: "Silkscreen", system-ui, sans-serif;
+  }
+  /* umwelt #301: the 320px reservation above is a DESKTOP assumption
+     baked into every viewport unconditionally — at a 390px phone width
+     it alone eats over 80% of the page, squeezing #controls (Enter/Look
+     included) into a sliver too narrow to lay out in one row, which is
+     what actually clipped it off-layout (not an overlap with the panel
+     itself — see #crossings-panel's own @media rule below for the other
+     half of this fix: the panel becomes a collapsible drawer instead of
+     an always-reserved 300px on narrow viewports, so the reservation it
+     needs shrinks along with it). */
+  @media (max-width: 640px) {
+    body { padding-right: 1rem; }
+  }
+  #controls {
+    margin-bottom: 1rem;
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    /* umwelt #301: let Enter/Look wrap onto its own line instead of
+       overflowing the viewport horizontally when the row doesn't fit.
+       Correction (reviewer-fairy catch on PR #308): this is NOT a no-op
+       above the 640px mobile breakpoint specifically — measured, it only
+       stops mattering above ~1150px (where #controls' own content width
+       plus body's unconditional 320px desktop reservation still fit on
+       one line); between ~640-1150px it DOES wrap onto 2-3 lines. That's
+       harmless (graceful degradation is exactly what flex-wrap is for),
+       just correcting the claim so a future maintainer doesn't read
+       "desktop" as "everything above 640px". Kept unconditional (not
+       gated to any one breakpoint) since it's safe everywhere it fires. */
+    flex-wrap: wrap;
+  }
+  #controls input { padding: 0.3rem; }
+
+  /* M3: identity bar — spectator-vs-logged-in state + login/logout. */
+  #identity-bar {
+    margin-bottom: 1rem;
+    padding: 0.5rem 0.75rem;
+    background: #1a1a1a;
+    border-radius: 4px;
+    display: flex;
+    gap: 0.6rem;
+    align-items: center;
+    font-size: 0.85rem;
+  }
+  #identity-bar button { padding: 0.25rem 0.6rem; }
+  #identity-status.identity-active { color: #2ecc71; font-weight: bold; }
+  #identity-status.identity-spectator { color: #999; }
+  /* umwelt#495 anti-silent-fail-open badge -- see the element's own
+     comment in the body for why this exists and stays up persistently. */
+  #identity-unverified-badge {
+    display: none;
+    color: #d9a441;
+    font-size: 0.75rem;
+    border: 1px solid #d9a441;
+    border-radius: 3px;
+    padding: 0.05rem 0.4rem;
+    margin-left: 0.4rem;
+  }
+  #identity-unverified-badge.shown { display: inline; }
+
+  /* umwelt#529: the human bell button — a plain identity-bar button (not a
+     gadget; #inbox-panel below is what uses the gadget system) with a
+     small count badge overlaid at its corner, same visual language as a
+     native app's notification bell. */
+  #inbox-bell-btn { position: relative; }
+  #inbox-badge {
+    position: absolute;
+    top: -0.4rem;
+    right: -0.4rem;
+    background: #e05050; /* matches gadgets.css's existing error/alert red */
+    color: #fff;
+    border-radius: 999px;
+    min-width: 1.1rem;
+    height: 1.1rem;
+    padding: 0 0.25rem;
+    font-size: 0.65rem;
+    line-height: 1.1rem;
+    text-align: center;
+    box-sizing: border-box;
+  }
+  #inbox-badge.hidden { display: none; }
+
+  /* umwelt#529/#539: the inbox panel's own content — the ggWindow chrome
+     (border/title/close) is gadgets.css's; this styles only what
+     renderInboxContent() builds inside it. */
+  .inbox-empty { color: #999; padding: 0.5rem 0; }
+  .inbox-section-label {
+    font-size: 0.8rem;
+    color: #999;
+    margin: 0.6rem 0 0.3rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  .inbox-section-label:first-child { margin-top: 0; }
+  .inbox-item {
+    padding: 0.4rem 0;
+    border-top: 1px solid #333;
+  }
+  .inbox-item:first-child { border-top: none; }
+  .inbox-item-header {
+    display: flex;
+    gap: 0.4rem;
+    align-items: baseline;
+    font-size: 0.8rem;
+    color: #999;
+  }
+  .inbox-item-sender { font-weight: bold; color: var(--gg-chrome-fg, #eee); }
+  .inbox-item-time { color: #999; }
+  .inbox-item-body { margin-top: 0.15rem; white-space: pre-wrap; }
+  #place-desc { color: #aaa; margin-bottom: 1rem; max-width: 60ch; }
+
+  /* umwelt #384 (Lei re-scope): a spectator session gets a login GATE
+     instead of the full street UI rendering behind an invisible auth
+     error. app.js's setGateActive() toggles body.gate-active; this block
+     hides #identity-bar/#app-shell and shows #login-gate. Default state
+     (no class) keeps the shell visible so a slow app.js load doesn't
+     flash the gate on top of it — app.js sets gate-active synchronously
+     at boot before session recovery even resolves (see its own comment). */
+  #login-gate {
+    display: none;
+    position: fixed;
+    inset: 0;
+    align-items: center;
+    justify-content: center;
+    background: #111;
+    z-index: var(--gg-z-window);
+  }
+  body.gate-active #identity-bar,
+  body.gate-active #app-shell {
+    display: none;
+  }
+  body.gate-active #login-gate {
+    display: flex;
+  }
+  #login-gate-box {
+    text-align: center;
+    /* narrow-viewport safety (PR #388 review): without a width bound the
+       three login buttons could force horizontal overflow at ~320px; let
+       them wrap inside a constrained box instead. */
+    max-width: min(320px, calc(100% - 2rem));
+    padding: 0 1rem;
+  }
+  #login-gate-box h1 {
+    font-family: "Silkscreen", system-ui, sans-serif;
+    font-size: 1.4rem;
+  }
+  /* Ariadne's colleague-pass catch on PR #605: h1 and the input text got
+     the pixel-font treatment, but the tagline, form labels, and the
+     forgot-password link declared no font-family at all and silently
+     fell back to body's system-ui/sans-serif -- exactly the plain
+     browser text Lei's spec ("only in our world pixel font style") was
+     asking NOT to ship. Silkscreen, matching h1/buttons (this file's own
+     font-system comment: "Silkscreen (menu/buttons)") -- these are UI
+     chrome, not read-heavy body text (which is VT323's role). */
+  #login-gate-box p,
+  #login-gate-form label,
+  #login-gate-forgot,
+  #login-gate-error {
+    font-family: "Silkscreen", system-ui, sans-serif;
+  }
+  #login-gate-error {
+    color: #e05050;
+    min-height: 1em;
+    margin-bottom: 0.5rem;
+  }
+  #login-gate-box button {
+    margin: 0 0.3rem;
+  }
+  /* umwelt#495: username/password form replacing the old hardcoded
+     three-name roster buttons -- same pixel-font world styling, typical
+     website login layout/functionality otherwise (Lei's own spec). */
+  #login-gate-form {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    text-align: left;
+  }
+  #login-gate-form label {
+    font-size: 0.8rem;
+    color: #aaa;
+    margin-bottom: 0.2rem;
+    display: block;
+  }
+  #login-gate-form input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.45rem 0.5rem;
+    font-family: "Share Tech Mono", monospace;
+    font-size: 0.95rem;
+    background: #1a1a1a;
+    color: var(--gb-lightest, #eee);
+    border: 1px solid var(--gb-light, #666);
+    border-radius: 4px;
+  }
+  #login-gate-form button[type="submit"] {
+    margin: 0.4rem 0 0;
+    padding: 0.5rem 0.9rem;
+    width: 100%;
+  }
+  #login-gate-forgot {
+    margin-top: 0.75rem;
+    font-size: 0.75rem;
+  }
+  #login-gate-forgot a {
+    color: #7fa8d9;
+  }
+
+  /* webrender-action-bar: a slim bar of GENERAL player actions (Look/Say
+     v0 — not thing-targeted; the interact-menu below already owns
+     thing-targeted talk/examine/use on avatars/things, umwelt #255/#267).
+     Placed ABOVE #street-frame, below the identity/controls bars and
+     place description — an ordinary in-flow block, so it automatically
+     respects body's `padding-right: 320px` crossings-sidebar reservation
+     without any extra width math, and never overlaps #street-banner
+     (a child of #street-frame, positioned below this bar). Buttons are
+     built in app.js from a small ACTIONS array, never hardcoded here. */
+  #action-bar {
+    margin-bottom: 0.75rem;
+    display: flex;
+    gap: 0.5rem;
+    /* umwelt #301 fast-follow (Kepler's live playtest, forum #267 reply
+       #4853): 8 buttons (the RPG action set, #307) overflow horizontally
+       at 390px instead of wrapping, same class of gap as #controls' own
+       pre-fix behavior. Same treatment. */
+    flex-wrap: wrap;
+  }
+  #action-bar button {
+    padding: 0.4rem 0.9rem;
+    background: var(--gb-dark);
+    color: var(--gb-lightest);
+    border: 1px solid var(--gb-light);
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  /* umwelt #321: the Say sub-view's emotion-picker row -- one button per
+     ACTIVE emotion (app.js builds these from `_EMOTION_EMOJI`, minus
+     "calm"). A plain horizontal flex row, consistent with the action-bar's
+     own button styling above; `.selected` gets a bright highlight so the
+     one picked emotion (if any) reads clearly against the rest. */
+  .emotion-picker {
+    display: flex;
+    gap: 0.3rem;
+  }
+  .emotion-picker button {
+    padding: 0.2rem 0.5rem;
+    background: var(--gb-dark);
+    color: var(--gb-lightest);
+    border: 1px solid var(--gb-light);
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 1rem;
+    line-height: 1;
+  }
+  .emotion-picker button.selected {
+    background: var(--gb-light);
+    border-color: var(--gb-lightest);
+  }
+  /* umwelt #386 (Lei's live ask, issue #386): shared sizing rule for the
+     two auto-growing composer textareas (action-bar Say, interact-menu
+     Talk) -- wraps, min-height ~3 comfortable lines, JS (app.js's
+     autoGrowComposer) grows the element up to max-height (~40% of the
+     viewport) and then this becomes an internal scrollbar. `resize: none`
+     because growth is automatic, not a manual drag-handle -- a resize
+     handle fighting the auto-grow JS on every keystroke reads as broken,
+     not spacious. No fixed pixel WIDTH here (mobile-friendly requirement)
+     -- width still comes from each surface's own `flex: 1` + max-width
+     rule above/below, unchanged from the pre-#386 input row shape. */
+  #composer textarea {
+    min-height: 4.5rem;
+    max-height: 40vh;
+    resize: none;
+    font-family: inherit;
+    font-size: 0.9rem;
+    line-height: 1.35;
+    /* PR #389 review r1: permanently auto (not JS-toggled) -- a cached
+       window.innerHeight in autoGrowComposer goes stale on rotate/resize
+       while the CSS 40vh cap keeps clamping, which could strand content
+       behind a "hidden" overflow until the next keystroke. Browsers only
+       paint the scrollbar when content actually overflows, so the cost of
+       always-auto is nil and the stale-toggle class of bug is gone. */
+    overflow-y: auto;
+  }
+  /* Subtle inline hint under each composer -- small muted text, per the
+     spec's "e.g. small muted text under the box" example. Shared class
+     (not per-surface) since the copy and styling are identical. */
+  .composer-hint {
+    flex-basis: 100%;
+    color: #999;
+    font-size: 0.7rem;
+    margin-top: -0.15rem;
+  }
+  /* umwelt #660: THE composer. One always-visible surface at the bottom of
+     the shell, replacing the two hidden ones this issue is about (the
+     action-bar Say row and the interact-menu Talk sub-view). The defect
+     underneath the task text was not that a channel picker was missing --
+     it was that the channel was chosen for you by WHICH WIDGET YOU HAPPENED
+     TO OPEN, with nothing on screen saying so. */
+  #composer {
+    position: sticky;
+    bottom: 0;
+    /* umwelt #936 (layout rule): the composer sits on the LOWEST layer of
+       the docked chrome, via the GADGETS.md §3 token (it was the literal 5,
+       the same value) -- so every surface that opens over it (interact
+       menu, ggWindows: --gg-z-window) wins by the token order, not by a
+       per-element fix. The inspect panel is the one fixed surface that
+       shares its edge; app.js lifts it onto the composer's top
+       (syncInspectPanelInset), and the selection chip docks INSIDE the
+       composer as its first row, so the inset already clears it. */
+    z-index: var(--gg-z-street);
+    margin-top: 0.75rem;
+    padding: 0.6rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: flex-start;
+    background: var(--gb-darkest, #0f380f);
+    border-top: 2px solid var(--gb-light);
+    /* The channel is legible WITHOUT INTERACTING (acceptance 2): this
+       border is the room/private tell, and it changes with state below. */
+  }
+  #composer textarea {
+    flex: 1;
+    min-width: 12rem;
+    padding: 0.4rem;
+    border-radius: 4px;
+    border: 1px solid var(--gb-light);
+    box-sizing: border-box;
+  }
+  #composer button {
+    padding: 0.4rem 0.9rem;
+    background: var(--gb-dark);
+    color: var(--gb-lightest);
+    border: 1px solid var(--gb-light);
+    border-radius: 4px;
+    cursor: pointer;
+    /* umwelt #386's rationale, unchanged: top-align against a grown box. */
+    align-self: flex-start;
+  }
+  /* The channel control. Room and Private are the only two -- there is no
+     world-broadcast option because there is no world-broadcast TRANSPORT
+     (Ariadne's #660 spec correction: a crossing's destination is always a
+     place). Rendering a third button that silently fell back to a room
+     send would put the bug INSIDE the safety feature. */
+  #composer-channel {
+    flex-basis: 100%;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.8rem;
+  }
+  #composer-channel button.selected {
+    background: var(--gb-light);
+    border-color: var(--gb-lightest);
+    font-weight: bold;
+  }
+  /* Private is DISABLED, not merely rejected at send, until a target
+     exists (acceptance 4) -- an unselectable control cannot be chosen
+     wrongly, whereas a send-time rejection teaches nothing until it is
+     already too late to have been reassuring. */
+  #composer-channel button[disabled] {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+  #composer-private-target { color: var(--gb-lightest); }
+  #composer-private-target.hidden,
+  #composer-private-clear.hidden,
+  #composer-emotions.hidden { display: none; }
+  /* umwelt #660's LOAD-BEARING requirement. The mistake this feature
+     exists to prevent is asymmetric: a room message sent privately is a
+     small annoyance; a private message sent to the room is not
+     recoverable. So the distinct treatment is on the PRIVATE state, it is
+     on the COMPOSER (visible while typing, not only after sending), and
+     it is loud rather than tasteful. */
+  #composer.private {
+    background: #2b1b3d;
+    border-top: 2px solid #c58cff;
+  }
+  #composer.private textarea {
+    border-color: #c58cff;
+    background: #1a1026;
+    color: #f3e8ff;
+  }
+  #composer.private #composer-private-target {
+    color: #e9d5ff;
+    font-weight: bold;
+  }
+  /* umwelt #321: Use's args sub-view -- same row shape as the composer
+     (span for the target name, then an input, then a button), not a
+     re-derived layout. */
+  /* umwelt #396 (client half): the dynamic parameter form, rendered into a
+     ggWindow from the engine's params_spec payload. No per-thing styling —
+     every rule here is generic over "a declared param", because the form's
+     whole point is that the client holds no form definitions of its own.
+     Sizing follows the composer's own scale (#386) rather than inventing a
+     third input tier. */
+  .params-form-row {
+    margin-bottom: 0.7rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+  .params-form-label {
+    font-size: 0.8rem;
+    color: var(--gb-lightest);
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    /* An author-controlled param name is length-capped server-side but can
+       still be a single long unbroken token — wrap it rather than letting
+       it widen the window past its max. */
+    overflow-wrap: anywhere;
+  }
+  .params-form-required { color: #e0a050; }
+  .params-form-input {
+    width: 100%;
+    padding: 0.4rem;
+    font-family: inherit;
+    font-size: 0.9rem;
+    background: #1a1a1a;
+    color: var(--gb-lightest);
+    border: 1px solid var(--gb-light);
+    border-radius: 4px;
+  }
+  .params-form-input--error { border-color: #e05050; }
+  .params-form-help {
+    font-size: 0.65rem;
+    line-height: 1;
+    padding: 0.1rem 0.3rem;
+    background: #222;
+    color: var(--gb-light);
+    border: 1px solid #444;
+    border-radius: 50%;
+    cursor: pointer;
+  }
+  /* Collapsed by default; the `?` toggles it. Not a native title= tooltip,
+     which is unreachable on touch — this world gets used from a Chromebook
+     and a phone. */
+  .params-form-desc {
+    display: none;
+    font-size: 0.75rem;
+    color: #999;
+    overflow-wrap: anywhere;
+  }
+  .params-form-desc--open { display: block; }
+  .params-form-error {
+    color: #e05050;
+    font-size: 0.8rem;
+    margin-bottom: 0.6rem;
+    overflow-wrap: anywhere;
+  }
+  .params-form-run-row { margin-top: 0.4rem; }
+
+  #action-bar-use {
+    margin-bottom: 0.75rem;
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+  }
+  #action-bar-use.hidden { display: none; }
+  #action-bar-use-target { font-weight: bold; }
+  #action-bar-use input {
+    flex: 1;
+    max-width: 320px;
+    padding: 0.4rem;
+    border-radius: 4px;
+    border: 1px solid var(--gb-light);
+    box-sizing: border-box;
+  }
+  #action-bar-use button {
+    padding: 0.4rem 0.9rem;
+    background: var(--gb-dark);
+    color: var(--gb-lightest);
+    border: 1px solid var(--gb-light);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  /* umwelt #240 street-view FRAME: a horizontal "street" replaces the old
+     CSS-grid-of-rectangles. Game Boy 4-green monochrome for the NEW street
+     chrome (frame/banner/road background, CSS-drawn doors/signs) — this is
+     new UI chrome introduced by this PR, not a recolor of existing sprite/
+     thing/avatar visuals, which stay exactly as M0-M3 already render them
+     (reused unchanged per the design's own instruction). */
+  :root {
+    --gb-darkest: #0f380f;
+    --gb-dark: #306230;
+    --gb-light: #8bac0f;
+    --gb-lightest: #9bbc0f;
+  }
+  #street-frame {
+    background: var(--gb-darkest);
+    border: 3px solid var(--gb-light);
+    border-radius: 6px;
+    width: max-content;
+    max-width: 100%;
+    overflow: hidden;
+  }
+  #street-banner {
+    background: var(--gb-dark);
+    color: var(--gb-lightest);
+    padding: 0.4rem 0.75rem;
+    font-size: 0.9rem;
+    letter-spacing: 0.03em;
+    display: flex;
+    gap: 0.4rem;
+    align-items: baseline;
+    border-bottom: 2px solid var(--gb-light);
+  }
+  #place-label { font-weight: bold; }
+  /* Static, non-user-controlled connector text via ::before — the dynamic
+     count itself is still set via textContent in app.js (requirement 6). */
+  #present-count::before { content: "— "; }
+  /* umwelt street (forum #267 reply 79, GMUD queue item 1+2; rebanded from
+     two lanes to three by umwelt #283, per team discussion with
+     Borges/Kepler): #street is the SHARED horizontal-scroll container for
+     three stacked flex rows — #street-sky (top), #street-land (middle —
+     doors + land-lane things), #street-road (bottom — road-lane things +
+     avatars) — rather than a single flex row holding everything. Sharing
+     one scroll container keeps all three bands horizontally aligned while
+     scrolling (all three rows scroll together, one scrollbar). `position:
+     relative` so #street is the common offsetParent for every band's items
+     AND for `.avatar-cursor` below — see app.js's updateCursorPosition,
+     which measures a cursor-target upper-lane item's `offsetLeft` and
+     applies it directly to the self-avatar cursor's `left`, relying on
+     both being measured against the same coordinate origin. */
+  #street {
+    position: relative;
+    /* umwelt #341 (Lei's live walk, 2026-07-24), round 2: the three bands
+       must share ONE width — the widest lane's — while #street REMAINS the
+       horizontal scroll container. Round 1 (`width: max-content` on
+       #street) made the bands share a width but sized #street to its own
+       content, so `overflow-x: auto` below went structurally inert
+       (clientWidth === scrollWidth always) and #street-frame's
+       `overflow: hidden` silently clipped long lanes with no scroll
+       affordance — caught by a reviewer-fairy headless-Chromium
+       measurement, invisible to string-presence tests. The grid form gets
+       both properties at once: a SINGLE `max-content` column track is
+       sized by the WIDEST band, and every band stretches to that shared
+       track, so all three backgrounds tile edge-to-edge together (this
+       also subsumes #322's per-band concern); each band keeps
+       `min-width: 100%` so a sparse scene still fills the visible frame.
+       (Measured, not assumed: `minmax(100%, max-content)` was tried first
+       and Chromium resolved the track to the percentage MINIMUM — bands
+       stayed viewport-width and overflowed; the plain `max-content` track
+       + per-band min-width is the empirically-verified form, via the
+       headless-Chromium harness in the PR record.) #street's own width
+       stays viewport-clamped, so a wide track overflows INSIDE #street
+       and `overflow-x: auto` scrolls it, exactly as before #341. */
+    display: grid;
+    grid-template-columns: max-content;
+    /* Lane seams (Kepler's GAME DAY charge, forum #267 reply #4827,
+       item 4): was `gap: 8px`, which read as a flat grey stripe cutting
+       the scene into three visibly separate strips regardless of what
+       each band's own background paints (place-lane-tiles, #296). Bands
+       now sit flush — zero gap — and the transition between them is
+       carried by the inset box-shadow blend on #street-sky/#street-land
+       below instead of a hard seam line, so the treatment still reads
+       right once real per-lane tile art lands (a shadow blends over any
+       background layer; a gap doesn't). */
+    gap: 0;
+    padding: 12px 16px;
+    /* Sparse-frame rule (design req. 5): a quiet street with one avatar and
+       nothing else must still read as a composed scene, not a floating
+       item — the fixed min-heights on the bands below + a legible road
+       surface give the frame a "road" shape even when nearly empty.
+       Road surface (2026-07-19, Lei's eye-strain note on the original
+       tight-period high-contrast striped gradient): swapped to a flat
+       light-grey, per Kepler's relayed "try blank/light-grey first" —
+       tactical fix ahead of the fuller swappable-theme-spec Borges is
+       doing for the pixel-art pipeline (which will make this a real
+       theme choice, not a hardcoded value). */
+    box-sizing: border-box;
+    overflow-x: auto;
+    overflow-y: hidden;
+    white-space: nowrap;
+    background: #c8c8c8;
+    transition: opacity 0.15s ease;
+  }
+  #street.loading { opacity: 0.4; }
+  /* Three bands (umwelt #283 — replaces the old #street-upper/#street-lower
+     two-lane layout with sky/land/road, driven by each item's own `lane`
+     field — see app.js's render()). Sky and land keep the old upper-lane
+     visual treatment (bottom-aligned, taller min-height — a door element is
+     taller than a plain .item, door-shape + roof accent + margin-top, see
+     .door/.door-shape below); road keeps the old lower-lane treatment
+     (vertically centered — avatars are plain 48px circles with no
+     roof-accent asymmetry). Sky is new with #283 and empty in every scene
+     until something opts into lane='sky' — same min-height as land so an
+     empty sky band doesn't collapse to zero height and look broken.
+
+     umwelt #322 → #341: a band's own box is where its place-lane-tiles
+     background paints (app.js's render(), backgroundImage/backgroundRepeat
+     set on the band element) — so the box must span the full scrollable
+     content width, or tiles stop at the visible edge while items keep
+     flowing past (#322's original bug). #322's fix put `width: max-content;
+     min-width: 100%` on each band, but that resolved PER BAND — a short
+     lane's background stopped at its own row beside a longer sibling
+     (#341, Lei's live walk). Both properties now come from #street's grid
+     (see its rule above): the single `max-content` column track is sized
+     by the WIDEST band, and every band, as a grid item with auto width,
+     stretches to that shared track — full-content-width backgrounds (per
+     #322) AND one shared width across all three lanes (per #341); each
+     band keeps only `min-width: 100%` for the sparse-scene case. */
+  #street-sky {
+    min-width: 100%;
+    display: flex;
+    align-items: flex-end;
+    gap: 10px;
+    min-height: 78px;
+    /* Lane seam blend (see #street's gap:0 comment above): a soft inset
+       shadow along the bottom edge, using the frame's own dark-green
+       tone rather than a neutral black, so it reads as "this band's own
+       shadowed horizon" instead of a generic drop-shadow — works over a
+       flat fallback color today and over a real tile background once
+       place-lane-tiles art lands, unlike the old hard gap line. */
+    box-shadow: inset 0 -10px 8px -8px rgba(15, 56, 15, 0.35);
+  }
+  /* Land: back-door + land-lane things + exits, in that order (see app.js's
+     render() — unchanged ordering logic from the old #street-upper, only
+     re-targeted at this row and now filtered to land-lane things).
+     width: shared grid track — see the umwelt #322→#341 note on
+     #street-sky above; no per-band width declarations. */
+  #street-land {
+    min-width: 100%;
+    display: flex;
+    align-items: flex-end;
+    gap: 10px;
+    min-height: 78px;
+    /* Same seam-blend treatment as #street-sky above, for the land/road
+       boundary. */
+    box-shadow: inset 0 -10px 8px -8px rgba(15, 56, 15, 0.35);
+  }
+  /* Road: avatars + road-lane things together (the old #street-lower).
+     NOTE: `.avatar-cursor` is appended to #street, not this band — #street
+     (position: relative, see its rule above) is the offsetParent for the
+     cursor and for app.js's updateCursorPosition/updateAvatarOverlaps
+     math (see their docstrings). This band's `position: relative` is for
+     its own children's stacking/backgrounds.
+     width: shared grid track — see the umwelt #322→#341 note on
+     #street-sky above; no per-band width declarations. #street's
+     own box (the real offsetParent) is untouched by this change, so
+     cursor/overlap positioning math is unaffected. */
+  #street-road {
+    min-width: 100%;
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 56px;
+  }
+
+  .item {
+    position: relative;
+    flex: 0 0 auto;
+    width: 64px;
+    height: 64px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    text-align: center;
+    overflow: hidden;
+    padding: 2px;
+    box-sizing: border-box;
+  }
+  /* umwelt #257: a thing/avatar's name, wrapped onto up to 2 lines instead
+     of clipped mid-character at 1 line — split into its own element (rather
+     than styled directly on .item) so .item's flex-centering keeps working
+     for the sprite-wrap/face-badge/emotion-bubble/marker overlay children too. */
+  .item-label {
+    font-size: 0.6rem;
+    /* #street sets white-space: nowrap for its own horizontal-scroll
+       layout — inherited by every descendant unless overridden here.
+       Without this reset, -webkit-line-clamp has nothing to clamp: text
+       never wraps past 1 line in the first place (caught live, reviewer-
+       fairy screenshot on PR #263 — invisible from reading the CSS alone,
+       same class of bug as #256's negative-offset badge clip). */
+    white-space: normal;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    word-break: break-word;
+    line-height: 1.15;
+  }
+  /* 2026-07-25, Lei's live feedback: an avatar's sprite was sharing the
+     64x64 box with .item-label as flex-row siblings (the default .item
+     flex layout above), so the sprite rendered at roughly half its
+     intended size to make room for the label text next to it. Avatars
+     only (not things — .item.thing keeps the original inline label,
+     unchanged) get the label pulled OUT of the flex flow and overlaid as
+     an absolutely-positioned strip at the bottom, so .sprite-wrap/
+     .sprite-img can use the entire box. Safe only because .item.avatar
+     already sets `overflow: visible` above (the emotion-bubble rule) —
+     an absolute bottom:0 child would otherwise clip against
+     .item.thing's `overflow: hidden`. Paired with app.js's
+     avatarDisplayName() shortening "sol's avatar" -> "Sol" so a single
+     short line fits without needing the 2-line wrap things still get. */
+  .item.avatar .item-label {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    margin: 0;
+    padding: 1px 2px;
+    background: rgba(0, 0, 0, 0.55);
+    -webkit-line-clamp: 1;
+    text-align: center;
+    pointer-events: none;
+  }
+  /* umwelt #239: avatars are click-to-inspect too now — same pointer
+     affordance as .item.thing below, so it's visually obvious both are
+     clickable. */
+  .item.avatar { border-radius: 50%; cursor: pointer; overflow: visible; }
+  .item.thing { cursor: pointer; }
+  /* umwelt #240 requirement 2: the caller's own avatar gets a distinct
+     highlighted treatment, but stays one entry within .avatars — never a
+     second body drawn twice. */
+  .item.avatar.self {
+    outline: 3px solid var(--gb-lightest);
+    box-shadow: 0 0 8px 2px var(--gb-lightest);
+  }
+  /* Keyboard controls: the player cursor. `.self` avatar (above) stops
+     flowing as a normal road-band item and is instead positioned
+     absolutely (app.js's updateCursorPosition), tracking whichever
+     upper-lane item the cursor currently targets. Only ever applied to the
+     avatar whose `a.agent === state.identity` — every OTHER avatar stays
+     exactly where its own `lane`-routed band's normal flex flow puts it
+     (umwelt #283). */
+  .item.avatar.avatar-cursor {
+    position: absolute;
+    transition: left 0.12s ease, top 0.12s ease;
+    z-index: 5;
+  }
+  /* umwelt #275: avatars piling up (self-cursor landing on top of one or
+     more other avatars when the Square is busy) used to read as "stuck /
+     colliding" purely because same-size opaque circles overlap with
+     nothing distinguishing an intentional overlap from a broken sprite.
+     There is no occupancy/collision-blocking logic anywhere in this
+     codebase to remove (app.js's updateAvatarOverlaps is pure rendering-
+     legibility, no server/db change) — Lei's #275 scoping: "for now, just
+     allow multiple avatars to stand and go across each other is a quick
+     fix". `.avatar-overlapping` (self) keeps the self-cursor the most
+     prominent element — it already sits above every other avatar via
+     `z-index: 5` and keeps its `.self` outline/glow untouched; this just
+     adds a brighter glow so an overlap still reads as "you, on top of
+     others" rather than a plain pile. `.avatar-overlapped` (every OTHER
+     avatar currently under the self-cursor) dims + gets a dashed divider
+     outline instead of the solid `.self` one, so the pile reads as
+     "several avatars sharing a spot" — never `pointer-events: none` or
+     `display: none`, so overlapped avatars stay clickable per the spec.
+     Round-2 fix (live-render finding, same issue #275): opacity + dashed
+     outline are NOT sufficient on their own. `cursorIndex` starts at 0 on
+     every fresh place-entry (clampCursor), and the self-cursor's `left` is
+     derived directly from the targeted upper-lane item's `offsetLeft`
+     (updateCursorPosition) — so whenever another avatar's flex position in
+     #street-road happens to land under that same x (the common case, not
+     an edge case), the self-cursor's rect and the overlapped avatar's rect
+     are PIXEL-IDENTICAL. A same-size, fully-opaque circle sitting exactly
+     on top of another erases any opacity/outline styling on the one
+     underneath — verified live via Playwright: `getComputedStyle` reported
+     the dimmed opacity + dashed outline correctly, but the two
+     `getBoundingClientRect()`s matched exactly, so the styling had zero
+     visible effect. `transform: translate(...)` sidesteps this because it
+     repaints the overlapped avatar's box away from the self-cursor's rect
+     without touching layout (no reflow, no effect on flex-neighbor
+     spacing) — a horizontal-only nudge, not vertical, because #street sets
+     `overflow-y: hidden` for its own two-lane framing (see #street above)
+     and a vertical push risks getting visually clipped there, whereas
+     #street's `overflow-x: auto` tolerates a horizontal one safely. Only
+     ever applied to the OTHER avatar(s); the self-cursor itself is left
+     exactly where updateCursorPosition puts it. Because only the
+     self-cursor is absolutely-positioned and every other avatar is a
+     static flex child, two non-self avatars never overlap each other today
+     — so one fixed offset, applied uniformly to every element currently
+     carrying this class, is enough even when self straddles more than one
+     neighbor at once; no per-avatar-pair dynamic math needed.
+     umwelt #283/#293 fold-in: `updateAvatarOverlaps()` toggles this class
+     onto ANY overlapping child of the road band, not just avatars — road-
+     lane things can occlude the self-cursor too now. The selector below
+     was `.item.avatar.avatar-overlapped` (avatar-only), so a road-thing
+     got the class with zero visual effect — worse than the original bug,
+     since a thing has no `.self`/z-index prominence to fall back on and
+     would vanish under the self-cursor with no cue at all. Generalized to
+     `.item.avatar-overlapped` (drop the `.avatar` requirement) — safe,
+     because this class only ever lands on `#street-road`'s children, the
+     same scope the JS already restricts itself to. */
+  .item.avatar-overlapped {
+    opacity: 0.55;
+    outline: 2px dashed var(--gb-dark);
+    outline-offset: -2px;
+    transform: translateX(-14px);
+  }
+  .item.avatar.avatar-cursor.avatar-overlapping {
+    box-shadow: 0 0 12px 4px var(--gb-lightest);
+  }
+  /* The upper-lane item the cursor currently targets — Enter's target is
+     unambiguous. A dashed outline (not a solid one) distinguishes "cursor
+     target" from `.item.avatar.self`'s solid outline above, since both
+     could in principle render at once during a keyboard walk-through. */
+  .cursor-target {
+    outline: 3px dashed var(--gb-lightest);
+    outline-offset: 2px;
+  }
+
+  /* umwelt #240: houses/doors — the back-door (scene.parent, always at the
+     fixed leftmost edge of the street) and forward exits (scene.exits,
+     server-sorted) share this same visual. Still a real <button> (native
+     keyboard/tap semantics — Leona's thumb is the design target) restyled
+     as a door+sign rather than a text link; click still calls navigateTo
+     unchanged (requirement 1). */
+  .door {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
+    background: none;
+    border: none;
+    padding: 0;
+    margin-top: 10px; /* room for the decorative roof accent above */
+    cursor: pointer;
+    font: inherit;
+    color: inherit;
+  }
+  .door-shape {
+    width: 40px;
+    height: 48px;
+    background: var(--gb-light);
+    border: 2px solid var(--gb-darkest);
+    border-radius: 4px 4px 0 0;
+    position: relative;
+    overflow: hidden; /* clips .door-sprite-img to the shape's rounded top */
+  }
+  /* 2026-07-24 world-finishing sprint: place-marker sprite (forum #277) —
+     fills the same footprint the flat background color used, on top of it
+     (so a not-yet-loaded/broken image still shows the door silhouette
+     underneath, never a blank box). */
+  .door-sprite-img {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+  .door-shape::before {
+    /* Purely decorative peaked-roof accent — no text, no user input. */
+    content: "";
+    position: absolute;
+    top: -10px;
+    left: -4px;
+    right: -4px;
+    height: 12px;
+    background: var(--gb-darkest);
+    clip-path: polygon(50% 0%, 0% 100%, 100% 100%);
+  }
+  /* The back-door gets a visually distinct (lighter) door face so it reads
+     as "the way back" at a glance, on top of its fixed-edge position. */
+  .door-back .door-shape { background: var(--gb-lightest); }
+  .door-sign {
+    /* umwelt #257: 2-line wrap (was 1-line ellipsis-clip) — same treatment
+       as .item-label above, same 40-char-name motivation. Same
+       white-space: normal reset is required here too -- #street's
+       nowrap is inherited here as well. */
+    max-width: 84px;
+    font-size: 0.55rem;
+    color: var(--gb-lightest);
+    background: var(--gb-darkest);
+    border: 1px solid var(--gb-light);
+    border-radius: 2px;
+    padding: 1px 4px;
+    white-space: normal;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    word-break: break-word;
+    line-height: 1.2;
+  }
+
+  /* M2: real sprites (falls back to the plain .item background above when
+     sprite_ref is null — see app.js's render()). */
+  .sprite-wrap { position: relative; width: 100%; height: 100%; }
+  .sprite-img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+  }
+  .sprite-tint {
+    position: absolute;
+    inset: 0;
+    opacity: 0.5;
+    mix-blend-mode: color;
+    pointer-events: none;
+  }
+  .marker {
+    position: absolute;
+    bottom: 1px;
+    right: 2px;
+    font-size: 0.55rem;
+    font-weight: bold;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.55);
+    padding: 0 2px;
+    border-radius: 2px;
+    line-height: 1.2;
+    pointer-events: none;
+  }
+
+  /* umwelt #240 fast-follow (forum #267 #4779): ambient emotion face badge
+     on each avatar's street sprite — a small corner overlay, opposite
+     corner from `.marker` above (things only) so the two overlay families
+     never visually collide. Every `.face-*` rule below is a pure geometric
+     shape selection (eyes + mouth pseudo-shapes via plain <span>s) — NO
+     text is ever placed inside `.face-badge` or its children; see app.js's
+     buildFaceElement for the security invariant this enforces. GB-palette
+     colors only (the same `--gb-*` variables the street chrome already
+     uses), so the badge reads as part of this UI's established visual
+     language rather than a foreign sprite style. */
+  .face-badge {
+    /* top/right: 1px, not a negative offset — `.item` (the badge's
+       positioning parent) has `overflow: hidden` (its own clip for
+       sprite/marker content), so a badge positioned partially OUTSIDE the
+       parent's box gets silently clipped to a barely-visible sliver
+       (caught via an actual rendered screenshot during review — a
+       negative offset here is invisible in code review, only in a live
+       render). Keeping the badge fully inside the parent's padding-box
+       makes the whole 18px circle render, not a crescent.
+       Note (kepler #267): `.item.avatar` overrides to `overflow: visible`
+       so the #267 emoji bubble can escape above the head — but the face-
+       badge is unaffected, because it sits fully INSIDE the box via its
+       own top:1px/right:1px placement (it never relied on the parent
+       clip; it stayed inside by geometry, not by clipping). */
+    position: absolute;
+    top: 1px;
+    right: 1px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--gb-lightest);
+    border: 1.5px solid var(--gb-darkest);
+    box-sizing: border-box;
+    pointer-events: none;
+  }
+  .face-badge .eye {
+    position: absolute;
+    width: 2.5px;
+    height: 2.5px;
+    border-radius: 50%;
+    background: var(--gb-darkest);
+    top: 6px;
+  }
+  .face-badge .eye-l { left: 4px; }
+  .face-badge .eye-r { right: 4px; }
+  .face-badge .mouth {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--gb-darkest);
+  }
+
+  /* neutral: flat mouth, plain round dot eyes (also the shape reused, at a
+     hash-derived tint, by the unrecognized-emotion fallback below). */
+  .face-neutral .mouth {
+    width: 8px;
+    height: 1.5px;
+    bottom: 4px;
+    border-radius: 1px;
+  }
+
+  /* happy: upward smile arc (rounded bottom border, no fill). */
+  .face-happy .mouth {
+    width: 8px;
+    height: 4px;
+    bottom: 3px;
+    background: none;
+    border: 0 solid transparent;
+    border-bottom: 1.5px solid var(--gb-darkest);
+    border-radius: 0 0 8px 8px;
+  }
+
+  /* sad: downward frown arc — same construction as happy, flipped. */
+  .face-sad .mouth {
+    width: 8px;
+    height: 4px;
+    bottom: 2px;
+    background: none;
+    border: 0 solid transparent;
+    border-top: 1.5px solid var(--gb-darkest);
+    border-radius: 8px 8px 0 0;
+  }
+
+  /* surprised: bigger round eyes + an open "O" mouth (ring, no fill) —
+     the most visually distinct silhouette of the set, on purpose. */
+  .face-surprised .eye { width: 3.5px; height: 3.5px; }
+  .face-surprised .mouth {
+    width: 4px;
+    height: 4px;
+    bottom: 3px;
+    background: none;
+    border-radius: 50%;
+    border: 1.5px solid var(--gb-darkest);
+  }
+
+  /* thinking: one eye raised (asymmetric "eyebrow" read) + a short tilted
+     mouth line — distinct from neutral's perfectly flat/symmetric face. */
+  .face-thinking .eye-l { top: 4px; }
+  .face-thinking .mouth {
+    width: 7px;
+    height: 1.5px;
+    bottom: 4px;
+    border-radius: 1px;
+    transform: translateX(-50%) rotate(-18deg);
+  }
+
+  /* asleep: closed eyes (flat dashes instead of round dots) + a small flat
+     mouth — the only face in the set with no round eyes at all. */
+  .face-asleep .eye {
+    width: 4px;
+    height: 1.5px;
+    border-radius: 1px;
+    top: 7px;
+  }
+  .face-asleep .mouth {
+    width: 5px;
+    height: 1.5px;
+    bottom: 4px;
+    border-radius: 1px;
+  }
+
+  /* fallback (unrecognized/garbage emotion string): the same flat-mouth,
+     round-eye neutral SHAPE as .face-neutral — deliberately, so the
+     fallback reads as "a mood, unreadable" rather than inventing a 7th
+     recognized-looking expression — but a dashed badge border plus a
+     hash-derived (app.js's fallbackFaceColor) badge fill color, so a
+     street-walker can tell "this is a KNOWN mood" (solid GB-lightest
+     badge) from "this is unrecognized" (dashed badge, off-palette tint) at
+     a glance. The fill color itself is set inline from app.js — numbers
+     only, never the raw emotion string. */
+  .face-fallback {
+    border-style: dashed;
+  }
+  .face-fallback .mouth {
+    width: 8px;
+    height: 1.5px;
+    bottom: 4px;
+    border-radius: 1px;
+  }
+
+  /* Emotion emoji bubble (kepler #267) — rendered above each avatar's head
+     at readable street scale (the #256 face-badge alone is sub-pixel there).
+     Option A placement: .item.avatar has overflow:visible so the bubble
+     can extend above the circle. GB-palette border via existing --gb-*
+     variables, soft shadow, sized so the emoji reads at street scale. The
+     bubble's textContent is a fixed emoji literal from app.js's closed
+     _EMOTION_EMOJI map (or the fixed fallback for unrecognized emotions)
+     — never the raw emotion string (§12.10). Exact offsets and sizing
+     set during live-render pass; final above-the-head placement is gated
+     on a live-render screenshot at review. */
+  .emotion-bubble {
+    position: absolute;
+    top: -22px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 28px;
+    height: 28px;
+    border-radius: 14px;
+    background: var(--gb-lightest);
+    border: 1.5px solid var(--gb-darkest);
+    box-sizing: border-box;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    line-height: 1;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+    pointer-events: none;
+  }
+
+  #error { color: #e05050; margin-top: 0.5rem; min-height: 1em; }
+
+  /* umwelt #259 → #351 (GADGETS.md §7.3's predicted migration order):
+     #console is now a `screen`-anchored gg-window instance instead of an
+     in-flow block — chrome (background/border/border-radius/position/
+     z-index/`.hidden` handling) comes from gadgets.css's `.gg-window`/
+     `.gg-window--screen`/`.gg-hidden` classes (applied directly on this
+     element in the body markup below), NOT from this rule. This id-scoped
+     rule supplies only THIS instance's own screen position/size —
+     GADGETS.md §3's `screen(pos)` anchor mode is per-instance by design
+     (every window needs its own corner/size, which can't live in the
+     shared gadgets.css class) — same established precedent as
+     #interact-menu's own fixed left/right/bottom values further below.
+     Bottom-LEFT (judgment call, flagged in the PR body): bottom-right is
+     already #crossings-toggle's spot below the 640px breakpoint (see that
+     rule's own comment), so bottom-left avoids the same class of overlap
+     #crossings-toggle's own placement comment warns about.
+     Default CLOSED (the `gg-hidden` class in the body markup) per #351's
+     acceptance criterion — opened via #console-toggle (see the action-bar
+     area below) or closed via #console-close/outside-click/Escape (see
+     gadgets.js's shared dismiss registry + app.js's wiring). Why the
+     console isn't built via the `ggWindow()` factory itself, even though
+     GADGETS.md §7.3 frames it that way: see app.js's own module-header
+     note on the console migration — factory-built chrome is assembled at
+     runtime via `document.createElement`, which would never appear in
+     this file's SERVED (static) markup, breaking the existing
+     content-grepping tests that assert on `id="console"` /
+     `id="console-log"` / `id="console-clear"` in the raw HTML response
+     (no headless-browser harness in this suite — see test_webrender.py's
+     module docstring). Hand-placing the `.gg-window`/`.gg-window--screen`
+     classes directly here reuses the SAME chrome + the SAME shared
+     dismiss-registry API (gadgets.js's ggMarkGadgetOpen/ggMarkGadgetClosed)
+     without literally calling the factory — functionally equivalent,
+     test-safe. */
+  #console {
+    bottom: 0.6rem;
+    left: 0.6rem;
+    width: min(420px, calc(100% - 1.2rem));
+    /* Share Tech Mono (2026-07-21 font session): replaces an earlier
+       Pixelify Sans candidate, which was too hard to read at this
+       small system-log size — this is the legibility fix, don't
+       swap it back out. Applies to the console log's default entries
+       (use/move/look/error); .console-entry.console-say/-talk below
+       override to VT323, the dialogue-specific font. */
+    font-family: "Share Tech Mono", ui-monospace, "SF Mono", Consolas, monospace;
+    font-size: 0.75rem;
+  }
+  /* #console-header now doubles as this hand-built instance's title bar
+     (the "Console" label + Clear + the new Close button) — kept as its
+     own content-level element (not gadgets.css's `.gg-window-titlebar`,
+     which only factory-built ggWindow instances get) but styled to read
+     the same way. */
+  #console-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.3rem 0.5rem;
+    border-bottom: 1px solid #333;
+    color: #999;
+  }
+  #console-clear {
+    background: none;
+    border: 1px solid #444;
+    color: #999;
+    border-radius: 3px;
+    padding: 0.1rem 0.4rem;
+    cursor: pointer;
+    font-size: 0.7rem;
+  }
+  #console-log {
+    height: 8em; /* ~7-9 lines at this font-size/line-height */
+    overflow-y: auto;
+    padding: 0.4rem 0.5rem;
+    color: #ddd;
+  }
+  .console-entry {
+    margin-bottom: 0.15rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .console-entry .console-ts { color: #777; margin-right: 0.3rem; }
+  .console-entry .console-kind { margin-right: 0.3rem; font-weight: bold; }
+  .console-entry.console-error .console-kind { color: #e05050; }
+  .console-entry.console-use .console-kind { color: var(--gb-light); }
+  .console-entry.console-talk .console-kind { color: #6fa8dc; }
+  .console-entry.console-move .console-kind { color: #999; }
+  /* webrender-action-bar: say is a broadcast message, same color family as
+     talk's addressed message; look is a passive re-fetch, same neutral
+     grey as move. */
+  .console-entry.console-say .console-kind { color: #6fa8dc; }
+  .console-entry.console-look .console-kind { color: #999; }
+  /* Dialogue-box treatment (2026-07-21 font session, game-grade speech
+     styling): say/talk are the actual in-world speech rows, so only these
+     two get a visible RPG-style border + tinted fill — every other
+     console entry (use/move/look/error) stays in its current subtle log
+     style. VT323 here (not Share Tech Mono, the console's default above)
+     is the dialogue-specific font, the density it was chosen for. CSS-only
+     — no new DOM elements, styling the existing .console-entry row
+     directly. */
+  .console-entry.console-say,
+  .console-entry.console-talk {
+    font-family: "VT323", ui-monospace, "SF Mono", Consolas, monospace;
+    font-size: 0.95rem;
+    border: 2px solid var(--gb-light);
+    background: rgba(48, 98, 48, 0.18);
+    border-radius: 4px;
+    padding: 0.3rem 0.5rem;
+  }
+  .console-entry details { margin-top: 0.15rem; }
+  .console-entry pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 0.2rem 0 0 0;
+    color: #aaa;
+  }
+
+  /* umwelt #351: per-file header inside the outcome window's content for a
+     multi-file readable outcome (app.js's _outcomeWindowContent) — content-
+     level styling (GADGETS.md §4: "per-feature CSS may style content
+     only"), the gg-window CHROME itself is entirely gadgets.css's. */
+  .gg-outcome-file-header {
+    font-weight: bold;
+    color: var(--gb-light);
+    margin-top: 0.4rem;
+  }
+  .gg-outcome-file-header:first-child { margin-top: 0; }
+
+  /* Feature 1: crossings sidebar — fixed, scrollable, newest at bottom. */
+  #crossings-panel {
+    position: fixed;
+    top: 0;
+    right: 0;
+    width: 300px;
+    /* umwelt#791 (Lei, Safari mobile, 2026-09-08): 100vh is the LAYOUT
+       viewport, which stays full-height even while Safari's address/tab
+       bar overlays the bottom of the VISUAL viewport — so the panel's
+       last ~50-100px sit under browser chrome with no scroll position
+       that reaches them. 100dvh (dynamic viewport height, Safari >=15.4)
+       tracks the visual viewport instead; declared second so it overrides
+       100vh only where supported, degrading harmlessly to the old
+       behavior elsewhere (unsupported browsers ignore the whole
+       100dvh declaration and keep the 100vh one above it). */
+    height: 100vh;
+    height: 100dvh;
+    background: #1a1a1a;
+    border-left: 1px solid #333;
+    display: flex;
+    flex-direction: column;
+    box-sizing: border-box;
+    /* umwelt #301: transition is unconditional (harmless at desktop,
+       where .collapsed is never applied — see the mobile-only rule
+       below) so there's one shared rule instead of duplicating it
+       inside the media query. */
+    transition: transform 0.2s ease;
+  }
+  /* umwelt #301: below 640px (same breakpoint #interact-menu's desktop
+     rule already uses) the always-visible 300px panel is what breaks
+     the phone layout — collapse it to an off-canvas drawer, opened via
+     #crossings-toggle (only rendered/shown at this width, see its own
+     rule below), closed by default so a first-load phone session sees
+     the full-width street immediately, not a panel eating the screen. */
+  @media (max-width: 640px) {
+    #crossings-panel { transform: translateX(100%); }
+    #crossings-panel.open { transform: translateX(0); }
+  }
+  #crossings-header {
+    padding: 0.75rem;
+    font-weight: bold;
+    border-bottom: 1px solid #333;
+  }
+  /* umwelt #301: the drawer-open toggle — a small fixed tab, always
+     reachable regardless of the drawer's own open/closed transform,
+     since it lives outside #crossings-panel in the DOM (see index.html
+     body). Desktop hides it entirely (the panel is always visible
+     there, nothing to toggle); the drawer/toggle pair only exists below
+     the 640px breakpoint.
+
+     Bottom-right, not top-right (reviewer-fairy catch on PR #308): a
+     top-right placement geometrically overlaps #identity-bar's own
+     buttons at exactly the mobile widths this fix targets, since
+     #identity-bar is in normal document flow (not fixed) and its real
+     height varies with content (spectator vs logged-in, how many
+     buttons). Anchoring bottom-right instead sidesteps THAT collision —
+     verified zero overlap with #identity-bar at 390/375/320px.
+
+     Accepted tradeoff (round-2 catch, same PR): while #interact-menu is
+     OPEN at these widths, it's a full-width bottom sheet (position:fixed,
+     left/right:0, bottom:0, z-index:20 — see its own rule below) that
+     geometrically covers this toggle (z-index:15) underneath it. This is
+     deliberately left as-is rather than "fixed": it's transient (a user
+     opens the interact-menu on purpose and it closes again, same as it
+     covers everything else on the page behind it while open), not a
+     permanent or silent state, and avoiding it would mean either coupling
+     this toggle's z-index to interact-menu's open/closed state (adds
+     cross-component coupling for a rare, self-resolving overlap) or
+     guessing at a "safe" position that varies with interact-menu's own
+     content-dependent height (fragile, same class of guess the
+     top-right placement above already got wrong once). */
+  #crossings-toggle {
+    display: none;
+  }
+  @media (max-width: 640px) {
+    #crossings-toggle {
+      display: block;
+      position: fixed;
+      bottom: 0.6rem;
+      right: 0.6rem;
+      z-index: 15;
+      background: #1a1a1a;
+      color: #ddd;
+      border: 1px solid #444;
+      border-radius: 4px;
+      padding: 0.3rem 0.6rem;
+      font-size: 0.75rem;
+      cursor: pointer;
+    }
+  }
+  #crossings-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0.5rem;
+    /* umwelt#791: the newest crossing sits at the scroll container's
+       bottom edge (see app.js's auto-scroll-to-latest); on an iPhone with
+       a home indicator, that edge is under the indicator's reserved
+       gesture area, not just the browser chrome the 100dvh fix above
+       addresses. env() with a 0 fallback is a no-op on non-notched
+       devices and older browsers that don't support env(). */
+    padding-bottom: calc(0.5rem + env(safe-area-inset-bottom, 0px));
+  }
+  /* VT323 (2026-07-21 font session) — the crossings panel is the
+     most-read body/dialogue text on the page; VT323 stays legible at
+     this small size. Dialogue-box treatment: a visible RPG-style border
+     + tinted fill (same recipe as .console-entry.console-say/-talk
+     below), replacing the previous flat #222 fill with no border. */
+  .crossing {
+    margin-bottom: 0.6rem;
+    padding: 0.4rem 0.5rem;
+    background: rgba(48, 98, 48, 0.18);
+    border: 2px solid var(--gb-light);
+    border-radius: 4px;
+    font-size: 0.9rem;
+    font-family: "VT323", ui-monospace, "SF Mono", Consolas, monospace;
+  }
+  .crossing .sender { font-weight: bold; margin-right: 0.4rem; }
+  .crossing .relation {
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    color: #999;
+    border: 1px solid #444;
+    border-radius: 3px;
+    padding: 0 0.3rem;
+    margin-right: 0.4rem;
+  }
+  .crossing .time { font-size: 0.65rem; color: #999; }
+  .crossing .body { color: #ddd; margin-top: 0.2rem; white-space: pre-wrap; }
+  /* voice-playback v0 (#309 listen-button): a plain button, not yet a
+     #352 gadget (see app.js's renderCrossing comment). Small + inline,
+     matching the .relation pill's scale rather than the larger action
+     buttons elsewhere on the page -- this is a per-crossing accessory,
+     not a primary action. */
+  .crossing .voice-btn {
+    margin-top: 0.3rem;
+    font-size: 0.75rem;
+    background: #222;
+    color: var(--gb-light);
+    border: 1px solid #444;
+    border-radius: 3px;
+    padding: 0.1rem 0.4rem;
+    cursor: pointer;
+  }
+  /* avatar picker (2026-07-27): content-only styling per GADGETS.md §4 —
+     the frame itself is ggWindow/.gg-window, this just lays out the
+     gallery grid inside it. */
+  .avatar-picker-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+    gap: 0.75rem;
+  }
+  .avatar-picker-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.3rem;
+    text-align: center;
+  }
+  .avatar-picker-card img {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    background: var(--gb-dark);
+    border: 1px solid var(--gb-light);
+    border-radius: 3px;
+  }
+  .avatar-picker-label {
+    font-size: 0.8rem;
+    color: var(--gb-light);
+  }
+  .crossing .voice-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  /* umwelt #387 (Lei's live ask, issue #387 -- "a reply button on each
+     crossing... so he can respond directly"): same small-accessory scale
+     as .voice-btn above (this row's existing "small, inline, quieter than
+     a full .gg-btn" convention), not a new size tier. Always-visible
+     (not a hover-reveal) -- the spec allows hover-on-desktop but requires
+     touch-reachability regardless, and .voice-btn already establishes
+     "always-visible small icon" as this row's own pattern, so reply
+     matches it rather than introducing a second interaction model for the
+     row's two accessory buttons. */
+  .crossing .reply-btn {
+    margin-top: 0.3rem;
+    margin-left: 0.3rem;
+    font-size: 0.75rem;
+    background: #222;
+    color: var(--gb-light);
+    border: 1px solid #444;
+    border-radius: 3px;
+    padding: 0.1rem 0.4rem;
+    cursor: pointer;
+  }
+
+  /* Feature 2: click-to-inspect panel. */
+  #inspect-panel {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    width: calc(100% - 320px);
+    max-height: 40vh;
+    overflow-y: auto;
+    background: #1a1a1a;
+    border-top: 1px solid #333;
+    /* umwelt #301: the 320px reservation above bakes in the same
+       desktop-only assumption body's padding-right did (a permanently
+       visible 300px crossings panel) — below 640px the panel is a
+       collapsed drawer instead, so this panel gets the full width back
+       too. */
+    box-sizing: border-box;
+    padding: 1rem;
+  }
+  @media (max-width: 640px) {
+    #inspect-panel { width: calc(100% - 1.2rem); }
+  }
+  #inspect-panel.hidden { display: none; }
+  .hidden { display: none; }
+  #inspect-close { float: right; }
+  #inspect-name { font-size: 1.1rem; font-weight: bold; margin-bottom: 0.25rem; }
+  #inspect-kind { color: #999; margin-bottom: 0.5rem; }
+  #inspect-desc { margin-bottom: 0.5rem; }
+  #inspect-gate { color: #e0b050; margin-bottom: 0.5rem; }
+  #inspect-checklist { white-space: pre-wrap; margin-bottom: 0.5rem; }
+  #inspect-charge-board { white-space: pre-wrap; margin-bottom: 0.5rem; }
+  /* umwelt #516: a container's contents list, rendered by app.js's
+     renderLookIn (look_in). Each contained thing is its own row; names +
+     descriptions are world-content set by whoever forged the thing, so
+     every field is assigned via .textContent in app.js (DESIGN.md §12.10). */
+  #inspect-contents { margin-bottom: 0.5rem; }
+  #inspect-contents .inspect-contents-item {
+    padding: 0.2rem 0; border-top: 1px solid #333;
+  }
+  #inspect-contents .inspect-contents-name { font-weight: bold; }
+  #inspect-contents .inspect-contents-desc { color: #999; font-size: 0.9rem; }
+  #inspect-contents .inspect-contents-empty { color: #999; }
+  /* umwelt #655: a look_in item is now openable in the proposal viewer
+     (app.js renderLookIn -> openThingViewer). A modifier on the existing
+     .inspect-contents-item row (not a new element) — pointer cursor +
+     focus outline so the div+role=button reads as clickable. Chrome stays
+     .gg-*-prefixed per the #352 charter; this is the feature-side rule. */
+  #inspect-contents .inspect-contents-item--openable { cursor: pointer; }
+  #inspect-contents .inspect-contents-item--openable:focus {
+    outline: 1px solid var(--gb-light, #b8a070);
+    outline-offset: -1px;
+  }
+  #inspect-contents .inspect-contents-item--openable:hover {
+    background: rgba(255, 255, 255, 0.04);
+  }
+  /* umwelt #967: a closed (retracted / approved) row has its name and
+     description text dimmed by COLOUR (not row opacity: the `badge` gadget
+     sits inside the name and must keep its full contrast). Both stay >=4.5:1
+     on the #1a1a1a panel. Still openable to read, never hidden. */
+  #inspect-contents .inspect-contents-item--closed .inspect-contents-name { color: #8a8a8a; }
+  #inspect-contents .inspect-contents-item--closed .inspect-contents-desc { color: #858585; }
+  /* umwelt #655: the proposal viewer (app.js openThingViewer) — a focal
+     ggWindow's CONTENT classes (the window chrome itself is gadgets.css's
+     .gg-window-*). Header / priority badge / kind-state / author / body
+     / decision log / action bar. .gg-btn (gadgets.css) is reused for the
+     action buttons; only the layout/spacing classes live here. */
+  .gg-thing-viewer { display: flex; flex-direction: column; gap: 0.6rem; }
+  .gg-thing-viewer-header { margin-bottom: 0.1rem; }
+  .gg-thing-viewer-title { font-size: 1.1rem; font-weight: bold; }
+  .gg-thing-viewer-meta {
+    margin-top: 0.2rem; display: flex; flex-wrap: wrap; gap: 0.4rem;
+    color: #999; font-size: 0.85rem; align-items: center;
+  }
+  .gg-thing-viewer-priority {
+    font-weight: bold; color: #e0b050; border: 1px solid #6a5a30;
+    padding: 0 0.3rem; border-radius: 3px; font-size: 0.8rem;
+  }
+  .gg-thing-viewer-state { color: #9ad; }
+  .gg-thing-viewer-author { color: #999; }
+  .gg-thing-viewer-body {
+    border-top: 1px solid #333; padding-top: 0.4rem;
+  }
+  .gg-thing-viewer-log {
+    border-top: 1px solid #333; padding-top: 0.4rem;
+  }
+  .gg-thing-viewer-log-header {
+    color: #999; font-size: 0.85rem; margin-bottom: 0.25rem;
+  }
+  .gg-thing-viewer-log-entry {
+    padding: 0.2rem 0; border-top: 1px solid #222;
+  }
+  .gg-thing-viewer-log-entry:first-of-type { border-top: none; }
+  .gg-thing-viewer-log-head { font-size: 0.85rem; color: #ccc; }
+  .gg-thing-viewer-log-comment {
+    margin-top: 0.15rem; margin-left: 0.75rem;
+    color: #aaa; font-size: 0.85rem; white-space: pre-wrap;
+  }
+  .gg-thing-viewer-actions {
+    border-top: 1px solid #333; padding-top: 0.5rem;
+    display: flex; flex-wrap: wrap; gap: 0.4rem;
+  }
+  .gg-thing-viewer-actparams { display: flex; flex-direction: column; gap: 0.4rem; }
+  .gg-thing-viewer-actparams-header { font-weight: bold; }
+  .gg-thing-viewer-loading,
+  .gg-thing-viewer-error { color: #999; }
+  /* umwelt #945: an act refusal shown in the viewer must be seen, not grey. */
+  .gg-thing-viewer-refusal { color: #c62828; font-weight: 600; margin-bottom: 6px; }
+  /* umwelt #239: avatar status block — replaces the old raw-JSON dump
+     with distinct per-field rows (see app.js's renderInspect). */
+  #inspect-status { color: #999; font-size: 0.85rem; }
+  #inspect-status > div { margin-bottom: 0.15rem; }
+
+  /* umwelt #267 "menu PR": the interact-menu — tap an avatar/thing -> a
+     small popup offering talk/examine (avatars) or per-action buttons
+     (things), replacing the old direct-to-inspect click. Mobile-first
+     (Lei's device answer, forum #267 — "MOBILE-polished is the target"):
+     a bottom sheet by default (large tap targets, easy thumb reach),
+     degrading to a smaller popup on wider viewports below. Reuses the
+     inspect panel's `.hidden`-toggle CONVENTION above, not its DOM ids —
+     a genuinely new component. GB-palette-consistent, same --gb-*
+     variables the street-view chrome above already uses. */
+  #interact-menu {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: var(--gb-darkest);
+    border-top: 3px solid var(--gb-light);
+    border-radius: 12px 12px 0 0;
+    box-sizing: border-box;
+    padding: 1rem;
+    z-index: 20;
+    box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.4);
+  }
+  #interact-menu.hidden { display: none; }
+  #interact-menu-close {
+    float: right;
+    background: none;
+    border: none;
+    color: var(--gb-lightest);
+    font-size: 1.2rem;
+    cursor: pointer;
+    line-height: 1;
+  }
+  #interact-menu-title {
+    color: var(--gb-lightest);
+    font-weight: bold;
+    margin-bottom: 0.6rem;
+  }
+  #interact-menu-actions { display: flex; flex-direction: column; gap: 0.5rem; }
+  /* Large tap targets (mobile-first — Leona's thumb) rather than a tiny
+     hover-dependent dropdown. */
+  #interact-menu-actions button {
+    padding: 0.75rem;
+    font-size: 1rem;
+    text-align: left;
+    background: var(--gb-dark);
+    color: var(--gb-lightest);
+    border: 1px solid var(--gb-light);
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  /* Two-lane keyboard controls: ArrowUp/ArrowDown-navigable highlight while
+     the interact-menu is open (see app.js's moveMenuHighlight). Explicit
+     CSS class rather than relying on browser default :focus — the buttons do
+     take real DOM focus (focusMenuHighlight), but the class keeps the
+     highlight styled consistently and independent of focus state. */
+  #interact-menu-actions button.menu-highlight {
+    outline: 2px solid var(--gb-lightest);
+    outline-offset: 2px;
+    background: var(--gb-light);
+  }
+  /* Desktop degradation: a smaller, corner-anchored popup instead of a
+     full-width bottom sheet — same component/markup, no separate
+     desktop-only DOM. Judgment call (design freedom per the spec): a
+     fixed corner position rather than anchoring to the tapped element's
+     own bounding rect — simpler, and robust against the street's own
+     horizontal scroll (an element-anchored popup would need to track
+     scroll position too). */
+  @media (min-width: 640px) {
+    #interact-menu {
+      left: auto;
+      right: 24px;
+      bottom: 24px;
+      width: 280px;
+      border-radius: 8px;
+      border: 2px solid var(--gb-light);
+      border-top: 2px solid var(--gb-light);
+    }
+  }
+</style>
+</head>
+<body>
+  <div id="identity-bar">
+    <span id="identity-status" class="identity-spectator">spectator</span>
+    <!-- umwelt#495 anti-silent-fail-open: an "unverified" session (unbound
+         identity, backfill window open) stays visibly marked for as long
+         as it's live -- next to the identity it names, not a one-time
+         toast that scrolls away. renderIdentityBar() (app.js) toggles
+         .shown and sets the title on every render, including after a
+         page reload (GET /session now carries `state` too). -->
+    <span id="identity-unverified-badge" title=""></span>
+    <!-- umwelt#529: the human bell -- reactive half of #539's inbox.
+         Icon (📬/🔔) + badge are set by app.js's renderInboxBell(); hidden
+         alongside avatar-picker-btn/logout-btn while spectator, same
+         loggedIn-gated visibility every other identity-bar control uses. -->
+    <button id="inbox-bell-btn" class="hidden" title="Inbox">
+      <span id="inbox-bell-icon">📬</span><span id="inbox-badge" class="hidden">0</span>
+    </button>
+    <button id="avatar-picker-btn" class="hidden">Pick avatar</button>
+    <button id="logout-btn" class="hidden">Log out</button>
+  </div>
+
+  <!-- umwelt #384 (Lei re-scope): the logged-out landing view -- the ONLY
+       thing rendered while state.identity === "spectator" (app.js's
+       setGateActive(), gated on by body.gate-active above). Login errors
+       (login()'s catch/!resp.ok paths) render into #login-gate-error --
+       previously they went to #error at the very bottom of the full page,
+       which is exactly why the original bug (#384) went unseen. -->
+  <div id="login-gate">
+    <div id="login-gate-box">
+      <h1>Umwelt</h1>
+      <p>Log in to enter the world.</p>
+      <div id="login-gate-error"></div>
+      <!-- umwelt#495: real username/password login, proxied by the
+           gateway to the world's own POST /umwelt/login (scrypt-verified
+           for a bound identity; see app.js's login() for the request
+           shape and the state-visibility handling). autocomplete
+           attributes are the standard browser hints for a login form --
+           harmless, and let a password manager offer to fill this.
+
+           `identity-login-controls` id kept on this wrapper (pre-existing,
+           umwelt #384) -- renderIdentityBar() toggles `.hidden` on it by
+           id; giving the new form a different id would null-deref that
+           call the next time it runs. -->
+      <span id="identity-login-controls">
+        <form id="login-gate-form" autocomplete="on">
+          <div>
+            <label for="login-username">Username</label>
+            <input id="login-username" name="username" type="text"
+                   autocomplete="username" required>
+          </div>
+          <div>
+            <label for="login-password">Password</label>
+            <input id="login-password" name="password" type="password"
+                   autocomplete="current-password">
+          </div>
+          <button type="submit" class="gg-btn">Log in</button>
+        </form>
+        <p id="login-gate-forgot">
+          <a href="/reset-password.html" target="_blank" rel="noopener">forgot password?</a>
+        </p>
+      </span>
+    </div>
+  </div>
+
+  <!-- umwelt #384: everything below is the logged-in street UI -- hidden
+       en bloc behind body.gate-active (see the <style> block above) so a
+       spectator session never renders street view/action bar/crossings
+       polling behind the gate. -->
+  <div id="app-shell">
+  <div id="controls">
+    <label>viewer <input id="viewer" type="text" placeholder="your name"></label>
+    <label>place <input id="place" type="text" placeholder="place_square (required)"></label>
+    <button id="go">Enter / Look</button>
+    <!-- P0 nav (umwelt #238): unconditional escape hatch, always visible
+         regardless of scene.exits/scene.parent — a deep place tree could
+         require many parent-hops otherwise. -->
+    <button id="back-to-square">⬅ Back to the Square</button>
+  </div>
+  <div id="place-desc"></div>
+  <!-- webrender-action-bar: general player actions (v0 = Look/Say — not
+       thing-targeted, see the interact-menu below for that). Buttons are
+       built in app.js from the ACTIONS array.
+       umwelt #660: Say no longer opens a hidden row of its own. There is
+       one composer, always visible at the bottom of the shell (#composer),
+       and the Say button simply focuses it in Room mode -- the emotion
+       picker moved there too (#composer-emotions). -->
+  <div id="action-bar"></div>
+  <!-- umwelt #351 (GADGETS.md §7.3): the console's own open toggle — near
+       the action bar (judgment call on exact placement, flagged in the PR
+       body: no other "sensible existing spot" reads more naturally for a
+       general, not-thing-targeted control). See app.js for the click
+       wiring + the shared gadgets.js dismiss-registry integration. -->
+  <button id="console-toggle" type="button">Console</button>
+  <!-- umwelt #321: Use's args sub-view — a hidden container with one text
+       input and one send button. (It used to mirror the Say row's shape;
+       umwelt #660 replaced that row with the always-visible composer, and
+       Use's args are a thing-targeted parameter form rather than a
+       message, so it stays its own surface.) Opened by
+       handleActionUse (app.js) once a thing is cursor-targeted;
+       #action-bar-use-target shows the targeted thing's name (textContent
+       only, never innerHTML -- same untrusted-content discipline as the
+       rest of this file). -->
+  <div id="action-bar-use" class="hidden">
+    <span id="action-bar-use-target"></span>
+    <input id="action-bar-use-input" type="text" placeholder="optional args (space-separated)">
+    <button id="action-bar-use-send" type="button">Use</button>
+  </div>
+  <!-- umwelt #240 street-view FRAME: a horizontal "street" replaces the old
+       CSS-grid-of-rectangles — see app.js's render(). The banner shows the
+       place label + a present-count; the road holds the back-door (fixed
+       leftmost, when scene.parent is non-null), things, avatars, and
+       forward exit doors (server-sorted), built entirely in app.js. -->
+  <!-- Three-band street (umwelt #283 — consumes each thing/avatar's `lane`
+       from the gateway's /scene response, umwelt #278): #street-sky (top),
+       #street-land (middle — doors + land-lane things), #street-road
+       (bottom — road-lane things + avatars), sharing #street's single
+       horizontal scroll — see app.js's render() for how the three bands
+       are populated and app.js's module-header note for the keyboard
+       model. -->
+  <div id="street-frame">
+    <div id="street-banner">
+      <span id="place-label"></span>
+      <span id="present-count"></span>
+    </div>
+    <div id="street">
+      <div id="street-sky"></div>
+      <div id="street-land"></div>
+      <div id="street-road"></div>
+    </div>
+  </div>
+  <div id="error"></div>
+
+  <!-- umwelt #259 → #351 (GADGETS.md §7.3): bottom output console — see
+       app.js's consoleLog for the log-entry wiring, and the #console CSS
+       block above for the gg-window chrome/positioning choice. Closed by
+       default (gg-hidden, per #351's acceptance criterion) — opened via
+       #console-toggle above, closed via #console-close/outside-click/
+       Escape (app.js + gadgets.js's shared dismiss registry). Remains the
+       debug/raw view (the collapsed per-entry <details><pre>JSON.stringify
+       ...</pre></details> view, app.js's consoleLog, is unchanged) — #351's
+       player-facing surface is the NEW outcome window (app.js's
+       _openOutcomeWindow), a separate, never-JSON-wrapped view. -->
+  <div id="console" class="gg-window gg-window--screen gg-hidden">
+    <div id="console-header">
+      <span>Console</span>
+      <button id="console-clear" type="button">Clear</button>
+      <button id="console-close" type="button" class="gg-close">&times;</button>
+    </div>
+    <div id="console-log"></div>
+  </div>
+
+  <!-- umwelt #301: drawer toggle for #crossings-panel below 640px, see
+       app.js for the click wiring (toggles .open on #crossings-panel) —
+       deliberately outside #crossings-panel itself so it stays reachable
+       regardless of the panel's own transform state. -->
+  <button id="crossings-toggle" type="button">Crossings</button>
+  <div id="crossings-panel">
+    <div id="crossings-header">Crossings</div>
+    <div id="crossings-list"></div>
+  </div>
+
+  <div id="inspect-panel" class="hidden">
+    <button id="inspect-close">&times;</button>
+    <div id="inspect-name"></div>
+    <div id="inspect-kind"></div>
+    <div id="inspect-desc"></div>
+    <div id="inspect-gate"></div>
+    <div id="inspect-checklist"></div>
+    <div id="inspect-charge-board"></div>
+    <!-- umwelt #516: a container's contents (look_in), rendered by app.js's
+         renderLookIn. Empty/hidden for a plain look_at (see renderInspect). -->
+    <div id="inspect-contents"></div>
+    <!-- umwelt #239: avatar-only status block (look_at's `status` sibling
+         key) — distinct per-field rows, see app.js's renderInspect. -->
+    <div id="inspect-status">
+      <div id="inspect-emotion"></div>
+      <div id="inspect-state"></div>
+      <div id="inspect-last-active"></div>
+      <div id="inspect-activity-line"></div>
+    </div>
+  </div>
+
+  <!-- umwelt #267 "menu PR": tap an avatar/thing -> this popup, offering
+       talk/examine for avatars or per-action buttons for things (read off
+       .actions, see app.js's openInteractMenuForAvatar/
+       openInteractMenuForThing). Bottom-sheet on mobile, smaller popup on
+       desktop (see the #interact-menu CSS + its @media rule above). -->
+  <div id="interact-menu" class="hidden">
+    <button id="interact-menu-close">&times;</button>
+    <div id="interact-menu-title"></div>
+    <div id="interact-menu-actions"></div>
+  </div>
+  <!-- umwelt #660: the one composer. Always visible, bottom of the shell.
+       Channel is Room or Private -- see the CSS above for why there is no
+       third "world-broadcast" button. app.js owns the state: which channel
+       is live, who the private target is, and the class that colours the
+       whole bar while Private is selected. -->
+  <div id="composer">
+    <div id="composer-channel">
+      <button id="composer-channel-room" type="button" class="selected">Room</button>
+      <button id="composer-channel-private" type="button" disabled
+              title="click an avatar to choose someone">Private</button>
+      <span id="composer-private-target" class="hidden"></span>
+      <button id="composer-private-clear" type="button" class="hidden"
+              title="clear the private target">&times;</button>
+    </div>
+    <div id="composer-emotions" class="emotion-picker"></div>
+    <textarea id="composer-input" rows="3"
+              placeholder="say something to the room…"></textarea>
+    <button id="composer-send" type="button">Send</button>
+    <div class="composer-hint" id="composer-hint">Enter for a new line · Shift+Enter to send (or tap Send)</div>
+  </div>
+  </div><!-- /#app-shell (umwelt #384) -->
+
+  <!-- Webrender Gadget Charter (GADGETS.md #352): the gg* factories +
+       anchor helper + shared dismiss registry, loaded before app.js so
+       app.js's feature-level wiring can call them (ggWindow, etc.) at
+       module-load time (see app.js's #351 outcome-window/console
+       migration notes). -->
+  <script src="gadgets.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+# MCP wrapper (walk the world from Claude Code).
+# The `<4` ceiling is a deliberate protocol-boundary guard, not a compatibility
+# claim about any particular release. MCP's specification moved to revision
+# 2026-07-28, which removes the initialize/notifications/initialized handshake,
+# makes MCP stateless (per-request protocol version in `_meta`), and makes
+# `server/discover` a mandatory server RPC. Our servers currently speak
+# 2025-11-25 (mcp SDK 1.27.2 / fastmcp 3.3.1) and the spec keeps a
+# backward-compatibility path for handshake-based revisions. Without an upper
+# bound a fresh install can cross that protocol boundary unchosen. Raise the
+# ceiling deliberately, together with a re-check of the server, rather than by
+# letting a resolver pick.
+fastmcp>=2.0,<4

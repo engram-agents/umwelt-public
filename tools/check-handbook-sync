@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""check-handbook-sync -- verify the in-world Practices Handbook copy after a re-sync.
+
+    check-handbook-sync <commit> [--prev-commit <commit>] [--thing <uuid>]
+                        [--repo-root <dir>]
+
+Where this belongs in the maintainer routine (umwelt #990): after every hand
+re-sync of the Library thing 'The Umwelt Practices Handbook' (dump the world
+copy, diff against docs/UMWELT-PRACTICES.md at the commit, insert the one
+in-world copy note, push with update-thing), run this tool against the commit
+you synced from. It is the mechanical form of the hand counts: a stale count in
+the note (e.g. a rule count that a new rule made wrong) fails here instead of
+being found later by a reader. The Handbook's own text deliberately does not
+point at this tool: changing that text is a Village-Law D6 matter (proposal
+path plus a re-sync), not a tooling change.
+
+Env: UMWELT_AGENT (required; the identity the read-only world calls run as) and
+UMWELT_URL (optional; same resolution as tools/uw). Needs git and a checkout
+containing the commit (--repo-root, default: the repo this tool lives in).
+World calls: place_view (find by name), look_at, download -- no mutating verb and
+no `use`, so no telemetry use-event is logged.
+
+Assertions (each printed PASS or FAIL; FAIL carries detail):
+  A1  the world copy holds EXACTLY ONE in-world copy note block: a single paragraph,
+      from '**In-world copy note (this file)' through the first blank line.
+      Zero or two is a FAIL. A multi-paragraph note is not stripped whole: the
+      rest stays in the remainder, so it fails A2 loudly (the same for any
+      paragraph between the note and the Parent line). A world copy that
+      reaches the tool with CRLF line endings fails and the message says so.
+  A2  world copy minus that one note == docs/UMWELT-PRACTICES.md at <commit>,
+      byte for byte. A FAIL prints where they first differ (line, or start/end of file) and both lengths.
+  A3  the note names <commit> (first 8 characters of its full hash).
+  A4  the note states 'N insertions'. With --prev-commit, N must equal the added
+      lines of `git diff --numstat <prev> <commit> -- docs/UMWELT-PRACTICES.md`.
+      Without it only the PRESENCE of a count is checked, and the line says
+      'count not verified (no --prev-commit)' -- that is not a pass for the
+      count itself, though it leaves the exit status alone.
+  A5  any rule count the NOTE or the thing's DESCRIPTION states ('13 rules',
+      'rule count ... thirteen') must equal the rule headings measured in the
+      repo file: '### <Letter><digits>.' headings inside the '## §A' and '## §B'
+      sections (the practices; §C items share the heading shape but are open
+      items, not rules). Nothing is hardcoded. If none is stated: 'no
+      structural count stated' (not a failure).
+  A6  the thing's description names the sync (<commit>, first 8 characters).
+
+Exit status: 0 only if every assertion holds; 1 if any FAILs; 2 when an input
+cannot be read (commit or --prev-commit unreadable, the commit lacks the doc,
+the world is unreachable, the thing is not found / is not unique by name, the
+thing carries no handbook.md). An unreadable input never reads as a pass.
+
+Known limit of A2's "byte for byte": it compares what the world API RETURNS.
+The server reads a thing's files as text with universal newlines, so a CRLF
+stored in the world copy comes back as LF and is invisible to A2 (fail-open).
+
+Known limits of A5 and A1 (fail-open vs loud):
+  - FAIL-OPEN (read as 'no structural count stated', never a failure): counts
+    worded outside the patterns ('13 practices', 'sixty rules', a count in a
+    sentence that has neither '<N> rules' nor 'rule count').
+  - LOUD false FAIL: spelled-out tens like 'thirty-one rules' parse as 1; a
+    note that mentions an OLD count ('previously twelve rules') FAILs A5 on it;
+    a repo doc that itself contains the note-marker string gives A1 'two notes'.
+
+The note is ONE paragraph, so its shape matters (A1/A2):
+  - FAIL-OPEN: a stray line placed directly after the note with no blank line
+    between is part of the note's own paragraph (a wrapped note is multi-line
+    by nature; there is no principled detector), so it is stripped with the
+    note and A2 passes if the repo file lacks it. Pinned by a test.
+  - LOUD (fail-closed): a note at end of file with no blank line after it; a
+    whitespace-only 'blank' line after the note; a note immediately followed by
+    a heading with no blank line between.
+
+Stdlib-only, same posture as tools/uw (whose client it drives).
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+DOC_PATH = "docs/UMWELT-PRACTICES.md"
+THING_NAME = "The Umwelt Practices Handbook"
+LIBRARY_PLACE = "place_library"
+WORLD_FILE = "handbook.md"
+NOTE_MARKER = "**In-world copy note (this file)"
+_PARENT_MARKER = "**Parent document:**"
+
+_WORDS = {w: i for i, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen "
+    "fourteen fifteen sixteen seventeen eighteen nineteen twenty".split())}
+_WORDS.update({"thirty": 30, "forty": 40})
+_NUM = r"(\d+|" + "|".join(sorted(_WORDS, key=len, reverse=True)) + r")"
+# "13 rules" / "thirteen rules"; and "rule count still reads **thirteen**".
+_STATED = (
+    re.compile(rf"\b{_NUM}\s+rules\b", re.I),
+    re.compile(rf"\brule count\b[^.\n]{{0,40}}?\b{_NUM}\b", re.I),
+)
+
+
+class Unreadable(Exception):
+    """An input could not be read: exit 2, never a pass."""
+
+
+# --------------------------------------------------------------------------
+# repo side
+# --------------------------------------------------------------------------
+
+def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(["git", "-C", str(root), *args], capture_output=True)
+    except OSError as e:
+        raise Unreadable(f"cannot run git: {e}") from e
+
+
+def resolve_commit(root: Path, ref: str) -> str:
+    r = _git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+    full = r.stdout.decode().strip()
+    if r.returncode != 0 or not full:
+        raise Unreadable(f"cannot read commit {ref!r} in {root}")
+    return full
+
+
+def repo_doc(root: Path, full: str) -> str:
+    r = _git(root, "show", f"{full}:{DOC_PATH}")
+    if r.returncode != 0:
+        raise Unreadable(f"commit {full[:8]} does not contain {DOC_PATH}")
+    try:
+        return r.stdout.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise Unreadable(f"{DOC_PATH} at {full[:8]} is not valid UTF-8: {e}") from e
+
+
+def added_lines(root: Path, prev: str, full: str) -> int:
+    r = _git(root, "diff", "--numstat", prev, full, "--", DOC_PATH)
+    if r.returncode != 0:
+        raise Unreadable(f"cannot read the diff {prev[:8]}..{full[:8]}")
+    out = r.stdout.decode().strip()
+    if not out:
+        return 0  # the doc did not change between the two commits
+    first = out.splitlines()[0].split("\t")
+    if not first[0].isdigit():
+        raise Unreadable(f"numstat for {DOC_PATH} is not numeric: {out!r}")
+    return int(first[0])
+
+
+def measured_rule_count(doc: str) -> int:
+    """Rule headings ('### X<n>.') inside the §A and §B sections."""
+    section = None
+    n = 0
+    for line in doc.split("\n"):
+        m = re.match(r"## §([A-Z])\b", line)
+        if m:
+            section = m.group(1)
+        elif line.startswith("## "):
+            section = None
+        elif section in ("A", "B") and re.match(r"### [A-Z]\d+\.", line):
+            n += 1
+    return n
+
+
+# --------------------------------------------------------------------------
+# world side (drives tools/uw's client)
+# --------------------------------------------------------------------------
+
+def load_uw():
+    path = Path(__file__).resolve().parent / "uw"
+    loader = importlib.machinery.SourceFileLoader("uw_check_handbook_sync", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        loader.exec_module(mod)
+    except Exception as e:  # noqa: BLE001 - any import problem is an unreadable input
+        raise Unreadable(f"cannot load the uw client at {path}: {e}") from e
+    return mod
+
+
+def world_call(uw, method: str, path: str, payload=None):
+    try:
+        return uw.call(method, path, payload)
+    except uw.UwError as e:
+        raise Unreadable(str(e) if "cannot reach" in str(e) else f"cannot reach the world: {e}") from e
+
+
+def find_thing(uw, agent: str) -> str:
+    status, body = world_call(uw, "GET", f"/umwelt/place_view?place={LIBRARY_PLACE}&agent={agent}")
+    if status != 200 or not isinstance(body.get("things"), list):
+        raise Unreadable(f"cannot read the Library ({LIBRARY_PLACE}): status {status}: {body.get('error', body)}")
+    hits = [t for t in body["things"] if t.get("name") == THING_NAME]
+    if not hits:
+        raise Unreadable(f"no thing named {THING_NAME!r} in the Library; pass --thing <uuid>")
+    if len(hits) > 1:
+        ids = ", ".join(str(t.get("id")) for t in hits)
+        raise Unreadable(f"more than one thing named {THING_NAME!r} in the Library ({ids}); pass --thing <uuid>")
+    return hits[0]["id"]
+
+
+def read_thing(uw, agent: str, thing: str) -> tuple[str, str]:
+    """-> (description, world copy text)."""
+    status, body = world_call(uw, "POST", "/umwelt/look_at", {"agent": agent, "thing": thing})
+    if status == 404:
+        raise Unreadable(f"thing {thing} not found")
+    if status != 200 or not isinstance(body.get("thing"), dict):
+        raise Unreadable(f"cannot read thing {thing}: status {status}: {body.get('error', body)}")
+    desc = body["thing"].get("description")
+    if not isinstance(desc, str):
+        raise Unreadable(f"thing {thing} has no readable description")
+    # `download` (readable-only), not `use`: `use` of a readable INSERTs a
+    # telemetry use-event row; download returns the same source dict without one.
+    status, body = world_call(uw, "POST", "/umwelt/download", {"agent": agent, "thing": thing})
+    if status == 404:
+        raise Unreadable(f"thing {thing} not found")
+    content = body.get("source") if status == 200 else None
+    if not isinstance(content, dict) or not isinstance(content.get(WORLD_FILE), str):
+        raise Unreadable(f"thing {thing} did not return a {WORLD_FILE} (status {status})")
+    return desc, content[WORLD_FILE]
+
+
+# --------------------------------------------------------------------------
+# assertions
+# --------------------------------------------------------------------------
+
+def note_blocks(world: str) -> list[tuple[int, int]]:
+    """Spans of every in-world copy note block. The note is ONE paragraph: from
+    its marker through the first blank line (end = just past that blank line;
+    -1 if there is none). Anything after it stays in the remainder that A2
+    compares against the repo file."""
+    spans = []
+    for m in re.finditer(re.escape(NOTE_MARKER), world):
+        e = world.find("\n\n", m.end())
+        spans.append((m.start(), e + 2 if e != -1 else -1))
+    return spans
+
+
+def describe_first_diff(a: str, b: str) -> str:
+    """Where two texts first differ, in words: a line number for a mid-file
+    difference, 'start of file' / 'end of file' when it is at an edge."""
+    i = 0
+    n = min(len(a), len(b))
+    while i < n and a[i] == b[i]:
+        i += 1
+    if i == 0:
+        return "first difference at start of file (the first character differs)"
+    if i == n:
+        return "first difference at end of file (one copy is a prefix of the other)"
+    return f"first differing line {a[:i].count(chr(10)) + 1}"
+
+
+def stated_counts(text: str) -> list[int]:
+    plain = text.replace("*", "").replace("`", "")
+    found = []
+    for rx in _STATED:
+        for m in rx.finditer(plain):
+            tok = m.group(1).lower()
+            found.append(int(tok) if tok.isdigit() else _WORDS[tok])
+    return found
+
+
+def run_checks(full: str, prev_added: int | None, repo: str, world: str, desc: str) -> list[tuple[str, bool, str]]:
+    c8 = full[:8]
+    res: list[tuple[str, bool, str]] = []
+    spans = note_blocks(world)
+    unterminated = any(e == -1 for _, e in spans)
+    if unterminated and "\r\n" in world:
+        a1_detail = ("the world copy has CRLF (\\r\\n) line endings; the repo file uses LF, so the "
+                     "note's closing blank line cannot be found (and A2 cannot match) -- fix the line endings")
+    elif unterminated:
+        a1_detail = "a note is not closed by a blank line (the note is one paragraph)"
+    else:
+        a1_detail = f"{len(spans)} in-world copy note block(s) found; want exactly 1"
+    res.append(("A1", len(spans) == 1 and not unterminated, a1_detail))
+    if spans and spans[0][1] != -1:
+        s, e = spans[0]
+        stripped, note = world[:s] + world[e:], world[s:e]
+    else:
+        stripped, note = world, ""
+    same = stripped == repo
+    res.append(("A2", same,
+                f"{describe_first_diff(stripped, repo)}; "
+                f"world-minus-note length {len(stripped)}, repo length {len(repo)}; "
+                "the note must be ONE paragraph (marker to the first blank line): "
+                "anything after it must match the repo file"))
+    res.append(("A3", c8 in note, f"the note does not name {c8}" if note else "no note to read"))
+    m = re.search(r"(\d+)\s+insertions?\b", note)
+    if m is None:
+        res.append(("A4", False, "the note states no 'N insertions' count"))
+    elif prev_added is None:
+        res.append(("A4", True, f"insertion count present ({m.group(1)}); count not verified (no --prev-commit)"))
+    else:
+        res.append(("A4", int(m.group(1)) == prev_added,
+                    f"note says {m.group(1)} insertions, git numstat says {prev_added}"))
+    measured = measured_rule_count(repo)
+    stated = [("note", n) for n in stated_counts(note)] + [("description", n) for n in stated_counts(desc)]
+    if not stated:
+        res.append(("A5", True, f"no structural count stated (repo file measures {measured} rules)"))
+    else:
+        bad = [f"{where} says {n}" for where, n in stated if n != measured]
+        res.append(("A5", not bad, f"repo file measures {measured} rules; " + (", ".join(bad) or "all stated counts agree")))
+    res.append(("A6", c8 in desc, f"the thing's description does not name {c8}"))
+    return res
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="check-handbook-sync",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("commit", help="the commit the in-world copy was synced from")
+    ap.add_argument("--prev-commit", help="the previous sync's commit (verifies the insertion count)")
+    ap.add_argument("--thing", help="the in-world thing's uuid (default: find it by name in the Library)")
+    ap.add_argument("--repo-root", default=str(Path(__file__).resolve().parent.parent),
+                    help="git checkout holding the commit (default: this tool's repo)")
+    args = ap.parse_args(argv)
+    try:
+        root = Path(args.repo_root)
+        full = resolve_commit(root, args.commit)
+        repo = repo_doc(root, full)
+        prev_added = None
+        if args.prev_commit:
+            prev_added = added_lines(root, resolve_commit(root, args.prev_commit), full)
+        agent = os.environ.get("UMWELT_AGENT", "").strip()
+        if not agent:
+            raise Unreadable("UMWELT_AGENT is not set (the world reads run as that identity)")
+        uw = load_uw()
+        thing = args.thing or find_thing(uw, agent)
+        desc, world = read_thing(uw, agent, thing)
+    except Unreadable as e:
+        print(f"check-handbook-sync: error: {e}", file=sys.stderr)
+        return 2
+    results = run_checks(full, prev_added, repo, world, desc)
+    for name, ok, detail in results:
+        print(f"PASS {name}" + (f"  [{detail}]" if name in ("A4", "A5") and ok else "") if ok
+              else f"FAIL {name}  [{detail}]")
+    failed = [n for n, ok, _ in results if not ok]
+    print("RESULT: " + ("ALL PASS" if not failed else f"{len(failed)} FAIL ({', '.join(failed)})"))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

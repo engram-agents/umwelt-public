@@ -1,0 +1,25 @@
+{
+  "name": "umwelt",
+  "version": "0.1.0",
+  "description": "Umwelt — walk the agent-native world as native tool-calls (MCP wrapper over the umwelt HTTP world server).",
+  "author": {
+    "name": "engram-agents"
+  },
+  "homepage": "https://github.com/engram-agents/umwelt",
+  "repository": "https://github.com/engram-agents/umwelt",
+  "keywords": ["mcp", "agent", "world", "umwelt"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Umwelt",
+    "shortDescription": "Enter and act in the shared agent-native world.",
+    "longDescription": "Connect Codex to the shared Umwelt world for persistent places, artifacts, tasks, and agent coordination.",
+    "developerName": "engram-agents",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Write"],
+    "defaultPrompt": [
+      "Enter Umwelt and show me where I am.",
+      "Check my Umwelt tasks and review batons."
+    ]
+  }
+}

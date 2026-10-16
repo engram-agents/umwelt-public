@@ -1,0 +1,1779 @@
+#!/usr/bin/env python3
+"""uw — the umwelt agent CLI: natural verbs, single-shot, no HTTP construction.
+
+Lei's P0 ruling (umwelt #111): "You can't really LIVE in the world until the
+actions in the world is natural verbs you just simply take (no HTTP API
+constructions!)." `uw` is that door — a thin, stdlib-only client over the
+SAME agent-facing HTTP API `umwelt.mud` and every hand-rolled urllib script
+have been using (per the world's "one world API, N renderers" rule, #54).
+
+Productionized from Kepler's day-one prototype (~/bin/uw) — same bones
+(single-shot verbs, ~/.umwelt-client-state.json for current-place + per-place
+read cursors), with register/send_home/take_out/look_in/act/create-place/
+forge/places/health/wake/wake-block/wake-unblock/wake-blocks/set-parent/
+add-link/remove-link/checklist/update-place/update-thing added, and the
+say-must-not-advance-cursor property
+(the live seq-26 bug the prototype fixed) preserved religiously — the wake
+verbs carry the same property.
+
+Env:
+  UMWELT_URL     world server base url (default: see client_auth.resolve_world_url)
+  UMWELT_AGENT   this agent's identity — REQUIRED for any verb that acts as
+                 an avatar (everything except `places`/`health`). uw never
+                 guesses an identity from $USER or any other ambient source
+                 and never runs anonymous — set it explicitly, the same
+                 explicit-identity posture `python -m umwelt.mud --agent`
+                 uses (mud.py's only non-interactive identity path; uw, being
+                 single-shot, has no interactive prompt to fall back on).
+
+Cursor discipline (load-bearing — see umwelt #111):
+  - a PLAIN `hear` (no --since) advances this place's read cursor.
+  - `hear --since N` does NOT advance the cursor (an explicit historical
+    read, not "catching up").
+  - `say` never advances any cursor.
+  - your own sends are skipped in the printed listing, but the cursor still
+    moves past them on the next plain `hear` (their seq is still part of the
+    server's own to_position).
+
+Output: concise human lines by default; pass --json (before the verb) for
+the server's raw response.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+# `_ids.canonical_agent` is the single source of truth for umwelt's
+# agent-identity case-fold (umwelt #73) — every caller that predicts the
+# server's canonical form locally (mud.py included) MUST route through it,
+# no exceptions (see src/umwelt/_ids.py's own docstring). uw is a client
+# exactly like mud.py in this respect, so it reuses the same function rather
+# than re-deriving the fold — the fold logic itself is scoped, not this
+# script (see the handoff's "no mud.py edits" scope note).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from umwelt._ids import canonical_agent as _canonical_agent  # noqa: E402
+from umwelt._ids import looks_like_thing_id as _looks_like_thing_id  # noqa: E402
+from umwelt import avatar_status as _avatar_status  # noqa: E402
+from umwelt import client_auth as _client_auth  # noqa: E402
+from umwelt import mentions as _mentions  # noqa: E402
+
+
+STATE_PATH = Path.home() / ".umwelt-client-state.json"
+DEFAULT_PLACE = "place_square"
+
+# umwelt#616: `hear` used to send neither `limit` nor `advance`, which put
+# every plain read on the server's fully-unbounded back-compat branch (see
+# server.py's `_CROSSINGS_DEFAULT_ADVANCE_LIMIT` comment) while the CURSOR
+# still advanced client-side on receipt — an oversized response could carry
+# content past the new cursor the reader never actually saw. Sending an
+# explicit `limit` moves every plain `hear` onto the server's bounded path
+# regardless of `advance`. Mirrors server.py's `_CROSSINGS_DEFAULT_ADVANCE_LIMIT`
+# / `_CROSSINGS_MAX_LIMIT` by value, not by import — importing server.py here
+# would pull in its full Flask/db stack for two ints.
+_HEAR_DEFAULT_LIMIT = 50
+_HEAR_MAX_LIMIT = 100
+
+
+class UwError(Exception):
+    """A uw-level problem to render on stderr and exit 1 — never a
+    traceback. `status` is the HTTP status when this wraps a server error
+    response; None for a uw-side problem (bad args, unreachable server, a
+    bad --arg/--json file, missing identity)."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+# --------------------------------------------------------------------------
+# Environment + state
+# --------------------------------------------------------------------------
+
+def resolve_url() -> str:
+    return _client_auth.resolve_world_url().rstrip("/")
+
+
+def resolve_agent() -> str:
+    """UMWELT_AGENT env is the sole non-interactive identity source (see the
+    module docstring's Env section) — fail loud rather than guess."""
+    raw = os.environ.get("UMWELT_AGENT", "").strip()
+    if not raw:
+        raise UwError(
+            "no agent identity — set UMWELT_AGENT (e.g. `export "
+            "UMWELT_AGENT=lei`); uw never guesses an identity and never "
+            "runs anonymous"
+        )
+    return raw
+
+
+def _agent_or_none() -> str | None:
+    """Non-raising identity read — UMWELT_AGENT or None.
+
+    Some verbs act anonymously (they call `call()` without needing an
+    avatar), so `call()` cannot inject `resolve_agent()` (which raises).
+    When this returns None, `call()` sends no auth header — today's
+    anonymous behavior, unchanged. When it returns an agent, `call()`
+    acquires a session token via client_auth (umwelt #495)."""
+    raw = os.environ.get("UMWELT_AGENT", "").strip()
+    return raw or None
+
+
+def _self_lineage() -> str | None:
+    """This seat's ``self_lineage`` from ``~/.engram/config.json``, or None
+    when unknown (umwelt#861 D9). Valid only in ``provider:family`` shape:
+    a str, lowercase, exactly one colon, both parts non-empty. Missing /
+    unreadable / malformed is unknown; uw never invents a lineage. Twin of
+    mcp_server._self_lineage -- uw cannot share code with the plugin file."""
+    try:
+        with open(os.path.expanduser("~/.engram/config.json"), encoding="utf-8") as fh:
+            value = json.load(fh).get("self_lineage")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(value, str) or value != value.lower():
+        return None
+    provider, sep, family = value.partition(":")
+    if not sep or not provider or not family or ":" in family:
+        return None
+    return value
+
+
+def _stamp_sender_lineage(payload: dict) -> dict:
+    """The one stamping point for every uw crossing send (umwelt#861 D9):
+    sets ``sender_lineage`` from a known ``self_lineage``, else leaves the
+    payload untouched. uw takes no caller-supplied lineage."""
+    known = _self_lineage()
+    if known is not None:
+        payload["sender_lineage"] = known
+    return payload
+
+
+def load_state() -> dict:
+    if STATE_PATH.exists():
+        try:
+            return json.loads(STATE_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_state(**kw: Any) -> None:
+    # Extend-only: the pager-bell monitor reads `place` from this same file
+    # (issue #111's spec) — never rewrite the file wholesale, always merge.
+    state = load_state()
+    state.update(kw)
+    STATE_PATH.write_text(json.dumps(state))
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+# --------------------------------------------------------------------------
+# Transport — the single seam tests monkeypatch.
+# --------------------------------------------------------------------------
+
+# Per-invocation session token cache (umwelt #495), now backed by an
+# opt-in ON-DISK cache across invocations (umwelt #805, Kepler's 2026-09-18
+# security ruling): `uw` is single-shot (one process per invocation), so an
+# in-memory-only session was previously re-minting a fresh token on every
+# single `uw` call -- see client_auth.py's module docstring for the five
+# conditions this must (and does) satisfy. `cache=True` is passed at the
+# get_auth_header() call site below; this AgentSession object itself is
+# unchanged (the disk layer is opt-in per-call, not per-session).
+_UW_SESSION = _client_auth.AgentSession()
+
+
+def call_once(method: str, path: str, payload: dict | None,
+              auth_headers: dict[str, str]) -> tuple[int, dict]:
+    """Single low-level HTTP call -> (status, body_dict). Raises UwError (no
+    status — a transport failure means the world never answered) if the
+    server is unreachable. ``auth_headers`` (the Authorization dict from
+    client_auth, possibly empty) is merged into the request headers — empty
+    dict = today's anonymous/declared behavior."""
+    url = f"{resolve_url()}{path}"
+    data = json.dumps(payload).encode() if payload is not None else None
+    headers = {"Content-Type": "application/json"} if data is not None else {}
+    if auth_headers:
+        headers.update(auth_headers)
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with _client_auth.urlopen_with_cert_fallback(req, 30) as r:
+            body = r.read().decode()
+            return r.status, (json.loads(body) if body else {})
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        try:
+            return e.code, (json.loads(body) if body else {})
+        except json.JSONDecodeError:
+            return e.code, {"error": body or f"HTTP {e.code}"}
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise UwError(f"cannot reach the world at {resolve_url()}: {e}") from e
+
+
+def call(method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
+    """Low-level HTTP call with client-auth + 401-retry-once (umwelt #495).
+
+    Acquires an ``Authorization`` header from ``client_auth`` when an agent
+    identity is set (no agent → anonymous request, no header — today's
+    behavior for the verbs that don't act as an avatar). On a 401 from a
+    bearer-authed request the cached token is invalidated and retried once
+    with a fresh token; the server is the authority on token validity.
+
+    The header is ADDITIVE — the agent identity in the request body is NOT
+    dropped when a token is present. The server still requires ``agent`` in
+    the body even with a valid token (400 'agent is required' otherwise), and
+    ``resolve_actor`` lets the token OVERRIDE the declared param rather than
+    replace it. Do not design toward omitting the body param. (Ariadne,
+    end-to-end finding, 2026-08-18 — measured on alpha against 1d5b90f.)
+
+    Key-present-but-auth-fails raises ``AuthFailure`` (fail closed — do not
+    silently fall back to declared); caught and re-raised as UwError. No-key
+    + fallback-disabled also fails closed. (Mira security ruling, 2026-08-18.)
+    """
+    for attempt in range(2):  # initial + one retry on a 401 of a bearer req
+        agent = _agent_or_none()
+        auth_headers: dict[str, str] = {}
+        if agent is not None:
+            try:
+                auth_headers = _client_auth.get_auth_header(
+                    resolve_url(), agent, _UW_SESSION, cache=True
+                )
+            except _client_auth.AuthFailure as e:
+                raise UwError(
+                    f"authentication failed: {e}", status=401
+                ) from e
+        status, body = call_once(method, path, payload, auth_headers)
+        # Retry once only if we sent a bearer token and the server rejected it.
+        if status == 401 and attempt == 0 and auth_headers:
+            _UW_SESSION.invalidate()
+            continue
+        return status, body
+    return status, body  # pragma: no cover (loop always returns above)
+
+
+def request(method: str, path: str, payload: dict | None = None) -> dict:
+    """call() + status-gate: raises UwError(status=...) on >=400, else
+    returns the parsed body dict."""
+    status, body = call(method, path, payload)
+    if status >= 400:
+        raise UwError(
+            body.get("error", f"request failed (status {status})"),
+            status=status,
+        )
+    return body
+
+
+# --------------------------------------------------------------------------
+# Rendering — concise human lines by default.
+# --------------------------------------------------------------------------
+
+def _print_json(obj: Any) -> None:
+    print(json.dumps(obj, indent=1, ensure_ascii=False))
+
+
+def _view_notes(view: dict) -> list[str]:
+    """The trailing `(your body is here now)` / `(ignored on reconnect: …)`
+    notes — shared by both render modes."""
+    notes = []
+    if view.get("born") is True:
+        notes.append("(your body is here now)")
+    ignored = view.get("ignored")
+    if ignored:
+        notes.append(f"(ignored on reconnect: {', '.join(ignored)})")
+    return notes
+
+
+def _render_arrival_counts(view: dict) -> list[str]:
+    """umwelt#928: the brief arrival body — a counts line and a pointer
+    line. mcp_server.py's `_render_arrival_counts` is the twin (separate
+    file across the plugin boundary); keep the counts-line shape identical.
+    The pointer names `uw look` only: `uw places` lists every place in the
+    world, not the exits from here, and `uw look` shows those."""
+    n = len(view.get("things") or [])
+    parts = [f"{n} thing{'s' if n != 1 else ''}"]
+    present = view.get("present") or []
+    if 1 <= len(present) <= 5:
+        parts.append("present: " + ", ".join(
+            p.get("name") or p.get("agent") or "someone" for p in present))
+    elif present:
+        parts.append(f"{len(present)} present")
+    unseen = view.get("unseen_count") or 0
+    if unseen:
+        parts.append(f"{unseen} unseen crossing{'s' if unseen != 1 else ''}"
+                     f" — 'hear' to read")
+    exits = sum(1 for r in (view.get("reachable") or [])
+                if r.get("relation") != "parent")
+    parts.append(f"{exits} exit{'s' if exits != 1 else ''}")
+    return [" · ".join(parts), "uw look for the room and its exits"]
+
+
+def _render_place(view: dict, arrival: bool = False) -> str:
+    """Render a place view (umwelt #214's uw-side mirror of
+    mcp_server._render_place_view — same content/order, uw's own line
+    shape).
+
+    umwelt#928: pass `arrival=True` (move, enter, register) for the BRIEF
+    render — the `== label ==` header, one counts line, one pointer line to
+    `uw look`, and the born/ignored notes. No description, no thing lines,
+    no exit list. `arrival=False` (the default; `look`'s only mode) is
+    byte-identical to the render this function has always produced.
+    """
+    place = view.get("place") or {}
+    lines = [f"== {place.get('label') or place.get('id', '?')} =="]
+    if arrival:
+        return "\n".join(lines + _render_arrival_counts(view) + _view_notes(view))
+    desc = place.get("description")
+    if desc:
+        lines.append(desc)
+
+    present = view.get("present") or []
+    if present:
+        tags = [p.get("name") or p.get("agent") or "someone" for p in present]
+        lines.append("present: " + ", ".join(tags))
+
+    things = view.get("things") or []
+    for i, t in enumerate(things, 1):
+        d = t.get("description") or ""
+        lines.append(f"{i}. {t['name']}" + (f" — {d}" if d else ""))
+
+    unseen = view.get("unseen_count") or 0
+    if unseen:
+        lines.append(f"{unseen} unseen crossing{'s' if unseen != 1 else ''} — 'hear' to read")
+
+    # umwelt #158: sub-places + lateral links reachable from here (the
+    # engine data is db.place_tree(depth=1); the server sends it structured
+    # as view["reachable"], this is the one place that turns it into prose).
+    # umwelt #239 (folded into #241): `reachable` now also carries a typed
+    # parent entry (`relation: "parent"`) — excluded here to keep this
+    # prose line's behavior unchanged; mcp_server.py's `_render_place_view`
+    # makes the identical exclusion, for the identical reason (see its own
+    # comment) — the two must never drift per this function's own docstring.
+    reachable = [r for r in (view.get("reachable") or [])
+                 if r.get("relation") != "parent"]
+    if reachable:
+        labels = [r.get("label") or r.get("id") for r in reachable]
+        lines.append("from here you can reach: " + ", ".join(labels))
+
+    lines.extend(_view_notes(view))
+
+    return "\n".join(lines)
+
+
+def _render_thing(thing: dict) -> str:
+    lines = [f"{thing.get('name', '?')} ({thing.get('kind', '?')})"]
+    desc = thing.get("description")
+    if desc:
+        lines.append(desc)
+    return "\n".join(lines)
+
+
+def _render_avatar_status(status: dict) -> str:
+    """#143's look_at status block (emotion + last_action + last_active_at
+    + Phase 2's state/activity_line) — plain labeled lines, the file's
+    house style (see _render_health / _render_carry_result). Timestamps
+    are left exactly as the server sent them (the module docstring's
+    "human-readable timestamps left as-is" convention, same as
+    _render_hear). Kind-dispatch + state composition are shared with
+    mcp_server.py and mud.py via umwelt.avatar_status (#178)."""
+    lines = [f"emotion: {status.get('emotion')}"]
+    last_action = status.get("last_action")
+    action_desc = _avatar_status.describe_last_action(last_action)
+    if action_desc:
+        at = (last_action or {}).get("at")
+        lines.append(f"last action: {action_desc} at {at}")
+    last_active_at = status.get("last_active_at")
+    if last_active_at:
+        lines.append(f"last active: {last_active_at}")
+    state_line = _avatar_status.describe_state(status)
+    if state_line:
+        lines.append(f"state: {state_line}")
+    return "\n".join(lines)
+
+
+def _render_params_spec(resp: dict) -> str:
+    """umwelt #396: a params-declaring readable/executable/blueprint
+    returns a `params_spec` sibling key (not `outcome`) when use() is
+    called with empty args (the caller's "--help") or args that failed to
+    bind (spec + `error`). `cmd_use` must render this explicitly — falling
+    through to `_render_use_outcome(resp.get("outcome", {}))` would silently
+    print a blank/near-empty line, since this response shape never carries
+    an `outcome` key at all."""
+    spec = resp.get("params_spec") or {}
+    lines = []
+    err = resp.get("error")
+    if err:
+        lines.append(f"the world says: {err}")
+    lines.append(f"{spec.get('name', '?')} takes these params:")
+    params = spec.get("params") or []
+    if not params:
+        lines.append("  (none declared)")
+    for p in params:
+        bits = [p.get("type", "string"),
+                "required" if p.get("required") else "optional"]
+        if p.get("enum"):
+            bits.append(f"enum={p['enum']}")
+        if not p.get("required") and "default" in p:
+            bits.append(f"default={p['default']!r}")
+        line = f"  - {p.get('name', '?')} ({', '.join(bits)})"
+        if p.get("description"):
+            line += f" — {p['description']}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _render_use_outcome(outcome: dict) -> str:
+    if "error" in outcome:
+        return f"the world says: {outcome['error']}"
+    if outcome.get("kind") == "readable":
+        lines = []
+        briefing = outcome.get("briefing")
+        if briefing:
+            lines.append(briefing)
+        content = outcome.get("content") or {}
+        if not content:
+            lines.append("(empty)")
+        for fname, text in content.items():
+            lines.append(f"--- {fname} ---")
+            lines.append(text if text else "(empty)")
+        return "\n".join(lines)
+
+    lines = []
+    briefing = outcome.get("briefing")
+    if briefing:
+        lines.append(briefing)
+    stdout = (outcome.get("stdout") or "").strip()
+    if stdout:
+        lines.append("--- stdout ---")
+        lines.append(stdout)
+    stderr = (outcome.get("stderr") or "").strip()
+    if stderr:
+        lines.append("--- stderr ---")
+        lines.append(stderr)
+    return "\n".join(lines)
+
+
+def _render_carry_result(verb: str, token: str, resp: dict) -> str:
+    load = resp.get("load")
+    capacity = resp.get("capacity")
+    if load is not None and capacity is not None:
+        return f"{verb} {token} — carrying {load}/{capacity}"
+    return f"{verb} {token}."
+
+
+def _render_inventory(inv: dict) -> str:
+    things = inv.get("things") or []
+    lines = [f"{t['name']} — {t.get('weight_est')}" for t in things]
+    load = inv.get("load", 0)
+    capacity = inv.get("capacity", 0)
+    headroom = inv.get("headroom", capacity - load)
+    lines.append(
+        f"carrying {len(things)} things — load {load} / capacity {capacity} "
+        f"(headroom {headroom})"
+    )
+    return "\n".join(lines)
+
+
+def _render_container_contents(look: dict) -> str:
+    things = look.get("things") or []
+    # umwelt #261 dotted-path follow-up: numbered so a caller can address
+    # what they just saw as "N.M" — mirrors the place render's own
+    # 1-indexed numbering (`_resolve_dotted_ordinal` indexes this same
+    # order via a fresh look_in call, so the number shown here IS the M).
+    lines = ([f"{i}. {t['name']} — {t.get('weight_est')}"
+              for i, t in enumerate(things, 1)] or ["(empty)"])
+    load = look.get("load", 0)
+    capacity = look.get("capacity", 0)
+    lines.append(f"bag load {load} / capacity {capacity}")
+    return "\n".join(lines)
+
+
+def _render_hear(resp: dict, place: str) -> str:
+    # seq, sender, relation, body — the prototype's rendering style
+    # (issue #111's explicit ask), own sends (viewer_relation == "sender")
+    # skipped in the listing but still counted in the cursor advance.
+    crossings = resp.get("crossings") or []
+    lines = []
+    for c in crossings:
+        rel = c.get("viewer_relation", "?")
+        if rel == "sender":
+            continue
+        to = f" →{c['to_agent']}" if c.get("to_agent") else ""
+        body = c.get("body") or c.get("body_ref") or "(no body)"
+        lines.append(
+            f"[{c.get('seq')}] {c.get('sender')}{to} ({rel}) "
+            f"{c.get('received_at', '')[:16]}:\n  {body}"
+        )
+    if not crossings:
+        lines.append(f"(quiet — no new crossings in {place} since {resp.get('from_position')})")
+    # umwelt#616: the server always computes `skipped` (how many additional
+    # qualifying crossings existed beyond what this response returned) —
+    # rendering nothing when it's non-zero is the silent-truncation shape
+    # this fix exists to close. 0/absent (the common case) renders nothing
+    # extra — unchanged from before.
+    skipped = resp.get("skipped") or 0
+    if skipped:
+        lines.append(f"… and {skipped} more; run hear again")
+    return "\n".join(lines)
+
+
+def _render_places(places: list[dict]) -> str:
+    lines = []
+    for i, p in enumerate(places, 1):
+        lines.append(f"{i}. {p.get('label', p['id'])} ({p['id']})")
+    return "\n".join(lines) if lines else "(no places)"
+
+
+# umwelt #160: the interactive map is a forest of place_tree-shaped nodes
+# (one per visible top-level place) — this is the recursive analogue of
+# _render_places above, walking `children` and rendering `links` inline per
+# node (same annotation-not-recursion-level posture place_tree itself uses).
+def _render_map_node(node: dict, depth: int, lines: list[str]) -> None:
+    indent = "  " * depth
+    label = node.get("label") or node.get("id")
+    tags = []
+    if node.get("kind") == "private":
+        tags.append("private")
+    unread = node.get("unread") or 0
+    if unread:
+        tags.append(f"{unread} unread")
+    thing_count = node.get("thing_count") or 0
+    if thing_count:
+        tags.append(f"{thing_count} things")
+    suffix = f" ({', '.join(tags)})" if tags else ""
+    lines.append(f"{indent}- {label} [{node.get('id')}]{suffix}")
+    for link in node.get("links") or []:
+        link_label = f" ({link['link_label']})" if link.get("link_label") else ""
+        lines.append(
+            f"{indent}    -> {link.get('dst_label') or link.get('dst_id')} "
+            f"[{link.get('dst_id')}]{link_label}"
+        )
+    for child in node.get("children") or []:
+        _render_map_node(child, depth + 1, lines)
+
+
+def _render_map_forest(roots: list[dict]) -> str:
+    if not roots:
+        return "(no places match)"
+    lines: list[str] = []
+    for root in roots:
+        _render_map_node(root, 0, lines)
+    return "\n".join(lines)
+
+
+def _render_health(h: dict) -> str:
+    lines = [f"status: {h.get('status')}"]
+    # umwelt #1029: a degraded world says WHY on the line after `status:`.
+    # A healthy probe or an old server (no key) adds nothing.
+    probe = h.get("db_probe")
+    if isinstance(probe, dict) and probe.get("ok") is False:
+        lines.append(f"db_probe: {probe.get('error') or 'unknown error'}")
+    lines.append(f"world: {h.get('world')}")
+    for k in ("commit", "started_at", "world_version"):
+        if h.get(k) is not None:
+            lines.append(f"{k}: {h[k]}")
+    # umwelt #991: the boot-time kinddef drift check is the one /health key
+    # whose purpose is to be SEEN, so it is rendered rather than left to
+    # --json. Absent on servers that predate it -> no line at all.
+    kf = h.get("kinddef_files")
+    if isinstance(kf, dict):
+        missing = kf.get("missing") or []
+        lines.append(f"kinddef_files: {kf.get('checked')} checked, "
+                     f"{len(missing)} missing")
+        for m in missing:
+            lines.append(f"  {m.get('id')} ({m.get('name')}): {m.get('reason')}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Thing-ref resolution (umwelt #135) — every thing-ref verb (look_at, use,
+# take, drop, put, take_out, look_in) accepts either a thing id OR a plain
+# name, resolved against what's actually in view: the current place's
+# things and, where relevant, the avatar's own carried inventory. An id
+# match wins outright (no ambiguity possible); a name match is case-
+# insensitive exact — zero matches or more than one are both loud, named
+# uw-side errors rather than a raw 404 from the server (which only ever
+# understands ids).
+# --------------------------------------------------------------------------
+
+def _current_place_view(agent: str) -> dict:
+    """The full /umwelt/look response for the caller's current place —
+    umwelt #184/#219/forum #263: re-pointed off the side-effecting move_to
+    (which teleported the avatar to a STALE cached `place` whenever the
+    local state file drifted from the server's own idea of where the
+    avatar stands, cmd_look's exact bug per PR2) onto the read-only
+    `POST /umwelt/look`, which resolves the caller's current place
+    SERVER-SIDE from the avatar's own place_id. No local `place` state
+    read at all — this used to read _current_place() (now removed, no
+    other caller), the same drift hazard cmd_look had.
+
+    Shared by _list_place_things (which only needed `things`) and
+    look_at's avatar-inclusive resolver (umwelt #146, which needs `things`
+    AND `present` off the SAME response) so the two don't double the
+    network round-trip when both are needed together."""
+    return request("POST", "/umwelt/look", {"agent": agent})
+
+
+def _list_place_things(agent: str) -> list[dict]:
+    return _current_place_view(agent).get("things") or []
+
+
+def _list_inventory_things(agent: str) -> list[dict]:
+    try:
+        resp = request("POST", "/umwelt/inventory", {"agent": agent})
+    except UwError as e:
+        # No avatar yet ("enter the world first") — nothing carried, not a
+        # resolution-time failure; the caller may still resolve by id or a
+        # name visible in the current place.
+        if e.status == 404:
+            return []
+        raise
+    return resp.get("things") or []
+
+
+def _match_candidates(ref: str, candidates: list[dict]) -> str:
+    for t in candidates:
+        if t.get("id") == ref:
+            return ref
+    lower_ref = ref.lower()
+    matches: dict[str, dict] = {}
+    for t in candidates:
+        if (t.get("name") or "").lower() == lower_ref:
+            matches[t["id"]] = t
+    if not matches:
+        raise UwError(
+            f"no thing matching {ref!r} here — checked ids and names in "
+            "your current place and inventory"
+        )
+    if len(matches) > 1:
+        listing = "; ".join(f"{t.get('name')} ({tid})" for tid, t in matches.items())
+        raise UwError(f"{ref!r} matches more than one thing — specify by id: {listing}")
+    return next(iter(matches))
+
+
+_ORDINAL_RE = re.compile(r"\A\d+\Z")
+
+
+def _resolve_ordinal(ref: str, place_things: list[dict]) -> str | None:
+    """umwelt #261 Gap A — mirror of mcp_server.py's `_resolve_ordinal`
+    (same ordering-source pin, same TOCTOU posture), written to this
+    file's own convention: a bare integer ref (`^\\d+$`) resolves, ALWAYS
+    and unconditionally, as a 1-indexed ordinal into `place_things` (the
+    SAME list `_render_place` numbers as its `f"{i}. {t['name']}"` lines)
+    — never falls through to name-match first.
+
+    Returns None immediately when `ref` isn't digit-shaped, so callers
+    fall through to their existing name/uuid match unchanged. When
+    digit-shaped: in 1-indexed range, returns the thing id; out of range,
+    raises UwError (loud, never a silent wrong-thing resolve) — a
+    digit-shaped ref never falls through to name/uuid matching, in or out
+    of range.
+
+    A thing whose `name` happens to be a pure integer (e.g. "3") is no
+    longer name-addressable via a bare ref — still reachable by its uuid.
+    Rare, accepted at v0, not mitigated here.
+
+    TOCTOU note: `place_things` order is stable under append (new things
+    append at the tail, existing ordinals don't shift) but a removal
+    (trash/take) between when the caller rendered the place and when they
+    act shifts every ordinal after the removed item down by one. This is a
+    known v0 property, not a bug to fix: the out-of-range error is the
+    loud signal, a shifted-but-in-range ordinal is the accepted v0 risk,
+    mitigated by the outcome briefing naming the actually-acted-on thing."""
+    if not _ORDINAL_RE.match(ref):
+        return None
+    n = int(ref)
+    if 1 <= n <= len(place_things):
+        return place_things[n - 1]["id"]
+    raise UwError(f"ordinal {n} out of range — {len(place_things)} thing(s) here; re-look")
+
+
+_DOTTED_ORDINAL_RE = re.compile(r"\A(\d+)\.(\d+)\Z")
+
+
+def _resolve_dotted_ordinal(agent: str, ref: str, place_things: list[dict]) -> str | None:
+    """umwelt #261 dotted-path container addressing — mirror of
+    mcp_server.py's own `_resolve_dotted_ordinal`, written to this file's
+    own raise-UwError convention. Extends Gap A's flat ordinal one level
+    deeper: a ref shaped `N.M` (e.g. "3.1") resolves N as a 1-indexed
+    ordinal into `place_things` (identical rule to `_resolve_ordinal`),
+    requires that thing be `kind == "container"`, then resolves M as a
+    1-indexed ordinal into THAT container's own contents, in the exact
+    order `POST /umwelt/look_in` returns them (the same order look_in's
+    own render numbers) — so "N.M" means "the Mth thing look_in on item N
+    would show you".
+
+    Returns None immediately when `ref` isn't dotted-ordinal-shaped, so
+    callers fall through to their existing ordinal/name/uuid path
+    unchanged. Every other outcome is terminal (a resolved id, or a raised
+    UwError) — a dotted-shaped ref never falls through to name/uuid
+    matching, in range or out.
+
+    v0 scope: PLACE containers only, one level deep — matches
+    `_resolve_ordinal`'s own place-only scope (never indexes inventory);
+    an inventory-held container is out of scope, and a bagged thing that
+    is itself a container is not recursively indexed.
+
+    This WIDENS RESOLUTION only — which ref string maps to which thing
+    id. It does NOT touch `_reachable`'s server-side closed-bag rule
+    (server.py): a mutating verb (take/put/etc.) resolved through this
+    path still fails its own reachability gate, exactly as it does for a
+    direct uuid ref to a bagged thing today."""
+    m = _DOTTED_ORDINAL_RE.match(ref)
+    if not m:
+        return None
+    outer, inner = int(m.group(1)), int(m.group(2))
+    if not (1 <= outer <= len(place_things)):
+        raise UwError(f"ordinal {outer} out of range — {len(place_things)} thing(s) here; re-look")
+    container = place_things[outer - 1]
+    if container.get("kind") != "container":
+        raise UwError(
+            f"item {outer} is {container.get('name')!r}, not a container — "
+            "nothing to index inside it"
+        )
+    look = request("POST", "/umwelt/look_in",
+                    {"agent": agent, "container": container["id"]})
+    contents = look.get("things") or []
+    if not (1 <= inner <= len(contents)):
+        raise UwError(
+            f"ordinal {inner} out of range — {len(contents)} thing(s) in "
+            f"{container.get('name')!r}; look_in it again"
+        )
+    return contents[inner - 1]["id"]
+
+
+def _resolve_thing(agent: str, ref: str, *,
+                    place: bool = True, inventory: bool = True,
+                    containers: bool = False,
+                    passthrough_id: bool = False) -> str:
+    """Resolve `ref` (an id or a name) to a thing id. `containers=True`
+    (take_out's own case — the CLI has no separate <container> arg, the
+    server derives it from the thing's own holder) additionally looks
+    inside every container currently in view, since a bagged thing appears
+    in neither the place's nor the avatar's own listing. Bounded to one
+    level of scanning — "bags don't go in bags (yet)" (umwelt #88 v1 rule)
+    means that's exhaustive.
+
+    umwelt #261 Gap A: when `place=True`, a bare integer ref resolves
+    first, unconditionally, as a 1-indexed ordinal into the place's own
+    things (`_resolve_ordinal`) — before this candidate set even grows to
+    include inventory or the containers scan, so the ordinal never indexes
+    anything but the place-things list the caller's own numbered render
+    shows. `place=False` (drop's candidate set) skips the ordinal branch
+    entirely — a bare integer there has no ordinal meaning and falls
+    through to name/uuid matching unchanged.
+
+    umwelt #261 dotted-path follow-up: when `place=True`, a ref shaped
+    `N.M` is checked FIRST (`_resolve_dotted_ordinal`, more specific
+    pattern first), before the flat-ordinal check — a dotted ref never
+    matches the flat `^\\d+$` pattern anyway, so this ordering is for
+    readability, not correctness. Skipped entirely when `place=False`,
+    same posture as the flat-ordinal branch.
+
+    umwelt #984: `passthrough_id=True` (default OFF; only `use` sets it)
+    adds the same id-shaped pass-through `_resolve_look_at_target` has
+    (#978), applied only after id/name/ordinal matching found NOTHING: a
+    well-formed uuid (`_ids.looks_like_thing_id`) that no candidate is
+    NAMED is returned unchanged for the server to resolve (e.g. a thing
+    nested in a container this view does not enumerate). Ambiguity (>1
+    name hit) and non-id-shaped misses keep the loud client-side error.
+    This adds no reach/privacy gate (the server's use checks identity
+    only; #982 tracks that)."""
+    candidates: list[dict] = []
+    if place:
+        place_things = _list_place_things(agent)
+        dotted_id = _resolve_dotted_ordinal(agent, ref, place_things)
+        if dotted_id is not None:
+            return dotted_id
+        ordinal_id = _resolve_ordinal(ref, place_things)
+        if ordinal_id is not None:
+            return ordinal_id
+        candidates += place_things
+    if inventory:
+        candidates += _list_inventory_things(agent)
+    if containers:
+        seen_containers: set[str] = set()
+        for t in list(candidates):
+            cid = t.get("id")
+            if not cid or cid in seen_containers:
+                continue
+            seen_containers.add(cid)
+            try:
+                look = request("POST", "/umwelt/look_in",
+                                {"agent": agent, "container": cid})
+            except UwError as e:
+                # Skip only the "this isn't a lookable container" shapes
+                # (404/409/422). A transport failure (status None) or 5xx
+                # must surface loudly — swallowing it would degrade a real
+                # outage into a false "no thing matching" from the resolver.
+                if e.status not in (404, 409, 422):
+                    raise
+                continue
+            candidates += look.get("things") or []
+    try:
+        return _match_candidates(ref, candidates)
+    except UwError:
+        if passthrough_id and _looks_like_thing_id(ref) and not any(
+                (t.get("name") or "").lower() == ref.lower() for t in candidates):
+            return ref
+        raise
+
+
+# --------------------------------------------------------------------------
+# look_at's OWN avatar-inclusive resolution (umwelt #146) — #143 added an
+# avatar look_at status block (emotion + last_action + last_active_at) that
+# was engine-complete but unreachable from uw: _resolve_thing above is the
+# SHARED scan every thing-ref verb uses, and it deliberately excludes
+# avatars (presence, not things — they must never become take/use/drop/
+# put-able by accident). This is a look_at-specific superset of that scan,
+# not a change to _resolve_thing itself or its behavior for any other verb.
+# --------------------------------------------------------------------------
+
+def _normalize_avatar(avatar: dict) -> dict:
+    """A present-avatar summary (`{"agent", "avatar_id", "name", ...}` —
+    `_present_summary`'s shape on the server, umwelt #133) copied with
+    `avatar_id` remapped to `id`, so it plugs into _match_candidates's
+    uniform `t.get("id")` / `t.get("name")` lookups alongside thing dicts
+    (which already key their id as `id`). Returns a COPY — never mutates
+    the caller's own dict.
+
+    Id-collision safety (umwelt #146 review): avatars and things are rows
+    in the SAME `things` table (db.py's schema), both minted via
+    uuid.uuid4() (avatar birth in db.py, thing creation in server.py) —
+    same generation scheme, same PRIMARY KEY column. Collision is therefore
+    ruled out by the database's own uniqueness constraint, not by any
+    namespace separation this client relies on."""
+    return {**avatar, "id": avatar.get("avatar_id")}
+
+
+def _resolve_look_at_target(agent: str, ref: str) -> str:
+    """Resolve `ref` (an id or a name) to a thing id, for look_at only —
+    the current place's things, the avatar's own inventory (same two
+    scopes _resolve_thing(place=True, inventory=True) would use), PLUS
+    present avatars in the current place, matched by avatar_id or
+    case-insensitive name. Same match/ambiguity/zero-match semantics as
+    every other verb (_match_candidates) — a name collision between a
+    thing and an avatar in the current place surfaces as the existing
+    ambiguous-match error, listing both, never a silent pick.
+
+    Fetches the place view once (_current_place_view) rather than once for
+    things and again for present, since both come back on the same
+    /umwelt/move_to response.
+
+    umwelt #261 Gap A: a bare integer ref resolves first, unconditionally,
+    as a 1-indexed ordinal into the place's own things (`_resolve_ordinal`)
+    — checked BEFORE inventory/avatars ever enter the candidate set, so
+    the ordinal only ever indexes what the caller's own numbered render
+    showed.
+
+    umwelt #261 dotted-path follow-up: a ref shaped `N.M` is checked FIRST
+    (`_resolve_dotted_ordinal`, more specific pattern first), before the
+    flat-ordinal check — a dotted ref never matches the flat `^\\d+$`
+    pattern anyway, so this ordering is for readability, not correctness."""
+    view = _current_place_view(agent)
+    place_things = list(view.get("things") or [])
+    dotted_id = _resolve_dotted_ordinal(agent, ref, place_things)
+    if dotted_id is not None:
+        return dotted_id
+    ordinal_id = _resolve_ordinal(ref, place_things)
+    if ordinal_id is not None:
+        return ordinal_id
+    candidates: list[dict] = list(place_things)
+    candidates += _list_inventory_things(agent)
+    candidates += [_normalize_avatar(a) for a in (view.get("present") or [])]
+    try:
+        return _match_candidates(ref, candidates)
+    except UwError:
+        # umwelt #978: same id-shaped pass-through mcp_server's resolvers have
+        # (#185 rule 4) -- only after id/name/ordinal/avatar matching found
+        # NOTHING. ANY well-formed uuid is sent to the server (e.g. a thing
+        # nested in a container this view does not enumerate). The server's
+        # look_at today checks identity only -- no reach/status/privacy gate
+        # (pre-existing, tracked as a separate issue); this pass-through does
+        # not add or imply one. Ambiguity (>1 name hit) and non-id-shaped
+        # misses keep the loud client-side error.
+        if _looks_like_thing_id(ref) and not any(
+                (t.get("name") or "").lower() == ref.lower() for t in candidates):
+            return ref
+        raise
+
+
+def _prepare_use_args(raw: str) -> list[str]:
+    """Translate uw's `use <thing> [args]` CLI token into use()'s server
+    contract (umwelt #57, enforced by _validate_use_args server-side): args
+    MUST be a JSON array of strings — a bare object 422s with "args must be
+    an array of strings (got object)", so reject that shape client-side
+    with the same wording rather than let it surface confusingly late. A
+    JSON array passes straight through; anything else (a bare unquoted
+    string, or any other JSON scalar) is wrapped as the single argv token
+    the caller plainly meant (issue #135)."""
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return [raw]
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        raise UwError(
+            "use args must be a JSON array of strings, e.g. "
+            "'[\"a\",\"b\"]' — the server's use() contract rejects an "
+            "object (\"args must be an array of strings\")"
+        )
+    return [raw]
+
+
+# --------------------------------------------------------------------------
+# Verb implementations.
+# --------------------------------------------------------------------------
+
+def cmd_enter(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    resp = request("POST", "/umwelt/enter", {"agent": agent})
+    place_id = (resp.get("place") or {}).get("id")
+    if place_id:
+        save_state(place=place_id)
+    _print_json(resp) if json_mode else print(_render_place(resp, arrival=True))
+
+
+def cmd_register(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    payload: dict[str, Any] = {"agent": agent, "type": args.type}
+    if args.lineage:
+        payload["lineage"] = args.lineage
+    if args.desc:
+        payload["avatar_description"] = args.desc
+    resp = request("POST", "/umwelt/register", payload)
+    place_id = (resp.get("place") or {}).get("id")
+    if place_id:
+        save_state(place=place_id)
+    _print_json(resp) if json_mode else print(_render_place(resp, arrival=True))
+
+
+def cmd_customize_avatar(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    # Tri-state per string field (umwelt #55): omitted (None) -> leave
+    # unchanged; "" -> clear (forwarded verbatim, unlike register's
+    # truthiness-gated --desc/--lineage, since here "" is a meaningful
+    # signal, not "nothing was typed"); non-empty -> set. carry_capacity is
+    # numeric (umwelt #151) and has no string "" to repurpose on a shell, so
+    # clearing it is a dedicated --clear-carry-capacity flag (Ariadne's
+    # design ruling: null is the server's unambiguous clear-signal; a
+    # repurposed sentinel int risks silently reinterpreting a caller's
+    # mistake as "reset").
+    payload: dict[str, Any] = {"agent": agent}
+    if args.description is not None:
+        payload["description"] = args.description
+    if args.lineage is not None:
+        payload["lineage"] = args.lineage
+    if args.type is not None:
+        payload["type"] = args.type
+    if args.clear_carry_capacity:
+        payload["carry_capacity"] = None
+    elif args.carry_capacity is not None:
+        payload["carry_capacity"] = args.carry_capacity
+    resp = request("POST", "/umwelt/customize_avatar", payload)
+    if json_mode:
+        _print_json(resp)
+        return
+    a = resp.get("avatar", {})
+    line = f"customized. description: {a.get('description')}"
+    if a.get("type"):
+        line += f" | type: {a['type']}"
+    if a.get("lineage"):
+        line += f" | lineage: {a['lineage']}"
+    if a.get("carry_capacity"):
+        line += f" | carry_capacity: {a['carry_capacity']}"
+    print(line)
+
+
+def cmd_move(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    resp = request("POST", "/umwelt/move_to", {"agent": agent, "place": args.place})
+    place_id = (resp.get("place") or {}).get("id", args.place)
+    save_state(place=place_id)
+    _print_json(resp) if json_mode else print(_render_place(resp, arrival=True))
+
+
+def cmd_look(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    # umwelt #184/#219/forum #263: re-pointed off the side-effecting move_to
+    # (which teleported the avatar to a STALE cached `place` whenever the
+    # local state file drifted from the server's own idea of where the
+    # avatar stands — the live bug Kepler hit) onto the read-only
+    # `POST /umwelt/look`, which resolves the caller's current place
+    # SERVER-SIDE from the avatar's own place_id — no local `place` state
+    # read, no write of any kind. Re-saves the resolved place_id back into
+    # local state on success (same convention as cmd_move/cmd_enter/
+    # cmd_register) so the cache self-heals here rather than staying stale.
+    resp = request("POST", "/umwelt/look", {"agent": agent})
+    place_id = (resp.get("place") or {}).get("id")
+    if place_id:
+        save_state(place=place_id)
+    _print_json(resp) if json_mode else print(_render_place(resp))
+
+
+def cmd_say(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    place = load_state().get("place", DEFAULT_PLACE)
+    text = " ".join(args.text)
+    payload = {
+        "agent": agent, "destination": place, "sent_at": now_iso(), "body": text,
+    }
+    if args.to:
+        payload["to_agent"] = args.to
+    # umwelt #133: emotion is a small, optional freeform tag on THIS
+    # crossing — passed through only when given, never validated
+    # client-side beyond that (the server owns the contract: 40-char cap,
+    # 422 on violation — see server.py's _validate_emotion). Absent means
+    # "let the server default it", same posture as every other optional
+    # field on this payload.
+    if args.emotion:
+        payload["emotion"] = args.emotion
+    # umwelt #119: mentions merge two sources — explicit --wake (comma-
+    # separated) first, then @name tokens scanned out of the message text via
+    # the shared umwelt.mentions.parse_mentions (umwelt #511 PR B; skips
+    # quoted lines and fenced/inline code, unlike the old bare-regex scan) —
+    # deduped, order preserved. The server is the authority on who's a real,
+    # registered agent (silently drops unknown/self names, umwelt #119 slice
+    # 1) — uw stays dumb here rather than keeping a second, potentially-stale
+    # copy of the avatar registry.
+    mentions: list[str] = []
+    if args.wake:
+        for name in args.wake.split(","):
+            name = name.strip()
+            if name and name not in mentions:
+                mentions.append(name)
+    for name in _mentions.parse_mentions(text):
+        if name not in mentions:
+            mentions.append(name)
+    if mentions:
+        payload["mentions"] = mentions
+    resp = request("POST", "/umwelt/send_crossing", _stamp_sender_lineage(payload))
+    # say must NEVER advance any place's read cursor (umwelt #111's
+    # load-bearing rule — the live seq-26 bug the prototype fixed).
+    if json_mode:
+        _print_json(resp)
+        return
+    print(f"you say: {text}")
+    rang = resp.get("wakes_granted") or []
+    if rang:
+        print(f"🔔 rang: {', '.join(rang)}")
+
+
+_WAKE_DENIAL_REASONS = {
+    "denied:rate": "they've hit their rate limit from you, try again shortly",
+    "denied:consent": "they've blocked you",
+    "denied:broadcast": "a wake needs an addressed recipient",
+}
+
+
+def cmd_wake(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    place = load_state().get("place", DEFAULT_PLACE)
+    text = " ".join(args.text)
+    payload = {
+        "agent": agent, "destination": place, "sent_at": now_iso(), "body": text,
+        "to_agent": args.to, "wake_me": True,
+    }
+    resp = request("POST", "/umwelt/send_crossing", _stamp_sender_lineage(payload))
+    # wake must NEVER advance any place's read cursor — same cursor-discipline
+    # rule as say (umwelt #111's load-bearing rule).
+    if json_mode:
+        _print_json(resp)
+        return
+    wake = resp.get("wake")
+    if wake == "granted":
+        print(f"🔔 woke {args.to}: {text}")
+    else:
+        reason = _WAKE_DENIAL_REASONS.get(wake, "wake not delivered")
+        print(f"sent to {args.to}: {text} (wake NOT delivered — {reason})")
+
+
+def cmd_wake_block(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    resp = request("POST", "/umwelt/wake_block", {"agent": agent, "blocked": args.blocked})
+    _print_json(resp) if json_mode else print(f"blocked {args.blocked} from waking you")
+
+
+def cmd_wake_unblock(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    resp = request("POST", "/umwelt/wake_unblock", {"agent": agent, "blocked": args.blocked})
+    _print_json(resp) if json_mode else print(f"unblocked {args.blocked}")
+
+
+def cmd_wake_blocks(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    resp = request("GET", f"/umwelt/wake_blocks?agent={urllib.parse.quote(agent)}", None)
+    if json_mode:
+        _print_json(resp)
+        return
+    blocked = resp.get("blocked") or []
+    if not blocked:
+        print("you haven't blocked anyone")
+    else:
+        for name in blocked:
+            print(f"blocked: {name}")
+
+
+def cmd_hear(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    place = load_state().get("place", DEFAULT_PLACE)
+    explicit_since = args.since is not None
+    since = args.since if explicit_since else load_state().get(f"cursor_{place}")
+    payload: dict[str, Any] = {"agent": agent, "place": place}
+    if since is not None:
+        payload["since"] = since
+    # umwelt#616: bound the read by default — --all opts back into the old
+    # fully-unbounded behavior (omit `limit` entirely; the server stays on
+    # its unbounded back-compat branch since we never send `advance`
+    # either). --limit lets a caller pick their own window; the server
+    # clamps it to _CROSSINGS_MAX_LIMIT regardless of what we send.
+    #
+    # Reviewer-fairy finding on PR#704: `--limit 0` must be refused, not
+    # silently sent — the server's own `if limit_raw:` check treats 0 the
+    # SAME as absent (Python truthiness), so a payload with `limit: 0`
+    # would silently fall through to the fully-unbounded branch, quietly
+    # reopening the exact bug this fix exists to close. A non-positive
+    # limit has no sensible meaning here anyway (there's no "read zero
+    # crossings" use case) — refuse it loudly instead.
+    if not args.all:
+        if args.limit is not None and args.limit < 1:
+            raise UwError(
+                f"--limit must be a positive integer, got {args.limit} "
+                f"(use --all for unbounded, or omit --limit for the "
+                f"default of {_HEAR_DEFAULT_LIMIT})")
+        payload["limit"] = args.limit if args.limit is not None else _HEAR_DEFAULT_LIMIT
+    resp = request("POST", "/umwelt/crossings_here", payload)
+    # Cursor rule: only a PLAIN hear (no --since) advances the cursor.
+    if not explicit_since and resp.get("to_position") is not None:
+        save_state(**{f"cursor_{place}": resp["to_position"]})
+    _print_json(resp) if json_mode else print(_render_hear(resp, place))
+
+
+def cmd_look_at(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    # look_at's own avatar-inclusive resolution (umwelt #146) — NOT
+    # _resolve_thing, which every other thing-ref verb still uses
+    # unchanged (avatars must stay un-take/use/drop/put-able).
+    thing_id = _resolve_look_at_target(agent, args.thing)
+    resp = request("POST", "/umwelt/look_at", {"agent": agent, "thing": thing_id})
+    if json_mode:
+        _print_json(resp)
+        return
+    thing = resp.get("thing", {})
+    lines = [_render_thing(thing)]
+    # #143: `status` is a sibling key to `thing`, present only when the
+    # target is an avatar-kind thing (the server's own gate — see
+    # server.py's look_at route) — mirror that same gate here rather than
+    # rendering on `status`'s mere presence alone.
+    status = resp.get("status")
+    if status is not None and thing.get("kind") == "avatar":
+        lines.append(_render_avatar_status(status))
+    # umwelt #182: `checklist_render` is a sibling key to `thing`, present
+    # only when the target has a non-empty metadata.checklist (the server's
+    # own gate — see server.py's look_at route / _render_checklist) — same
+    # "mirror the gate, don't guess from presence alone" posture as `status`
+    # above. Makes a checklist readable via plain `uw look_at`, not just
+    # --json.
+    checklist_render = resp.get("checklist_render")
+    if checklist_render is not None:
+        lines.append(checklist_render)
+    # umwelt #227/#249 dogfood friction (Ariadne, forum #268/#4753):
+    # `board_render` is a sibling key to `thing`, present only for a bound
+    # project_board instance (the server's own gate — see server.py's
+    # look_at route / _render_project_board) — same "omitted entirely when
+    # N/A, presence-check alone suffices" posture as `checklist_render`
+    # above. Without this, `uw look_at <board>` (plain text) silently
+    # looked like boards had no task list at all, even though --json's
+    # board_render carried the full render the whole time.
+    board_render = resp.get("board_render")
+    if board_render is not None:
+        lines.append(board_render)
+    print("\n".join(lines))
+
+
+def cmd_use(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    # umwelt #984: use ONLY -- an id-shaped ref the view does not list goes to
+    # the server unchanged (MCP `use` already does). take/drop/put/take_out
+    # keep the strict client-side resolution.
+    thing_id = _resolve_thing(agent, args.thing, passthrough_id=True)
+    payload: dict[str, Any] = {"agent": agent, "thing": thing_id}
+    if args.use_args is not None:
+        payload["args"] = _prepare_use_args(args.use_args)
+    resp = request("POST", "/umwelt/use", payload)
+    if json_mode:
+        _print_json(resp)
+    elif "params_spec" in resp:
+        print(_render_params_spec(resp))
+    else:
+        outcome = resp.get("outcome", {})
+        print(_render_use_outcome(outcome))
+
+
+def cmd_take(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    # take's target must already be in the place (not carried) — no point
+    # offering already-carried things as candidates.
+    thing_id = _resolve_thing(agent, args.thing, inventory=False)
+    resp = request("POST", "/umwelt/take", {"agent": agent, "thing": thing_id})
+    _print_json(resp) if json_mode else print(_render_carry_result("you take", args.thing, resp))
+
+
+def cmd_drop(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    # drop's target must already be carried — no point offering place
+    # things as candidates.
+    thing_id = _resolve_thing(agent, args.thing, place=False)
+    resp = request("POST", "/umwelt/drop", {"agent": agent, "thing": thing_id})
+    _print_json(resp) if json_mode else print(_render_carry_result("you drop", args.thing, resp))
+
+
+def cmd_put(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    thing_id = _resolve_thing(agent, args.thing)
+    container_id = _resolve_thing(agent, args.container)
+    resp = request("POST", "/umwelt/put", {
+        "agent": agent, "thing": thing_id, "container": container_id,
+    })
+    _print_json(resp) if json_mode else print(
+        _render_carry_result("you put", f"{args.thing} in {args.container}", resp)
+    )
+
+
+def cmd_take_out(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    # No <container> arg — the server derives it from the thing's own
+    # holder_id, and a CLI must not accept-and-ignore an argument
+    # (Borges's colleague review on #113: drop it rather than discard it).
+    # containers=True: a bagged thing isn't in the place or inventory
+    # listing directly (see _resolve_thing's docstring).
+    thing_id = _resolve_thing(agent, args.thing, containers=True)
+    resp = request("POST", "/umwelt/take_out", {"agent": agent, "thing": thing_id})
+    _print_json(resp) if json_mode else print(
+        _render_carry_result("you take out", args.thing, resp)
+    )
+
+
+def cmd_look_in(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    container_id = _resolve_thing(agent, args.container)
+    resp = request("POST", "/umwelt/look_in", {"agent": agent, "container": container_id})
+    _print_json(resp) if json_mode else print(_render_container_contents(resp))
+
+
+def cmd_inv(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    resp = request("POST", "/umwelt/inventory", {"agent": agent})
+    _print_json(resp) if json_mode else print(_render_inventory(resp))
+
+
+def cmd_send_home(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    resp = request("POST", "/umwelt/send_home", {"agent": agent, "thing": args.thing})
+    _print_json(resp) if json_mode else print(
+        _render_carry_result("you send home", args.thing, resp)
+    )
+
+
+def cmd_act(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    kv: dict[str, str] = {}
+    for pair in args.arg or []:
+        if "=" not in pair:
+            raise UwError(f"--arg must be key=value (got {pair!r})")
+        k, v = pair.split("=", 1)
+        kv[k] = v
+    payload = {"agent": agent, "thing": args.thing, "action": args.action, "args": kv}
+    resp = request("POST", "/umwelt/act", payload)
+    if json_mode:
+        _print_json(resp)
+    else:
+        print(f"{args.thing} -> {args.action}: status={resp.get('status')}")
+
+
+def cmd_create_place(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    payload: dict[str, Any] = {
+        "agent": agent, "label": args.label, "description": args.desc,
+    }
+    if args.kind:
+        payload["kind"] = args.kind
+    if args.id:
+        payload["id"] = args.id
+    if args.parent:
+        payload["parent"] = args.parent
+    resp = request("POST", "/umwelt/create_place", payload)
+    place = resp.get("place", {})
+    _print_json(resp) if json_mode else print(
+        f"created {place.get('id')} ({place.get('label')})"
+    )
+
+
+def cmd_set_parent(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    payload: dict[str, Any] = {"agent": agent, "place": args.place}
+    if args.parent:
+        payload["parent"] = args.parent
+    resp = request("POST", "/umwelt/set_parent", payload)
+    _print_json(resp) if json_mode else print(
+        f"{args.place} parent -> {resp.get('parent') or '(top-level)'}"
+    )
+
+
+def cmd_update_place(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    try:
+        metadata = json.loads(args.metadata_json)
+    except json.JSONDecodeError as e:
+        raise UwError(f"--metadata-json is not valid JSON: {e}") from e
+    payload: dict[str, Any] = {
+        "agent": agent, "place": args.place, "patch": {"metadata": metadata},
+    }
+    resp = request("POST", "/umwelt/update_place", payload)
+    _print_json(resp) if json_mode else print(
+        f"{args.place} metadata updated"
+    )
+
+
+def cmd_update_thing(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    patch: dict[str, Any] = {}
+    if args.name is not None:
+        patch["name"] = args.name
+    if args.description is not None:
+        patch["description"] = args.description
+    if args.exec_command is not None:
+        patch["exec_command"] = args.exec_command
+    if args.source_json is not None:
+        try:
+            patch["source"] = json.loads(args.source_json)
+        except json.JSONDecodeError as e:
+            raise UwError(f"--source-json is not valid JSON: {e}") from e
+    if args.metadata_json is not None:
+        try:
+            meta_patch = json.loads(args.metadata_json)
+        except json.JSONDecodeError as e:
+            raise UwError(f"--metadata-json is not valid JSON: {e}") from e
+        if not isinstance(meta_patch, dict):
+            raise UwError("--metadata-json must be a JSON object")
+        # umwelt #393: server.py's update_thing route now merges metadata
+        # server-side for BOTH kind-typed AND untyped things (a null value
+        # clears a key; an omitted key is left untouched) — previously only
+        # kind-typed things got that merge, so this command used to fetch
+        # the thing's current metadata, merge meta_patch into it client-
+        # side, strip engine-owned keys the server would otherwise 422 on,
+        # and refuse loudly on a graft-tracked thing whose patch didn't
+        # address graft_ref (omission under the OLD full-replace-for-
+        # untyped semantics would have silently DROPPED it, corrupting
+        # advance_ref's compare-and-swap invariant). None of that is needed
+        # now: the server merges, so omission means "leave unchanged" for
+        # every thing, typed or not — the caller's own patch can be
+        # forwarded exactly as given. The server still 422s on an explicit
+        # attempt to SET action_log/graft_ref/graft_version (any thing) or
+        # status/kind_id (kind-typed) — that's real protection, unaffected
+        # by this simplification, and its error text surfaces via
+        # request()'s normal >=400 handling below.
+        patch["metadata"] = meta_patch
+
+    if not patch:
+        raise UwError("nothing to update — pass at least one of "
+                      "--name/--description/--exec-command/--metadata-json/--source-json")
+
+    resp = request("POST", "/umwelt/update_thing",
+                   {"agent": agent, "thing": args.thing, "patch": patch})
+    _print_json(resp) if json_mode else print(
+        f"{args.thing} updated: {', '.join(sorted(resp.get('updated', [])))}"
+    )
+
+
+def cmd_add_link(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    payload: dict[str, Any] = {"agent": agent, "src": args.src, "dst": args.dst}
+    if args.label:
+        payload["label"] = args.label
+    if args.one_way:
+        payload["mutual"] = False
+    resp = request("POST", "/umwelt/add_link", payload)
+    _print_json(resp) if json_mode else print(
+        f"linked {args.src} {'->' if args.one_way else '<->'} {args.dst}"
+    )
+
+
+def cmd_remove_link(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    payload: dict[str, Any] = {"agent": agent, "src": args.src, "dst": args.dst}
+    if args.one_way:
+        payload["mutual"] = False
+    resp = request("POST", "/umwelt/remove_link", payload)
+    _print_json(resp) if json_mode else print(
+        f"unlinked {args.src} {'->' if args.one_way else '<->'} {args.dst}"
+    )
+
+
+def cmd_checklist(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    # `value1`/`value2` carry different meanings per op (umwelt #182):
+    #   check/uncheck/remove -> value1 = item (1-based)
+    #   add                  -> value1 = text
+    #   edit                 -> value1 = item, value2 = text
+    #   reset                -> neither used
+    payload: dict[str, Any] = {"agent": agent, "thing": args.thing, "op": args.op}
+    if args.op in ("check", "uncheck", "remove"):
+        if args.value1 is None:
+            raise UwError(f"{args.op} requires an item number")
+        try:
+            payload["item"] = int(args.value1)
+        except ValueError as e:
+            raise UwError(f"item must be an integer (got {args.value1!r})") from e
+    elif args.op == "add":
+        if args.value1 is None:
+            raise UwError("add requires text")
+        payload["text"] = args.value1
+    elif args.op == "edit":
+        if args.value1 is None or args.value2 is None:
+            raise UwError("edit requires an item number and text")
+        try:
+            payload["item"] = int(args.value1)
+        except ValueError as e:
+            raise UwError(f"item must be an integer (got {args.value1!r})") from e
+        payload["text"] = args.value2
+    resp = request("POST", "/umwelt/checklist", payload)
+    if json_mode:
+        _print_json(resp)
+    elif args.full:
+        # umwelt#867: --full is client-only (never posted above) and prints
+        # the full block, unchanged from today's default.
+        print(resp.get("render") or
+              f"{args.thing}: {args.op} applied — "
+              f"{resp.get('done_count')}/{resp.get('total')} done.")
+    else:
+        # umwelt#867: default is the bounded one-item headline; an older
+        # world with no `headline` key falls back to the full block, then
+        # to the applied-line, so an old server never loses output.
+        print(resp.get("headline") or resp.get("render") or
+              f"{args.thing}: {args.op} applied — "
+              f"{resp.get('done_count')}/{resp.get('total')} done.")
+
+
+def cmd_forge(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    try:
+        spec = json.loads(Path(args.spec_file).read_text())
+    except OSError as e:
+        raise UwError(f"cannot read {args.spec_file!r}: {e}") from e
+    except json.JSONDecodeError as e:
+        raise UwError(f"{args.spec_file!r} is not valid JSON: {e}") from e
+    place = load_state().get("place", DEFAULT_PLACE)
+    # umwelt #950: the engine ignores a top-level `place` inside the spec (the
+    # request's place wins; measured on a test world). Say so on stderr rather
+    # than let the author believe the key placed the thing. Warning only: the
+    # spec is forwarded unchanged and the exit status is not touched.
+    if isinstance(spec, dict) and "place" in spec:
+        print(f"uw: forge: warning: the spec's top-level 'place' "
+              f"({spec['place']!r}) is ignored by the engine; the forge is "
+              f"attempted in {place!r}, the place uw has on record for you "
+              f"(the world refuses unless that is where you stand)",
+              file=sys.stderr)
+    resp = request("POST", "/umwelt/create_thing", {
+        "agent": agent, "place": place, "spec": spec,
+    })
+    # umwelt #950: `place` here is the one POSTed above (client state), NOT a
+    # read-back from the server. It makes a misplacement visible at the console
+    # (compare it with where `uw look` says you stand); it does not prove where
+    # the engine stored the thing. Keep the "thing id <id>" prefix stable.
+    _print_json(resp) if json_mode else print(
+        f"forged {spec.get('name')!r} — thing id {resp.get('thing_id')} "
+        f"in {place}"
+    )
+
+
+def cmd_places(args: argparse.Namespace, json_mode: bool) -> None:
+    status, body = call("GET", "/umwelt/places", None)
+    if status >= 400:
+        raise UwError(body.get("error", f"request failed (status {status})"), status=status)
+    places = body.get("places", [])
+    _print_json(body) if json_mode else print(_render_places(places))
+
+
+def cmd_map(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    # umwelt #160: identity-required (like move/look), unlike `places` —
+    # the map is a viewer-scoped filter+visibility render, not the flat
+    # legacy list. POST (JSON body), same as every other identity-requiring
+    # verb in this file (`places`/`health` are the only GET-no-body verbs).
+    payload: dict[str, Any] = {"agent": agent}
+    if args.name:
+        payload["name"] = args.name
+    if args.kind:
+        payload["kind"] = args.kind
+    if args.owner:
+        payload["owner"] = args.owner
+    if args.unread_only:
+        payload["unread_only"] = True
+    if args.depth is not None:
+        payload["depth"] = args.depth
+    resp = request("POST", "/umwelt/map", payload)
+    roots = resp.get("roots") or []
+    _print_json(resp) if json_mode else print(_render_map_forest(roots))
+
+
+def cmd_health(args: argparse.Namespace, json_mode: bool) -> None:
+    status, body = call("GET", "/health", None)
+    if status >= 400:
+        raise UwError(body.get("error", f"request failed (status {status})"), status=status)
+    _print_json(body) if json_mode else print(_render_health(body))
+
+
+# --------------------------------------------------------------------------
+# Argument parsing.
+# --------------------------------------------------------------------------
+
+# Verbs that don't act as an avatar — no UMWELT_AGENT required.
+_NO_IDENTITY_VERBS = {"places", "health"}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="uw",
+        description="uw — the umwelt agent CLI: natural verbs, single-shot, "
+                     "no HTTP construction (umwelt #111).",
+    )
+    parser.add_argument("--json", action="store_true",
+                        help="print the server's raw JSON response instead "
+                             "of a concise human line (give this BEFORE the verb)")
+    sub = parser.add_subparsers(dest="verb", required=True)
+
+    sub.add_parser("enter", help="birth-or-reconnect your avatar, land wherever it stands "
+                                  "(prints one line of counts — things, present, unseen, exits; 'uw look' shows everything)")
+
+    p = sub.add_parser("register", help="register (or reconnect) — pick a name, describe your avatar "
+                                        "(prints one line of counts — things, present, unseen, exits; 'uw look' shows everything)")
+    p.add_argument("--type", choices=("human", "agent"), default="human")
+    p.add_argument("--lineage", default="", help="e.g. anthropic:fable (agent type only)")
+    p.add_argument("--desc", default="", help="one-line avatar description")
+
+    p = sub.add_parser("customize-avatar", help="set/clear your own avatar's "
+                                                 "description/lineage/type/carry-capacity after birth")
+    p.add_argument("--description", default=None,
+                   help="one-line avatar description; pass an empty string to clear")
+    p.add_argument("--lineage", default=None,
+                   help="e.g. anthropic:fable (agent type only); pass an empty string to clear")
+    p.add_argument("--type", default=None,
+                   help="human or agent; pass an empty string to clear")
+    p.add_argument("--carry-capacity", type=int, default=None, metavar="N",
+                   help="your own per-agent carry budget, in weight_est tokens (positive int)")
+    p.add_argument("--clear-carry-capacity", action="store_true",
+                   help="reset carry_capacity back to the world default (env "
+                        "UMWELT_CARRY_CAPACITY / CARRY_CAPACITY_DEFAULT); "
+                        "takes precedence over --carry-capacity if both are given")
+
+    p = sub.add_parser("move", help="move to a place by its exact id "
+                                    "(prints one line of counts — things, present, unseen, exits; 'uw look' shows everything)")
+    p.add_argument("place")
+
+    sub.add_parser("look", help="re-render where you are")
+
+    p = sub.add_parser("say", help="speak in your current place")
+    p.add_argument("text", nargs="+")
+    p.add_argument("--to", default=None, help="address the crossing to an agent")
+    p.add_argument("--wake", default=None, help="comma-separated agent names to explicitly wake (in addition to any @name in the text)")
+    p.add_argument("--emotion", default=None, help="one small freeform tag for your emotional state at send time (optional; the server defaults it when omitted, caps it at 40 chars, and 422s on violation)")
+
+    p = sub.add_parser("hear", help="read crossings here since your cursor")
+    p.add_argument("--since", type=int, default=None,
+                   help="an explicit seq — does NOT advance your cursor")
+    _limit_group = p.add_mutually_exclusive_group()
+    _limit_group.add_argument(
+        "--limit", type=int, default=None,
+        help=f"cap how many crossings to return (default {_HEAR_DEFAULT_LIMIT}; "
+             f"server clamps to {_HEAR_MAX_LIMIT})")
+    _limit_group.add_argument(
+        "--all", action="store_true",
+        help="no cap — read every qualifying crossing (umwelt#616: can be large)")
+
+    p = sub.add_parser("wake", help="send an addressed crossing with a wake request")
+    p.add_argument("to", help="the agent to wake")
+    p.add_argument("text", nargs="+")
+
+    p = sub.add_parser("wake-block", help="block an agent from ever waking you")
+    p.add_argument("blocked", help="the agent to block")
+
+    p = sub.add_parser("wake-unblock", help="remove an agent from your wake-block list")
+    p.add_argument("blocked", help="the agent to unblock")
+
+    sub.add_parser("wake-blocks", help="list agents you've blocked from waking you")
+
+    p = sub.add_parser("look_at", help="inspect a thing's description (no "
+                                        "execution) — id or a name in view")
+    p.add_argument("thing")
+
+    p = sub.add_parser("use", help="execute a thing — id or a name in view")
+    p.add_argument("thing")
+    p.add_argument("use_args", nargs="?", default=None, metavar="ARGS",
+                   help="argv for the thing's exec_command — a JSON array "
+                        "of strings, e.g. '[\"a\",\"b\"]' (the server's "
+                        "use() contract, umwelt #57); a bare token like "
+                        "`hello` is wrapped into a one-element array; a "
+                        "bare JSON object is rejected client-side, since "
+                        "the server does too")
+
+    p = sub.add_parser("take", help="pick a thing up — id or a name "
+                                     "visible in your current place")
+    p.add_argument("thing")
+
+    p = sub.add_parser("drop", help="put down a carried thing — id or a "
+                                     "name in your inventory")
+    p.add_argument("thing")
+
+    p = sub.add_parser("put", help="put a thing into a container — id or "
+                                    "a name in view, for both")
+    p.add_argument("thing")
+    p.add_argument("container")
+
+    p = sub.add_parser("take_out", help="pull a thing out of its container "
+                                        "(the world knows which one holds "
+                                        "it) — id or a name inside a "
+                                        "container in view")
+    p.add_argument("thing")
+
+    p = sub.add_parser("look_in", help="see what's inside a container — "
+                                        "id or a name in view")
+    p.add_argument("container")
+
+    sub.add_parser("inv", help="what you're carrying, and your carry budget")
+
+    p = sub.add_parser("send_home", help="remote-move a thing to your own post")
+    p.add_argument("thing")
+
+    p = sub.add_parser("act", help="execute a kind-declared action on a typed thing")
+    p.add_argument("thing")
+    p.add_argument("action")
+    p.add_argument("--arg", action="append", metavar="k=v",
+                   help="repeatable; each becomes a string entry in the args object")
+
+    p = sub.add_parser("create-place", help="open a new purposed place")
+    p.add_argument("label")
+    p.add_argument("--desc", required=True, help="place description (required by the world)")
+    p.add_argument("--kind", choices=("public", "private"), default=None)
+    p.add_argument("--id", default=None, help="explicit place id (else derived from label)")
+    p.add_argument("--parent", default=None,
+                   help="nest under this place id (default: top-level, "
+                        "NOT your current place)")
+
+    p = sub.add_parser("set-parent", help="set (or clear) a place's parent")
+    p.add_argument("place", help="the place id to reparent")
+    p.add_argument("--parent", default=None,
+                   help="the new parent place id (omit to clear back to top-level)")
+
+    p = sub.add_parser("update-place", help="patch a place's metadata "
+                                             "(place-lane-tiles spec) — "
+                                             "owner-only, or any agent for "
+                                             "an owner-less engine-genesis "
+                                             "place")
+    p.add_argument("place", help="the place id to patch")
+    p.add_argument("--metadata-json", required=True,
+                   help="JSON object (full replace, not a merge) — e.g. "
+                        '\'{"lane_tiles": {"sky": {"class": "sky-tile"}}}\'')
+
+    p = sub.add_parser("update-thing", help="patch a thing you authored — "
+                                             "fix a mistaken forge without "
+                                             "re-creating it (umwelt #294)")
+    p.add_argument("thing", help="the thing id to patch (author-only)")
+    p.add_argument("--name", default=None, help="new name")
+    p.add_argument("--description", default=None, help="new description")
+    p.add_argument("--exec-command", default=None,
+                   help="new exec_command (executable things only)")
+    p.add_argument("--metadata-json", default=None,
+                   help="JSON object — MERGED into the thing's existing "
+                        "metadata (existing keys not mentioned survive); "
+                        "a null value for a key clears it, e.g. "
+                        '\'{"render_spec": {"sprite": "lantern"}}\'')
+    p.add_argument("--source-json", default=None,
+                   help="JSON object mapping relative file paths to new "
+                        "contents (full replace of source)")
+
+    p = sub.add_parser("add-link", help="add a lateral link between two places")
+    p.add_argument("src", help="the link's source place id")
+    p.add_argument("dst", help="the link's destination place id")
+    p.add_argument("--label", default=None, help="an optional label for the link")
+    p.add_argument("--one-way", action="store_true",
+                   help="write only src->dst (default: mutual, writes both directions)")
+
+    p = sub.add_parser("remove-link", help="remove a lateral link between two places")
+    p.add_argument("src", help="the link's source place id")
+    p.add_argument("dst", help="the link's destination place id")
+    p.add_argument("--one-way", action="store_true",
+                   help="remove only src->dst (default: mutual, removes both directions)")
+
+    p = sub.add_parser("checklist", help="check/uncheck/reset/add/remove/edit "
+                                          "a thing's checklist items (umwelt #182)")
+    p.add_argument("thing")
+    p.add_argument("op", choices=("check", "uncheck", "reset", "add", "remove", "edit"))
+    p.add_argument("value1", nargs="?", default=None,
+                   help="item number (check/uncheck/remove/edit) or text (add)")
+    p.add_argument("value2", nargs="?", default=None,
+                   help="text (edit only, after the item number)")
+    p.add_argument("--full", action="store_true",
+                   help="print the full checklist block instead of the "
+                        "default bounded one-item headline (umwelt #867). "
+                        "Client-only — never sent to the world.")
+
+    p = sub.add_parser("forge", help="create_thing from a spec file")
+    p.add_argument("spec_file", help="path to a JSON create_thing spec")
+
+    sub.add_parser("places", help="list every place in the world")
+    sub.add_parser("health", help="the world server's health/version info")
+
+    p = sub.add_parser("map", help="the interactive map — filterable "
+                                    "full-forest view of every place "
+                                    "visible to you (umwelt #160)")
+    p.add_argument("--name", default=None,
+                   help="case-insensitive substring filter on label")
+    p.add_argument("--kind", choices=("public", "private"), default=None)
+    p.add_argument("--owner", default=None, help="exact-match filter on owner")
+    p.add_argument("--unread-only", action="store_true",
+                   help="only show nodes with unread crossings")
+    p.add_argument("--depth", type=int, default=None,
+                   help="cap the walk depth per root (omit for unbounded)")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        if args.verb in _NO_IDENTITY_VERBS:
+            if args.verb == "places":
+                cmd_places(args, args.json)
+            else:
+                cmd_health(args, args.json)
+            return 0
+
+        agent_raw = resolve_agent()
+        agent = _canonical_agent(agent_raw)
+
+        handlers = {
+            "enter": cmd_enter,
+            "register": cmd_register,
+            "customize-avatar": cmd_customize_avatar,
+            "move": cmd_move,
+            "look": cmd_look,
+            "say": cmd_say,
+            "wake": cmd_wake,
+            "wake-block": cmd_wake_block,
+            "wake-unblock": cmd_wake_unblock,
+            "wake-blocks": cmd_wake_blocks,
+            "hear": cmd_hear,
+            "look_at": cmd_look_at,
+            "use": cmd_use,
+            "take": cmd_take,
+            "drop": cmd_drop,
+            "put": cmd_put,
+            "take_out": cmd_take_out,
+            "look_in": cmd_look_in,
+            "inv": cmd_inv,
+            "send_home": cmd_send_home,
+            "act": cmd_act,
+            "create-place": cmd_create_place,
+            "set-parent": cmd_set_parent,
+            "update-place": cmd_update_place,
+            "update-thing": cmd_update_thing,
+            "add-link": cmd_add_link,
+            "remove-link": cmd_remove_link,
+            "checklist": cmd_checklist,
+            "forge": cmd_forge,
+            "map": cmd_map,
+        }
+        handler = handlers[args.verb]
+        handler(agent, args, args.json)
+        return 0
+    except UwError as e:
+        prefix = f"{e.status} " if e.status is not None else ""
+        print(f"uw: {args.verb}: {prefix}{e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

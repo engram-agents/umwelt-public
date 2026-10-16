@@ -1,0 +1,51 @@
+# release-minus-set.txt — paths excluded from the PUBLIC release snapshot of Umwelt.
+#
+# Umwelt is cut by engram-alpha's tools/release-cutover.py run with
+# --source <this checkout> (see docs/RELEASING.md, itself excluded below).
+# This is the ONLY hand-maintained part of the cutover. One entry per line;
+# gitignore-style globs (matched against repo-root-relative POSIX paths).
+# Lines starting with # are ignored. Every entry must match something on the cut
+# ref: the tool warns on an entry that matches nothing, and a warning is a defect.
+# A trailing / means a directory. A leading / (or any other slash) anchors the
+# entry to the repo root; a bare name matches at ANY depth.
+# (.claude/ is deliberately absent: no tracked file lives there. Add it the day
+# one does.)
+
+# --- Dev / Claude-project workspace (not part of the product) ---
+CLAUDE.md
+
+# --- CI / dev-policy workflows (private dev infra) ---
+.github/
+
+# --- Dev test suite. UNANCHORED on purpose: the only tests directory is
+#     src/umwelt/tests/, at depth, and an anchored /tests/ would miss it. ---
+tests/
+
+# --- Host-specific deploy files at the repo ROOT (anchored, so it can never
+#     swallow a shipped src/**/deploy/). ---
+/deploy/
+
+# --- Network identity: LAN and tailnet addresses of the home host. ---
+docs/TAILNET-TRUST-BOUNDARY.md
+
+# --- Identity audit naming people. ---
+docs/design/identity-audit-557.md
+
+# --- Commander tool reading the private CI; names the private repo. ---
+tools/ci-nightly-read.py
+
+# --- Dev-process doc: how to cut a release. ---
+docs/RELEASING.md
+
+# --- GPU art/voice services and art-curation tools: a stranger cannot run the
+#     GPU services or the curation tools; no shipped module imports gpu_services;
+#     the gateway answers 503 "not configured" when the service URLs are unset.
+#     tools/pixel_art_* is a glob on purpose: it also catches the
+#     pixel_art_manifest*.json and pixel_art_reroll*.json data files. ---
+src/umwelt/gpu_services/
+requirements-gpu-services.txt
+docs/gpu-services/
+tools/pixel_art_*
+tools/promote_art_library.py
+tools/populate_generics.py
+tools/s3d_backfill_boards.py

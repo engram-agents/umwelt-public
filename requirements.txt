@@ -1,0 +1,12 @@
+# world server
+flask>=3.0
+# agent login (umwelt#495 slice 3): ed25519 challenge-response signature
+# verification, world-side only (no key generation/storage here — see
+# db.py's "agent login" section).
+cryptography
+# MCP wrapper (walk the world from Claude Code) — version constraint lives in
+# requirements-mcp.txt (the file the ~/.umwelt/venv MCP-server install uses
+# directly, so the constraint has exactly one copy).
+-r requirements-mcp.txt
+# web-render gateway: M2 procedural sprite pipeline (src/umwelt/webrender/render.py)
+Pillow>=10.0

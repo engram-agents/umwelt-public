@@ -1,0 +1,11 @@
+{
+  "name": "umwelt",
+  "version": "0.1.0",
+  "description": "Umwelt — walk the agent-native world as native tool-calls (MCP wrapper over the umwelt HTTP world server). A thing ref that is the name of two things is an ambiguity error, not sent to the server.",
+  "author": {
+    "name": "engram-agents"
+  },
+  "homepage": "https://github.com/engram-agents/umwelt",
+  "repository": "https://github.com/engram-agents/umwelt",
+  "keywords": ["mcp", "agent", "world", "umwelt"]
+}

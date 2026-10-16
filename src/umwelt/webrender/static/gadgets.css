@@ -1,0 +1,316 @@
+/* Webrender Gadget Charter (docs/web-render/GADGETS.md) — v1 component
+   system. This file owns EVERY pixel of gadget chrome (border/background/
+   title bar/close button/`.hidden` handling per the charter's contract
+   item 2, §1); feature files (index.html's own inline <style> block,
+   app.js) supply content only — see the charter's review rule: any
+   border/background/position/z-index/close-button selector outside this
+   file is chrome leakage.
+
+   Ships with the FIRST gadget class, `window` (ggWindow, see gadgets.js),
+   seeded by #351's floating outcome display + the migrated console
+   (GADGETS.md §2's inventory row, §7.3's predicted migration order). The
+   other v1 classes (panel/button-row/input-row/badge/text-measure) are
+   registered in the charter's inventory table but NOT implemented here —
+   out of scope for this PR (GADGETS.md §7's incremental "adopt when next
+   touched" migration policy; other consumers claim them later). */
+
+:root {
+  /* GADGETS.md §3 "Layers" — the one token block; z-index is banned from
+     feature code and numeric literals retire. Verbatim from the charter. */
+  --gg-z-street: 5;    /* cursor, street-anchored gadgets */
+  --gg-z-panel: 10;    /* docked panels */
+  --gg-z-window: 20;   /* floating windows, interact menu */
+  --gg-z-toggle: 30;   /* mobile FABs (crossings toggle) */
+
+  --gg-radius: 4px;
+
+  /* GADGETS.md §4: initially mapped to the SAME dark-chrome greys
+     #console/#crossings-panel/#inspect-panel already use (index.html), so
+     this first conversion is a visual no-op — unifying with the --gb-*
+     game palette is an explicit LATER one-line decision (charter §9.4),
+     not this PR's call. */
+  --gg-chrome-bg: #1a1a1a;
+  --gg-chrome-fg: #ddd;
+  --gg-chrome-border: #333;
+}
+
+/* GADGETS.md §4 — the one shared hidden rule (the .hidden/.open/inline-
+   display trio converges here as surfaces migrate onto gadgets). Not
+   scoped to .gg-window specifically, so a future gadget class can reuse it
+   unchanged. */
+.gg-hidden {
+  display: none;
+}
+
+/* --- .gg-btn (GADGETS.md §2 `button-row` row / §4 classes list) --------
+   The button chrome recipe named in the charter's §0 survey (written out
+   6 times pre-charter). Reviewer-fairy catch (PR #375 round 1): this is
+   NOT yet wired to any consumer in this PR -- the crossing play-button
+   deliberately keeps its own existing, smaller `.voice-btn` styling (see
+   app.js's renderCrossing comment; a real, considered judgment call, not
+   an oversight) rather than adopting this full-size recipe. `.gg-btn` is
+   added here as real, ready infrastructure for the next full-size button
+   consumer (interact-menu buttons are §7.3's predicted next migration),
+   ahead of the full `ggButtonRow` factory, which no PR has claimed yet.
+   Same visual recipe as `#action-bar button` (index.html) -- a
+   deliberate no-op against today's look, per the charter's "migration
+   PRs should be behavior-preserving" posture (§9.4) -- using the SAME
+   `--gb-*` palette vars those buttons already reference directly (§4:
+   "extending the four --gb-* palette vars, which stay"), not a new
+   token set. */
+.gg-btn {
+  padding: 0.4rem 0.9rem;
+  background: var(--gb-dark);
+  color: var(--gb-lightest);
+  border: 1px solid var(--gb-light);
+  border-radius: var(--gg-radius);
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.gg-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* --- window (ggWindow, gadgets.js) ----------------------------------- */
+
+.gg-window {
+  background: var(--gg-chrome-bg);
+  color: var(--gg-chrome-fg);
+  border: 1px solid var(--gg-chrome-border);
+  border-radius: var(--gg-radius);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+  box-sizing: border-box;
+  min-width: 160px;
+  max-width: 420px;
+}
+
+/* street(x?, nearEl?) anchor mode (GADGETS.md §3) — a DOM child of
+   #street (position:relative, index.html), positioned via
+   ggAnchorToStreetEl's offsetLeft/offsetTop math — the SAME trick
+   app.js's updateCursorPosition already uses/documents for the player
+   cursor. #351's outcome window is the first consumer. */
+.gg-window--street {
+  position: absolute;
+  z-index: var(--gg-z-street);
+}
+
+/* screen(pos) anchor mode (GADGETS.md §3) — viewport-fixed. The migrated
+   console is the first consumer (GADGETS.md §7.3). */
+.gg-window--screen {
+  position: fixed;
+  z-index: var(--gg-z-window);
+}
+
+.gg-window-titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.3rem 0.5rem;
+  border-bottom: 1px solid var(--gg-chrome-border);
+  font-family: "Silkscreen", system-ui, sans-serif;
+  font-size: 0.8rem;
+  color: var(--gg-chrome-fg);
+}
+
+.gg-window-title {
+  font-weight: bold;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gg-close {
+  background: none;
+  border: none;
+  color: var(--gg-chrome-fg);
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0 0.2rem;
+  cursor: pointer;
+}
+
+.gg-window-content {
+  padding: 0.5rem;
+  overflow: auto;
+  max-height: 60vh;
+}
+
+/* variant:"mono" (GADGETS.md §2's inventory row) — ASCII-preserving
+   output (the orrery's star chart, #351's motivating case): whitespace
+   intact, in the console's existing monospace font stack (reused, not
+   reinvented). Also exposed standalone as `.gg-mono-block` (GADGETS.md
+   §2's text-measure row) for content built OUTSIDE a ggWindow's own
+   content wrapper — e.g. the per-file `<pre>` blocks inside a readable
+   outcome's window content (app.js's _outcomeContentFromOutcome). */
+.gg-window--mono .gg-window-content,
+.gg-mono-block {
+  white-space: pre-wrap;
+  font-family: "Share Tech Mono", ui-monospace, "SF Mono", Consolas, monospace;
+}
+
+/* --- editor (ggEditor, gadgets.js) -----------------------------------
+   Embeddable content widget — a toolbar row + a <textarea>, meant to sit
+   INSIDE a caller's own layout (a params-form row today, GADGETS.md §2's
+   `editor` row) rather than floating/anchored like ggWindow. Unlike
+   .gg-window (whose bordered box is the OUTER `.gg-window` frame around a
+   separately-chromed `.gg-window-content`), this class's ROOT owns the
+   full bordered chrome box directly — toolbar strip + textarea inside one
+   frame, the common "toolbar over textbox" editor-widget shape. Same
+   --gg-chrome-* and --gg-radius tokens as .gg-window (§4: "extending the four
+   --gb-* palette vars... --gg-chrome-*"), so the two classes read as one
+   visual family. */
+.gg-editor {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--gg-chrome-bg);
+  border: 1px solid var(--gg-chrome-border);
+  border-radius: var(--gg-radius);
+}
+
+.gg-editor-toolbar {
+  display: flex;
+  flex-wrap: wrap; /* GADGETS.md §5: wraps to a second row on narrow
+                       screens — sufficient mobile behavior for a toolbar
+                       this simple, no separate @640px rule needed. */
+  gap: 0.3rem;
+  padding: 0.35rem;
+  border-bottom: 1px solid var(--gg-chrome-border);
+}
+
+.gg-editor-toolbar-btn {
+  padding: 0.2rem 0.5rem;
+  font-size: 0.8rem;
+}
+
+.gg-editor-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.5rem;
+  font-family: inherit; /* matching .params-form-input's existing font;
+                            monospace is NOT required per this class's
+                            spec. */
+  font-size: 0.9rem;
+  background: transparent; /* the chrome background already lives on the
+                               .gg-editor root this textarea sits inside */
+  color: var(--gg-chrome-fg);
+  border: none;
+  border-radius: 0 0 var(--gg-radius) var(--gg-radius);
+  resize: vertical;
+}
+/* Deliberately NO `:focus { outline: none }` here — a review catch, not
+   in the original spec: `.params-form-input` (the plain <input> this
+   class stands in for) defines no :focus rule at all, so it keeps the
+   browser's native focus ring. Suppressing it here without a replacement
+   would be a real, self-inflicted a11y regression relative to the very
+   component ggEditor replaces, not a stylistic no-op — so this textarea
+   keeps the same native default instead. */
+
+/* Visual equivalent of .params-form-input--error (index.html's feature
+   CSS) for a ggEditor's root. _buildParamsFormContent's error-highlight
+   call is type-agnostic — it does
+   `input.classList.add("params-form-input--error")` on whatever `input`
+   is (app.js), so a ggEditor's root `el` (gadgets.js's drop-in-<input>
+   contract) picks up that FEATURE class the same as a plain <input>
+   would. No code anywhere adds a literal "gg-editor--error" class, so
+   this rule keys off the class actually applied — `.params-form-input
+   --error` — but keeps the DECLARATION itself scoped to gadgets.css
+   (GADGETS.md §1 obligation 2's chrome-leakage rule: a feature-file
+   selector should not be the thing visually governing a gadget's
+   border), matching that feature class's existing #e05050. */
+.gg-editor.params-form-input--error {
+  border-color: #e05050;
+}
+
+/* --- .gg-status (GADGETS.md §2 `status` row; umwelt #957) --------------
+   The action-bar outcome line. Chrome only here; app.js supplies text.
+   Error red matches the proposal viewer's refusal row; ok is a muted
+   green; pending is dimmed italics. */
+:root {
+  --gg-status-ok: #2e7d32;
+  --gg-status-error: #c62828;
+}
+
+.gg-status {
+  min-height: 1.2em;
+  margin: 0 0 0.5rem;
+  font-size: 0.85rem;
+}
+.gg-status-pending { opacity: 0.7; font-style: italic; }
+.gg-status-ok { color: var(--gg-status-ok); }
+.gg-status-error { color: var(--gg-status-error); font-weight: 600; }
+
+/* In-flight state for any element carrying aria-busy via a pending counter
+   (app.js actPost sets this class on #action-bar while a /act is pending). */
+.act-pending { opacity: 0.7; cursor: progress; }
+
+/* --- .gg-badge (GADGETS.md §2 `badge` row; umwelt #967) ----------------
+   A short inline label. Chrome only here; the caller supplies the text.
+   `closed` = a terminal state (retracted / approved): light red, chosen
+   for >=4.5:1 on the #1a1a1a chrome (6.27:1; the old #c62828 was 3.10:1). */
+:root { --gg-badge-closed: #ff6b6b; }
+.gg-badge {
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0 0.4rem;
+  border: 1px solid currentColor;
+  border-radius: var(--gg-radius);
+  font-size: 0.75rem;
+  font-weight: 600;
+  vertical-align: middle;
+}
+.gg-badge-info { color: var(--gg-chrome-fg); }
+.gg-badge-closed { color: var(--gg-badge-closed); }
+
+/* --- .gg-chip (GADGETS.md §2 `chip` row; umwelt #936) -------------------
+   The persistent "what is selected" bar. Chrome only here; app.js supplies
+   the text. It docks INSIDE #composer (a full-width row of that flex
+   container), so it never overlaps the composer and moves with it. The
+   error colour reuses --gg-status-error (declared with .gg-status above). */
+.gg-chip {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+}
+.gg-chip-selection { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
+.gg-chip-selection[hidden], .gg-chip-notice[hidden] { display: none; }
+.gg-chip-main {
+  display: inline-flex; align-items: baseline; gap: 0.4rem;
+  padding: 0.2rem 0.5rem;
+  background: var(--gb-dark, #306230);
+  color: var(--gb-lightest, #9bbc0f);
+  border: 1px solid var(--gb-light, #8bac0f);
+  border-radius: var(--gg-radius, 4px);
+  cursor: pointer;
+}
+.gg-chip-name { font-weight: bold; overflow-wrap: anywhere; }
+.gg-chip-kind { opacity: 0.75; }
+.gg-chip-id { font-family: monospace; opacity: 0.8; }
+.gg-chip-where { opacity: 0.75; overflow-wrap: anywhere; }
+.gg-chip-copy, .gg-chip-clear, .gg-chip-go {
+  padding: 0.1rem 0.4rem;
+  background: none;
+  color: inherit;
+  border: 1px solid var(--gb-light, #8bac0f);
+  border-radius: var(--gg-radius, 4px);
+  cursor: pointer;
+  font-size: inherit;
+}
+.gg-chip-byid { display: inline-flex; gap: 0.3rem; margin: 0; }
+.gg-chip-input {
+  width: 10rem;
+  padding: 0.15rem 0.3rem;
+  font-size: inherit;
+  border: 1px solid var(--gb-light, #8bac0f);
+  border-radius: var(--gg-radius, 4px);
+  box-sizing: border-box;
+}
+.gg-chip-notice { color: var(--gg-status-error); font-weight: 600; overflow-wrap: anywhere; }
+.gg-chip-notice-info { color: inherit; font-weight: normal; opacity: 0.8; }

@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.db
+things/
+
+# Local venv for the pytest gate on PEP-668-locked systems (system pip
+# refuses installs without one) — never committed, per-contributor.
+.venv/
+venv/
+
+# M2 web-render sprite cache (runtime-generated PNGs, gateway-local; never
+# committed — see src/umwelt/webrender/sprites.py's SpriteStore).
+src/umwelt/webrender/sprites/
