@@ -46,6 +46,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -65,6 +66,7 @@ from umwelt._ids import canonical_agent as _canonical_agent  # noqa: E402
 from umwelt._ids import looks_like_thing_id as _looks_like_thing_id  # noqa: E402
 from umwelt import avatar_status as _avatar_status  # noqa: E402
 from umwelt import client_auth as _client_auth  # noqa: E402
+from umwelt import engine_api as _engine_api  # noqa: E402
 from umwelt import mentions as _mentions  # noqa: E402
 
 
@@ -95,6 +97,53 @@ class UwError(Exception):
         self.status = status
 
 
+class EngineApiMismatch(UwError):
+    """umwelt#1105 C3: the world's engine-API gate refused the request. The
+    message IS the one-line mismatch rendering; main() prints it bare and
+    exits 2 (1 stays for every ordinary refusal)."""
+
+
+def _refusal(status: int, body: dict) -> UwError:
+    """The UwError for a >=400 answer: the gate's refusal gets its own type."""
+    if _engine_api.is_mismatch_refusal(status, body):
+        return EngineApiMismatch(_engine_api.render_mismatch(body), status=status)
+    return UwError(body.get("error", f"request failed (status {status})"),
+                   status=status)
+
+
+# Cap on the bytes ONE world response may deliver (umwelt #1119 follow-up).
+# Twin of the same constant in src/umwelt/mcp_server.py: keep the two equal.
+# Measured: the largest single response on the prod copy is 6,693,004 bytes
+# (crossings_for_agent without `since`); the cap is 2**25 bytes (32 MiB), the
+# smallest power of two at or above 4 x that figure (4 x 6,693,004 =
+# 26,772,016; the cap is 5.01 x it; the owner's rule is 4 x, rounded up to a
+# power of two). It refuses a legitimate single response over 32 MiB rather
+# than truncate it (the engine side is umwelt #1122). Applied where the body
+# is read off the socket, on the success AND the HTTP-error path.
+_MAX_RESPONSE_BYTES = 33554432
+# Cap on the files in ONE download (umwelt #1119 follow-up). Twin of the same
+# constant in src/umwelt/mcp_server.py: keep the two equal. An
+# operational ceiling, not a measurement: a download plan above it is refused
+# before the first write, whatever its byte total.
+_MAX_DOWNLOAD_FILES = 10000
+
+
+class ResponseTooLarge(UwError):
+    """The world's answer (or a download plan) went past a volume cap. Its own
+    signal: `main` exits 3 for it, where an ordinary UwError exits 1. No HTTP
+    status: a refused body is never interpreted."""
+
+
+def _too_large(e: "_client_auth.BodyTooLarge") -> ResponseTooLarge:
+    if e.advertised is not None:
+        return ResponseTooLarge(
+            f"response too large: advertised {e.advertised} bytes, "
+            f"cap is {_MAX_RESPONSE_BYTES} bytes")
+    return ResponseTooLarge(
+        f"response too large: read at least {e.read} bytes, "
+        f"cap is {_MAX_RESPONSE_BYTES} bytes")
+
+
 # --------------------------------------------------------------------------
 # Environment + state
 # --------------------------------------------------------------------------
@@ -110,8 +159,8 @@ def resolve_agent() -> str:
     if not raw:
         raise UwError(
             "no agent identity — set UMWELT_AGENT (e.g. `export "
-            "UMWELT_AGENT=lei`); uw never guesses an identity and never "
-            "runs anonymous"
+            "UMWELT_AGENT=<your-agent-name>`); uw never guesses an identity "
+            "and never runs anonymous"
         )
     return raw
 
@@ -205,7 +254,10 @@ def call_once(method: str, path: str, payload: dict | None,
     headers = {"Content-Type": "application/json"} if data is not None else {}
     if auth_headers:
         headers.update(auth_headers)
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    headers.update(_engine_api.client_headers())  # umwelt#1105
+    req = _client_auth.BoundedRequest(url, data=data, method=method,
+                                      headers=headers,
+                                      max_bytes=_MAX_RESPONSE_BYTES)
     try:
         with _client_auth.urlopen_with_cert_fallback(req, 30) as r:
             body = r.read().decode()
@@ -216,6 +268,8 @@ def call_once(method: str, path: str, payload: dict | None,
             return e.code, (json.loads(body) if body else {})
         except json.JSONDecodeError:
             return e.code, {"error": body or f"HTTP {e.code}"}
+    except _client_auth.BodyTooLarge as e:
+        raise _too_large(e) from e
     except (urllib.error.URLError, OSError, ValueError) as e:
         raise UwError(f"cannot reach the world at {resolve_url()}: {e}") from e
 
@@ -266,10 +320,7 @@ def request(method: str, path: str, payload: dict | None = None) -> dict:
     returns the parsed body dict."""
     status, body = call(method, path, payload)
     if status >= 400:
-        raise UwError(
-            body.get("error", f"request failed (status {status})"),
-            status=status,
-        )
+        raise _refusal(status, body)
     return body
 
 
@@ -311,8 +362,8 @@ def _render_arrival_counts(view: dict) -> list[str]:
     if unseen:
         parts.append(f"{unseen} unseen crossing{'s' if unseen != 1 else ''}"
                      f" — 'hear' to read")
-    exits = sum(1 for r in (view.get("reachable") or [])
-                if r.get("relation") != "parent")
+    # umwelt#1043 slice 4: the way up IS an exit (twin of mcp_server.py).
+    exits = len(view.get("reachable") or [])
     parts.append(f"{exits} exit{'s' if exits != 1 else ''}")
     return [" · ".join(parts), "uw look for the room and its exits"]
 
@@ -353,20 +404,43 @@ def _render_place(view: dict, arrival: bool = False) -> str:
     # umwelt #158: sub-places + lateral links reachable from here (the
     # engine data is db.place_tree(depth=1); the server sends it structured
     # as view["reachable"], this is the one place that turns it into prose).
-    # umwelt #239 (folded into #241): `reachable` now also carries a typed
-    # parent entry (`relation: "parent"`) — excluded here to keep this
-    # prose line's behavior unchanged; mcp_server.py's `_render_place_view`
-    # makes the identical exclusion, for the identical reason (see its own
-    # comment) — the two must never drift per this function's own docstring.
+    # umwelt #239 / #1043 slice 4: `reachable` also carries a typed parent
+    # entry (`relation: "parent"`) -- the way UP, listed apart from the
+    # others (`from here you can reach: A, B · the way up: Workshop`; a place
+    # with only a parent prints just `the way up: Workshop`).
+    # mcp_server.py's `_render_place_view` makes the identical split -- the
+    # two must never drift per this function's own docstring.
     reachable = [r for r in (view.get("reachable") or [])
                  if r.get("relation") != "parent"]
+    ways_up = [r for r in (view.get("reachable") or [])
+               if r.get("relation") == "parent"]
+    parts = []
     if reachable:
-        labels = [r.get("label") or r.get("id") for r in reachable]
-        lines.append("from here you can reach: " + ", ".join(labels))
+        parts.append("from here you can reach: " + ", ".join(
+            r.get("label") or r.get("id") for r in reachable))
+    if ways_up:
+        parts.append("the way up: " + ", ".join(
+            r.get("label") or r.get("id") for r in ways_up))
+    if parts:
+        lines.append(" · ".join(parts))
 
     lines.extend(_view_notes(view))
 
     return "\n".join(lines)
+
+
+def _render_thing_actions(actions: list) -> str | None:
+    """umwelt#1043 slice 4: what a typed thing can DO, one line per action as
+    `name(requires...)` -- the answer to "what do I `act` with here". The list
+    is /umwelt/thing_actions' (the kind chain, the one source of truth); this
+    only shapes it. None when there is nothing to list. TWIN CODE: the same
+    function sits in src/umwelt/mcp_server.py and tools/uw (separate files
+    across the plugin boundary); change one, change both."""
+    rows = [f"  {a['verb']}({', '.join(a.get('requires') or [])})"
+            for a in actions if isinstance(a, dict) and a.get("verb")]
+    if not rows:
+        return None
+    return "actions (use with act):\n" + "\n".join(rows)
 
 
 def _render_thing(thing: dict) -> str:
@@ -440,7 +514,11 @@ def _render_use_outcome(outcome: dict) -> str:
         if briefing:
             lines.append(briefing)
         content = outcome.get("content") or {}
-        if not content:
+        # umwelt #647: a tome/library carries no content, it carries a table
+        # of contents (where to `read`).
+        if outcome.get("toc"):
+            lines.append(_render_toc(outcome["toc"]))
+        elif not content:
             lines.append("(empty)")
         for fname, text in content.items():
             lines.append(f"--- {fname} ---")
@@ -460,6 +538,317 @@ def _render_use_outcome(outcome: dict) -> str:
         lines.append("--- stderr ---")
         lines.append(stderr)
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# umwelt #647 / #708: long-read verbs (`read`, `search`), the tome table of
+# contents, and `download` writing the CLIENT's own disk.
+#
+# TWIN CODE: this block is byte-identical in src/umwelt/mcp_server.py and
+# tools/uw (each client is a self-contained file; the plugin build vendors a
+# fixed file list, so a shared module would be a packaging change). Change
+# one, change the other. The engine does the paging; neither client re-pages.
+# --------------------------------------------------------------------------
+
+def _render_read_page(resp: dict) -> str:
+    """One `read` page the way the harness shows a file: a header, each line
+    as `cat -n` (`f"{n:>6}\t{text}"`), then `next: --offset X` or `(end)`.
+    A line the engine cut ends with a marker saying so."""
+    lines = resp.get("lines") or []
+    offset = resp.get("offset", 1)
+    total = resp.get("total_lines", 0)
+    cut = set(resp.get("cut_lines") or [])
+    head = f"[{resp.get('size_class')}] {resp.get('name')} · {resp.get('file')} · "
+    if lines:
+        head += f"lines {offset}–{offset + len(lines) - 1} of {total}"
+    else:
+        head += f"no lines at offset {offset} (the file has {total})"
+    rows = [head]
+    for i, text in enumerate(lines):
+        n = offset + i
+        row = f"{n:>6}\t{text}"
+        if n in cut:
+            row += f"… [line cut at {len(text)} chars]"
+        rows.append(row)
+    nxt = resp.get("next_offset")
+    rows.append(f"next: --offset {nxt}" if nxt is not None else "(end)")
+    return "\n".join(rows)
+
+
+def _render_edit(resp: dict) -> str:
+    """One `edit` confirmation the way the harness shows it: a header (what
+    was edited, how many replacements, the lines the first one now spans) and
+    the reply's excerpt as `cat -n` rows, numbered from where it starts (3
+    lines above the first replacement, or line 1)."""
+    n = resp.get("replaced", 1)
+    where = resp.get("file") or resp.get("field")
+    first, last = resp.get("first_line"), resp.get("last_line")
+    rows = [f"edited {resp.get('thing_id')} · {where} · {n} "
+            f"replacement{'' if n == 1 else 's'} · lines {first}–{last}"]
+    excerpt = resp.get("excerpt") or ""
+    if excerpt and isinstance(first, int):
+        start = max(1, first - 3)
+        rows += [f"{start + i:>6}\t{text}"
+                 for i, text in enumerate(excerpt.split("\n"))]
+    return "\n".join(rows)
+
+
+def _render_search(resp: dict) -> str:
+    """One `search` page in ripgrep form: `file:line:text` for a match,
+    `file-line-text` for a context line, `--` between groups that are not
+    adjacent; count mode `file:N`; files mode one path per line; then a
+    footer `total N · next: --offset X` or `total N · (end)`."""
+    mode = resp.get("output_mode")
+    rows: list[str] = []
+    last: tuple | None = None            # (file, last line number printed)
+    for e in resp.get("entries") or []:
+        if mode == "count":
+            rows.append(f"{e.get('file')}:{e.get('count')}")
+        elif mode == "files_with_matches":
+            rows.append(f"{e.get('file')}")
+        else:
+            group = ([(k, t, "-") for k, t in e.get("before") or []]
+                     + [(e.get("line"), e.get("text"), ":")]
+                     + [(k, t, "-") for k, t in e.get("after") or []])
+            if last is not None and (last[0] != e.get("file")
+                                     or group[0][0] != last[1] + 1):
+                rows.append("--")
+            for k, t, sep in group:
+                rows.append(f"{e.get('file')}{sep}{k}{sep}{t}")
+            last = (e.get("file"), group[-1][0])
+    nxt = resp.get("next_offset")
+    tail = f"next: --offset {nxt}" if nxt is not None else "(end)"
+    rows.append(f"total {resp.get('total')} · {tail}")
+    return "\n".join(rows)
+
+
+def _render_toc(toc: dict) -> str:
+    """The table of contents `use` returns for a tome/library: per file its
+    size, then its headings as indented `L{start}-{end}  ## title  (N chars)`
+    rows (the line range is what `read --offset/--limit` takes)."""
+    rows = ["contents:"]
+    heads = toc.get("headings") or []
+    for f in toc.get("files") or []:
+        rows.append(f"  {f.get('file')} — {f.get('lines')} lines, "
+                    f"{f.get('chars')} chars")
+        for h in heads:
+            if h.get("file") == f.get("file"):
+                rows.append(
+                    f"    L{h.get('start_line')}-{h.get('end_line')}  "
+                    f"{'#' * int(h.get('level', 1))} {h.get('title')}  "
+                    f"({h.get('chars')} chars)")
+    if toc.get("shown", 0) < toc.get("total", 0):
+        rows.append(f"  (showing {toc.get('shown')} of {toc.get('total')} "
+                    f"headings)")
+    return "\n".join(rows)
+
+
+def _download_bad_relpath(rel: Any) -> str | None:
+    """Why a world-supplied source relpath may not be written, or None. The
+    source dict is WORLD-supplied; the disk is yours: refuse empty, `.`/`..`
+    components, absolute, and NUL / control characters."""
+    if not isinstance(rel, str) or not rel:
+        return "empty or not a string"
+    if any(ord(c) < 32 or 0x7F <= ord(c) <= 0x9F for c in rel):
+        return "contains a NUL or control character"
+    # ANY surrogate code point: os.fsencode alone accepts U+DC80..U+DCFF
+    # (surrogateescape would turn them into raw bytes on disk).
+    if any(0xD800 <= ord(c) <= 0xDFFF for c in rel):
+        return "cannot be encoded as a file name (a lone surrogate)"
+    try:
+        os.fsencode(rel)
+    except UnicodeError:
+        return "cannot be encoded as a file name"
+    if (rel.startswith(("/", "\\")) or os.path.isabs(rel)
+            or re.match(r"^[A-Za-z]:", rel)):
+        return "is an absolute path"
+    for part in rel.replace("\\", "/").split("/"):
+        if part in ("", ".", ".."):
+            return "has an empty, '.' or '..' path component"
+        if len(os.fsencode(part)) > 255:
+            return "has a path component over 255 bytes"
+    return None
+
+
+def _write_download(source: Any, path: str, overwrite: bool) -> list[tuple[str, int]]:
+    """Write a `/umwelt/download` source dict to the client's disk; return
+    `[(written path, chars)]`. One file: `path` IS the file. Several: `path`
+    is a directory (made if absent) and each relpath goes under it.
+
+    Before ANYTHING is written (no directory made either), the whole plan
+    is validated: the target `path` itself (EVERY component at most
+    255 bytes, its total length under PC_PATH_MAX); every file's
+    text must encode as UTF-8; every relpath (several files) must be
+    non-empty, relative, free of `.`/`..`/empty components and of NUL /
+    control characters, free of any surrogate code point U+D800..U+DFFF, with
+    no component over 255 bytes and a total path the OS accepts; no two names
+    may collide after NFC + casefold (so `{A, a}` is refused on every
+    filesystem), nor a file also be a directory (`{a, a/b}`); no target may
+    resolve outside `path` (symlinks resolved), be a symlink or directory, or
+    already exist without `overwrite`. Before any write the volume is bounded:
+    the file count by an operational ceiling (`_MAX_DOWNLOAD_FILES`, not a
+    measurement and not a server limit) and the sum of the files' UTF-8 bytes
+    by `_MAX_RESPONSE_BYTES`; past either, `ResponseTooLarge` is raised and
+    nothing is written. A refusal leaves the disk untouched.
+
+    What is NOT checked up front: a disk error, or a symlink planted after
+    the check. Files are then opened O_EXCL (O_TRUNC with overwrite) and
+    O_NOFOLLOW, but O_NOFOLLOW protects only the final component of the path,
+    never a directory above it. Two residuals follow, both unguarded.
+    (1) With `overwrite`, a hard link at the destination is a regular file
+    and passes O_NOFOLLOW, and O_TRUNC truncates the linked inode; no guard
+    is promised. (2) A race: an empty directory can land outside the root if
+    a symlink is planted after the plan-time check and before makedirs on a
+    path the attacker controls; no file content is written there, and the
+    recheck after makedirs cannot be the fix, because it fires after both the
+    mkdir and the escape. A per-component mkdir with O_NOFOLLOW would close
+    it and is tracked on its own. Raises ValueError with the reason (or
+    `ResponseTooLarge` for the volume caps)."""
+    if not isinstance(source, dict) or not source:
+        raise ValueError("the world sent no files to write")
+    if not all(v is None or isinstance(v, str) for v in source.values()):
+        raise ValueError("the world sent a file that is not text; "
+                         "nothing was written")
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("path is required")
+    if any(ord(c) < 32 or 0x7F <= ord(c) <= 0x9F for c in path):
+        raise ValueError("path contains a NUL or control character")
+    target = os.path.abspath(os.path.expanduser(path))
+    # The TARGET's own limits, checked before anything (a makedirs included)
+    # touches the disk: EVERY component of it (the file for a single-file
+    # download, the directory for several) and its total length.
+    try:
+        path_max = os.pathconf("/", "PC_PATH_MAX")
+    except (OSError, ValueError, AttributeError):
+        path_max = 4096
+    try:
+        target_bytes = os.fsencode(target)
+    except UnicodeError:
+        raise ValueError("path cannot be encoded as a file name; "
+                         "nothing was written")
+    if any(len(part) > 255 for part in target_bytes.split(os.fsencode(os.sep))):
+        raise ValueError("refusing path: a component of it is over 255 "
+                         "bytes; nothing was written")
+    if len(target_bytes) >= path_max:
+        raise ValueError("refusing path: it is too long for this system; "
+                         "nothing was written")
+    if len(source) > _MAX_DOWNLOAD_FILES:
+        raise ResponseTooLarge(
+            f"response too large: {len(source)} files in the download, "
+            f"ceiling is {_MAX_DOWNLOAD_FILES} files; nothing was written")
+    total_bytes = 0
+    for rel, text in source.items():
+        try:
+            total_bytes += len((text or "").encode("utf-8"))
+        except UnicodeError:
+            raise ValueError(
+                f"refusing {rel!r}: its text cannot be encoded as UTF-8; "
+                f"nothing was written")
+    if total_bytes > _MAX_RESPONSE_BYTES:
+        raise ResponseTooLarge(
+            f"response too large: {total_bytes} bytes of file text in the "
+            f"download, cap is {_MAX_RESPONSE_BYTES} bytes; nothing was "
+            f"written")
+
+    def fold(name: str) -> str:
+        """NFC + casefold (+ NFC again: casefold can denormalise)."""
+        return unicodedata.normalize(
+            "NFC", unicodedata.normalize("NFC", name).casefold())
+
+    def check_free(dest: str, label: str) -> None:
+        if os.path.islink(dest):
+            raise ValueError(f"refusing {label}: it is a symlink")
+        if os.path.isdir(dest):
+            raise ValueError(f"refusing {label}: it is a directory")
+        if os.path.lexists(dest) and not overwrite:
+            raise ValueError(
+                f"refusing {label}: it already exists (pass overwrite to "
+                f"replace it); nothing was written")
+
+    plan: list[tuple[str, str]] = []           # (dest, text)
+    real_root: str | None = None
+    if len(source) == 1:
+        check_free(target, repr(path))
+        plan.append((target, next(iter(source.values())) or ""))
+    else:
+        norm: dict[str, str] = {}
+        folded: dict[str, str] = {}
+        for rel in source:
+            reason = _download_bad_relpath(rel)
+            if reason:
+                raise ValueError(
+                    f"refusing {rel!r}: it {reason}; nothing was written")
+            key = rel.replace("\\", "/")
+            if fold(key) in folded:
+                raise ValueError(
+                    f"refusing {rel!r}: it names the same file as "
+                    f"{folded[fold(key)]!r} (names are compared after "
+                    f"Unicode normalisation and case folding); nothing was "
+                    f"written")
+            norm[key] = rel
+            folded[fold(key)] = rel
+        for key, rel in norm.items():
+            parts = key.split("/")
+            for i in range(1, len(parts)):
+                hit = folded.get(fold("/".join(parts[:i])))
+                if hit is not None:
+                    raise ValueError(
+                        f"refusing {rel!r}: {hit!r} is "
+                        f"a file and also a directory; nothing was written")
+        if os.path.lexists(target) and not os.path.isdir(target):
+            raise ValueError(f"path {path!r} exists and is not a directory")
+        real_root = os.path.realpath(target)
+        for key, rel in norm.items():
+            dest = os.path.join(target, *key.split("/"))
+            if len(os.fsencode(dest)) >= path_max:
+                raise ValueError(
+                    f"refusing {rel!r}: the full path is too long for this "
+                    f"system; nothing was written")
+            real_parent = os.path.realpath(os.path.dirname(dest))
+            if os.path.commonpath([real_root, real_parent]) != real_root:
+                raise ValueError(
+                    f"refusing {rel!r}: it would land outside {path!r}; "
+                    f"nothing was written")
+            walk = os.path.dirname(dest)
+            while len(walk) > len(target):
+                if os.path.lexists(walk) and not os.path.isdir(walk):
+                    raise ValueError(
+                        f"refusing {rel!r}: a parent of it exists and is "
+                        f"not a directory; nothing was written")
+                walk = os.path.dirname(walk)
+            check_free(dest, repr(rel))
+            plan.append((dest, source[rel] or ""))
+
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    flags |= os.O_TRUNC if overwrite else os.O_EXCL
+    written: list[tuple[str, int]] = []
+    for dest, text in plan:
+        try:
+            parent = os.path.dirname(dest)
+            os.makedirs(parent, exist_ok=True)
+            if real_root is not None and os.path.commonpath(
+                    [real_root, os.path.realpath(parent)]) != real_root:
+                raise ValueError(f"refusing {dest!r}: it would land outside "
+                                 f"{path!r}")
+            fd = os.open(dest, flags, 0o644)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+                fh.write(text)
+        except (OSError, UnicodeError) as e:
+            done = ", ".join(p for p, _n in written) or "none"
+            raise ValueError(f"could not write {dest!r}: {e} "
+                             f"(written before the failure: {done})")
+        written.append((dest, len(text)))
+    return written
+
+
+def _render_download(name: Any, size_class: Any,
+                     written: list[tuple[str, int]]) -> str:
+    """The paths written and their char counts."""
+    total = sum(n for _p, n in written)
+    rows = [f"downloaded {name!r} ({size_class}): {len(written)} file(s), "
+            f"{total} chars"]
+    rows += [f"  {p}  ({n} chars)" for p, n in written]
+    return "\n".join(rows)
 
 
 def _render_carry_result(verb: str, token: str, resp: dict) -> str:
@@ -754,7 +1143,8 @@ def _resolve_dotted_ordinal(agent: str, ref: str, place_things: list[dict]) -> s
 def _resolve_thing(agent: str, ref: str, *,
                     place: bool = True, inventory: bool = True,
                     containers: bool = False,
-                    passthrough_id: bool = False) -> str:
+                    passthrough_id: bool = False,
+                    passthrough_unmatched: bool = False) -> str:
     """Resolve `ref` (an id or a name) to a thing id. `containers=True`
     (take_out's own case — the CLI has no separate <container> arg, the
     server derives it from the thing's own holder) additionally looks
@@ -787,7 +1177,13 @@ def _resolve_thing(agent: str, ref: str, *,
     nested in a container this view does not enumerate). Ambiguity (>1
     name hit) and non-id-shaped misses keep the loud client-side error.
     This adds no reach/privacy gate (the server's use checks identity
-    only; #982 tracks that)."""
+    only; #982 tracks that).
+
+    umwelt #1043: `passthrough_unmatched=True` (only `act` sets it) widens
+    that to ANY ref no candidate is named: it goes to the server unchanged,
+    as `act` always sent it, so an engine singleton's fixed non-uuid id
+    (`thing_project_registrar`) still acts from anywhere and a real miss
+    gets the server's own 404. Ambiguity still refuses client-side."""
     candidates: list[dict] = []
     if place:
         place_things = _list_place_things(agent)
@@ -822,8 +1218,10 @@ def _resolve_thing(agent: str, ref: str, *,
     try:
         return _match_candidates(ref, candidates)
     except UwError:
-        if passthrough_id and _looks_like_thing_id(ref) and not any(
-                (t.get("name") or "").lower() == ref.lower() for t in candidates):
+        named = any((t.get("name") or "").lower() == ref.lower() for t in candidates)
+        if passthrough_unmatched and not named:
+            return ref
+        if passthrough_id and _looks_like_thing_id(ref) and not named:
             return ref
         raise
 
@@ -1186,6 +1584,33 @@ def cmd_look_at(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
     board_render = resp.get("board_render")
     if board_render is not None:
         lines.append(board_render)
+    # umwelt #1043: `charge_board_render` is a sibling key to `thing`, present
+    # only for a charge_board instance (the server's own gate -- an empty
+    # board still renders); same presence-check posture as `board_render`
+    # above. Printed as the MCP look_at prints it by default (#876): the
+    # bounded `charge_board_headline` when the server sent one, else the full
+    # render. The full render stays in --json.
+    charge_board_render = resp.get("charge_board_render")
+    if charge_board_render is not None:
+        charge_board_headline = resp.get("charge_board_headline")
+        lines.append(charge_board_headline if charge_board_headline is not None
+                     else charge_board_render)
+    # umwelt#1043 slice 4: a TYPED thing (metadata.kind_id) lists its actions,
+    # read from the kind chain via /umwelt/thing_actions -- the same list the
+    # MCP look_at prints. An untyped thing makes no extra call. An addition:
+    # if the call is refused, the look_at stands without it.
+    if (thing.get("metadata") or {}).get("kind_id"):
+        try:
+            acts = request(
+                "GET", f"/umwelt/thing_actions?thing={urllib.parse.quote(thing_id)}"
+                       f"&agent={urllib.parse.quote(agent)}", None)
+        except (EngineApiMismatch, ResponseTooLarge):
+            raise   # gate refusals keep their own exit codes (2, 3)
+        except UwError:
+            acts = {}
+        listing = _render_thing_actions(acts.get("actions") or [])
+        if listing:
+            lines.append(listing)
     print("\n".join(lines))
 
 
@@ -1205,6 +1630,82 @@ def cmd_use(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
     else:
         outcome = resp.get("outcome", {})
         print(_render_use_outcome(outcome))
+
+
+def cmd_read(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    # umwelt #647: same resolution as `use` (an id anywhere, or a name in view).
+    thing_id = _resolve_thing(agent, args.thing, passthrough_id=True)
+    payload: dict[str, Any] = {"agent": agent, "thing": thing_id}
+    for key in ("file", "offset", "limit"):
+        if getattr(args, key) is not None:
+            payload[key] = getattr(args, key)
+    resp = request("POST", "/umwelt/read", payload)
+    _print_json(resp) if json_mode else print(_render_read_page(resp))
+
+
+def cmd_search(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    # umwelt #647: Grep's own argument names go over the wire, dashes included.
+    thing_id = _resolve_thing(agent, args.thing, passthrough_id=True)
+    payload: dict[str, Any] = {"agent": agent, "thing": thing_id,
+                               "pattern": args.pattern}
+    for key, value in (("file", args.file), ("output_mode", args.output_mode),
+                       ("-i", True if args.ignore_case else None),
+                       ("-A", args.after), ("-B", args.before),
+                       ("-C", args.context), ("head_limit", args.head_limit),
+                       ("offset", args.offset)):
+        if value is not None:
+            payload[key] = value
+    resp = request("POST", "/umwelt/search", payload)
+    _print_json(resp) if json_mode else print(_render_search(resp))
+
+
+def _edit_string(args: argparse.Namespace, inline: str, from_file: str,
+                 flag: str) -> str:
+    """One of --old/--new: the inline value, or the verbatim text of the file
+    named by its -file twin (no newline stripped). Exactly one of the two."""
+    given_inline = getattr(args, inline)
+    given_file = getattr(args, from_file)
+    if (given_inline is None) == (given_file is None):
+        raise UwError(f"pass exactly one of --{flag} and --{flag}-file")
+    if given_inline is not None:
+        return given_inline
+    try:
+        with open(given_file, encoding="utf-8", newline="") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError) as e:
+        raise UwError(f"cannot read --{flag}-file {given_file}: {e}") from e
+
+
+def cmd_edit(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    # umwelt #1154: the harness's Edit. Strings are read BEFORE any request,
+    # so a bad flag combination never reaches the world.
+    old = _edit_string(args, "old", "old_file", "old")
+    new = _edit_string(args, "new", "new_file", "new")
+    thing_id = _resolve_thing(agent, args.thing, passthrough_id=True)
+    payload: dict[str, Any] = {"agent": agent, "thing": thing_id,
+                               "old_string": old, "new_string": new}
+    for key, value in (("file", args.file), ("field", args.field),
+                       ("replace_all", True if args.replace_all else None)):
+        if value is not None:
+            payload[key] = value
+    resp = request("POST", "/umwelt/edit", payload)
+    _print_json(resp) if json_mode else print(_render_edit(resp))
+
+
+def cmd_download(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
+    # umwelt #647 / #708: the server returns the source dict; THIS writes it
+    # to your disk, after validating every name (see _write_download).
+    thing_id = _resolve_thing(agent, args.thing, passthrough_id=True)
+    resp = request("POST", "/umwelt/download", {"agent": agent, "thing": thing_id})
+    try:
+        written = _write_download(resp.get("source"), args.path, args.overwrite)
+    except ValueError as e:
+        raise UwError(str(e))
+    if json_mode:
+        _print_json({"name": resp.get("name"), "written": [
+            {"path": p, "chars": n} for p, n in written]})
+    else:
+        print(_render_download(resp.get("name"), resp.get("size_class"), written))
 
 
 def cmd_take(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
@@ -1265,6 +1766,25 @@ def cmd_send_home(agent: str, args: argparse.Namespace, json_mode: bool) -> None
     )
 
 
+def _render_act_result(thing: str, action: str, resp: dict[str, Any]) -> str:
+    """One act() result as text. A real status prints as `status=S`. A typed
+    action with no state transition returns status None, which used to print
+    `status=None` for a success AND for a rejected effect alike; now a success
+    says `ok (no status change)` and a failed effect says so on its first line,
+    with each failure underneath."""
+    status = resp.get("status")
+    failures = resp.get("effect_failures")
+    if status is not None:
+        head = f"{thing} -> {action}: status={status}"
+    elif failures:
+        head = f"{thing} -> {action}: effect failed (no status change)"
+    else:
+        head = f"{thing} -> {action}: ok (no status change)"
+    if failures:
+        head += "".join(f"\n  effect_failure: {f}" for f in failures)
+    return head
+
+
 def cmd_act(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
     kv: dict[str, str] = {}
     for pair in args.arg or []:
@@ -1272,12 +1792,16 @@ def cmd_act(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
             raise UwError(f"--arg must be key=value (got {pair!r})")
         k, v = pair.split("=", 1)
         kv[k] = v
-    payload = {"agent": agent, "thing": args.thing, "action": args.action, "args": kv}
+    # umwelt #1043: resolve a name or ordinal in view, as `use` does; an
+    # ambiguous name refuses client-side. A ref that names nothing goes to
+    # the server unchanged, as act always sent it (engine ids, real misses).
+    thing_id = _resolve_thing(agent, args.thing, passthrough_unmatched=True)
+    payload = {"agent": agent, "thing": thing_id, "action": args.action, "args": kv}
     resp = request("POST", "/umwelt/act", payload)
     if json_mode:
         _print_json(resp)
     else:
-        print(f"{args.thing} -> {args.action}: status={resp.get('status')}")
+        print(_render_act_result(args.thing, args.action, resp))
 
 
 def cmd_create_place(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
@@ -1471,7 +1995,7 @@ def cmd_forge(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
 def cmd_places(args: argparse.Namespace, json_mode: bool) -> None:
     status, body = call("GET", "/umwelt/places", None)
     if status >= 400:
-        raise UwError(body.get("error", f"request failed (status {status})"), status=status)
+        raise _refusal(status, body)
     places = body.get("places", [])
     _print_json(body) if json_mode else print(_render_places(places))
 
@@ -1500,7 +2024,7 @@ def cmd_map(agent: str, args: argparse.Namespace, json_mode: bool) -> None:
 def cmd_health(args: argparse.Namespace, json_mode: bool) -> None:
     status, body = call("GET", "/health", None)
     if status >= 400:
-        raise UwError(body.get("error", f"request failed (status {status})"), status=status)
+        raise _refusal(status, body)
     _print_json(body) if json_mode else print(_render_health(body))
 
 
@@ -1596,6 +2120,64 @@ def build_parser() -> argparse.ArgumentParser:
                         "`hello` is wrapped into a one-element array; a "
                         "bare JSON object is rejected client-side, since "
                         "the server does too")
+
+    p = sub.add_parser("read", help="read part of a thing: numbered lines, "
+                                     "paged by --offset (like the harness's Read)")
+    p.add_argument("thing", help="a thing id, or a name in view / your inventory")
+    p.add_argument("--file", default=None,
+                   help="which file (only needed when the thing has several)")
+    p.add_argument("--offset", type=int, default=None,
+                   help="1-based line to start at (default 1)")
+    p.add_argument("--limit", type=int, default=None,
+                   help="most lines to return (default 2000; a page also "
+                        "stops at about 4 KB)")
+
+    p = sub.add_parser("search", help="search a thing's text for a regular "
+                                       "expression (like the harness's Grep)")
+    p.add_argument("thing", help="a thing id, or a name in view / your inventory")
+    p.add_argument("pattern", help="regular expression, at most 512 chars "
+                                   "(`regex` package syntax, not ripgrep's)")
+    p.add_argument("--file", default=None, help="restrict to one file")
+    p.add_argument("--output-mode", dest="output_mode", default=None,
+                   help="content (default) | count | files_with_matches")
+    p.add_argument("-i", dest="ignore_case", action="store_true",
+                   help="case-insensitive")
+    p.add_argument("-A", dest="after", type=int, default=None,
+                   help="context lines after a match (0-10)")
+    p.add_argument("-B", dest="before", type=int, default=None,
+                   help="context lines before a match (0-10)")
+    p.add_argument("-C", dest="context", type=int, default=None,
+                   help="context lines on both sides (0-10; -A / -B win)")
+    p.add_argument("--head-limit", dest="head_limit", type=int, default=None,
+                   help="most entries to return (default 50)")
+    p.add_argument("--offset", type=int, default=None,
+                   help="skip this many entries (not lines)")
+
+    p = sub.add_parser("edit", help="replace text in a thing, like the "
+                                     "harness's Edit: --old must match "
+                                     "exactly once, or pass --replace-all")
+    p.add_argument("thing", help="a thing id, or a name in view / your inventory")
+    p.add_argument("--old", default=None, help="the exact text to find")
+    p.add_argument("--new", default=None, help="the replacement text")
+    p.add_argument("--old-file", dest="old_file", default=None,
+                   help="read the text to find from this file (verbatim)")
+    p.add_argument("--new-file", dest="new_file", default=None,
+                   help="read the replacement text from this file (verbatim)")
+    p.add_argument("--file", default=None,
+                   help="which file of the thing's source (only needed when "
+                        "it has several)")
+    p.add_argument("--field", default=None, choices=["source", "description"],
+                   help="what to edit (default: source)")
+    p.add_argument("--replace-all", dest="replace_all", action="store_true",
+                   help="replace every occurrence, not just a unique one")
+
+    p = sub.add_parser("download", help="write a thing's whole text to YOUR "
+                                         "disk — one file: PATH is the file; "
+                                         "several: PATH is a directory")
+    p.add_argument("thing", help="a thing id, or a name in view / your inventory")
+    p.add_argument("path", help="the file (one-file thing) or directory")
+    p.add_argument("--overwrite", action="store_true",
+                   help="replace files that already exist")
 
     p = sub.add_parser("take", help="pick a thing up — id or a name "
                                      "visible in your current place")
@@ -1748,6 +2330,10 @@ def main(argv: list[str] | None = None) -> int:
             "hear": cmd_hear,
             "look_at": cmd_look_at,
             "use": cmd_use,
+            "read": cmd_read,
+            "search": cmd_search,
+            "edit": cmd_edit,
+            "download": cmd_download,
             "take": cmd_take,
             "drop": cmd_drop,
             "put": cmd_put,
@@ -1769,6 +2355,13 @@ def main(argv: list[str] | None = None) -> int:
         handler = handlers[args.verb]
         handler(agent, args, args.json)
         return 0
+    except EngineApiMismatch as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    except ResponseTooLarge as e:
+        # Its own exit code: 3 is the volume refusal alone (UwError stays 1).
+        print(f"uw: {args.verb}: {e}", file=sys.stderr)
+        return 3
     except UwError as e:
         prefix = f"{e.status} " if e.status is not None else ""
         print(f"uw: {args.verb}: {prefix}{e}", file=sys.stderr)

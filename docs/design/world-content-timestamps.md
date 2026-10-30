@@ -72,7 +72,7 @@ Three options were on the table:
 **Adopted: C.** The reason is not performance, it is repairability.
 **"The log" here means the tier-1 mutation log defined in §2.1 — not `events`.**
 
-`ax_0009` says duplicated state drifts. A denormalized `updated_at` (option A)
+Duplicated state drifts. A denormalized `updated_at` (option A)
 is exactly such a duplicate, and once it drifts there is nothing to reconcile it
 *against*. Under C the ordering is explicit — the event log outranks the column
 by construction — so a rebuild *repairs* the cache instead of being just another

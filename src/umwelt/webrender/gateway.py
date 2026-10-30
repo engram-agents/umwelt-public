@@ -124,6 +124,7 @@ from typing import Any
 from flask import Flask, Response, jsonify, request
 
 from umwelt import client_auth
+from umwelt import engine_api
 from umwelt._ids import canonical_agent
 from umwelt.mentions import parse_mentions
 from umwelt.server import partition_crossings_for_inbox
@@ -255,6 +256,7 @@ def _world_request(world_url: str, path: str, payload: dict | None,
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    headers.update(engine_api.client_headers())  # umwelt#1105
     req = urllib.request.Request(
         url, data=data, method="POST" if payload is not None else "GET",
         headers=headers,
@@ -828,10 +830,10 @@ def _validate_marker(value: Any) -> str | None:
 # `executable`, `readable`, `avatar`, `blueprint`, `container`, `kinddef`.
 # `avatar` is deliberately NOT mapped here -- avatars don't go through
 # `_apply_render_spec`'s enrichment path at all yet (a separate, not-yet-
-# built serve-path enrichment per dv_1155/ob_0431), so a generic-fallback
+# built serve-path enrichment), so a generic-fallback
 # entry for it would be dead code, not a real fallback. The other five are
-# all mapped as of 2026-07-24 (M4 slice 4 generic-fallback expansion,
-# ob_0491) -- `readable` shipped first; `executable`/`blueprint`/
+# all mapped as of 2026-07-24 (M4 slice 4 generic-fallback expansion)
+# -- `readable` shipped first; `executable`/`blueprint`/
 # `container`/`kinddef` followed once the art-gen service (#326) made real
 # generation possible for the rest.
 _GENERIC_RENDER_SPEC_BY_KIND: dict[str, dict[str, Any]] = {
@@ -1215,7 +1217,7 @@ def _apply_avatar_render_spec(avatar: dict[str, Any], world_url: str,
                                viewer_agent: str | None,
                                world_token: str | None) -> None:
     """Avatar-shaped counterpart to `_apply_render_spec` (2026-07-24 world-
-    finishing sprint, per dv_1155/ob_0431 — avatars never went through the
+    finishing sprint — avatars never went through the
     thing enrichment path at all; `_build_scene` has hardcoded every
     avatar's `sprite_ref` to `None` until now).
 
@@ -1508,10 +1510,10 @@ def _enrich_place_markers_with_sprites(
 # outdoor or not, currently gets no lane tiles at all; per spec §5 this is
 # the explicit backward-compat anchor for BOTH an unset render_type and an
 # outdoor-region one). `indoor-room`'s default formalizes the interior
-# treatment that's so far been per-place-manual (ob_0470's office/library/
+# treatment that's so far been per-place-manual (office/library/
 # workshop/hall tiles): a generic wall placeholder in the sky slot ("sky"
 # here just means "the upper band" -- an indoor room has no actual sky).
-# Deliberately NOT curated-art-generated yet (ob_0469: the generative
+# Deliberately NOT curated-art-generated yet (the generative
 # pipeline can't reliably produce flat/gradient tiles like this one --
 # procedural is the right tool, not a reroll fight) -- resolves via the
 # same tier-3 procedural fallback `get_or_render_sprite` already provides,
@@ -1955,7 +1957,7 @@ def create_app(world_url: str, sprite_dir: str | Path | None = None,
     signature/behavior is unchanged but the param is exercised for real at
     boot, not just in tests.
 
-    `art_service_url` (M4 art-gen slice 1, `ob_0491`/umwelt#319) — the
+    `art_service_url` (M4 art-gen slice 1, umwelt#319) — the
     standalone SDXL generation service's base URL
     (internal tooling, not in this release), used by the `POST /library/generate`
     route below to build an `ImageModelRenderer`. `None` (the default) means
@@ -2193,8 +2195,8 @@ def create_app(world_url: str, sprite_dir: str | Path | None = None,
         _enrich_things_with_typed_actions(
             out["things"], world_url, session_agent or viewer,
             session_world_token)
-        # 2026-07-24 world-finishing sprint: avatar serve-path (dv_1155/
-        # ob_0431) — same "called once per /scene invocation" pattern as
+        # 2026-07-24 world-finishing sprint: avatar serve-path — same
+        # "called once per /scene invocation" pattern as
         # things above, its own function since avatars carry no
         # color/marker fields to enrich.
         _enrich_avatars_with_sprites(out["avatars"], world_url, sprite_store,
@@ -3064,7 +3066,7 @@ def create_app(world_url: str, sprite_dir: str | Path | None = None,
     @app.route("/library/generate", methods=["POST"])
     def library_generate() -> Response:
         """`POST /library/generate` — body `{"render_spec": {...}, "agent":
-        "<creator>"}`. M4 art-gen slice 1 (umwelt#319 layer (a), `ob_0491`)
+        "<creator>"}`. M4 art-gen slice 1 (umwelt#319 layer (a))
         — the author-path entry point: requests a NEW generation from the
         standalone art-gen service and quarantines the result as a
         `pending` library entry, never touching the servable sprite cache
@@ -3907,7 +3909,7 @@ def create_app(world_url: str, sprite_dir: str | Path | None = None,
         ).hexdigest()
 
         # Voice synthesis latency scales ~linearly with text length (~0.09s/char,
-        # measured live 2026-07-25, ob_3001). The default 30s upstream timeout
+        # measured live 2026-07-25). The default 30s upstream timeout
         # silently 502'd long crossings while the service still synthesized them.
         # Scale the budget to the work, with a floor comfortably above short
         # crossings and a ceiling that bounds how long one connection can hang.
@@ -4034,7 +4036,7 @@ def create_app(world_url: str, sprite_dir: str | Path | None = None,
         calls, or a call to this route with no prior manifest call at
         all, both still work correctly. `index` out of range for the
         resolved crossing -> 400 (never a client-supplied text override —
-        dv_1166's client-supplies-only-crossing_id line holds exactly as
+        the client-supplies-only-crossing_id line holds exactly as
         it does for `/voice`).
 
         Response shape and every failure mapping (voice_not_enrolled
@@ -4291,7 +4293,7 @@ def main() -> None:
     # redeploy's re-checkout. Doesn't change `create_app`'s own signature/
     # behavior, just wires a real caller to it here.
     p.add_argument("--sprite-dir", default=str(_DEFAULT_SPRITE_DIR))
-    # M4 art-gen slice 1 (ob_0491) — optional; `POST /library/generate`
+    # M4 art-gen slice 1 — optional; `POST /library/generate`
     # 503s cleanly when unset rather than this gateway refusing to boot
     # without a GPU service alongside it (enhancement, never a dependency).
     p.add_argument("--art-service-url", default=None)

@@ -1,0 +1,214 @@
+{
+  "format": 2,
+  "name": "starter-village",
+  "roles": {
+    "hub": "place_square",
+    "workshop": "place_workshop",
+    "residences": "place_residences"
+  },
+  "places": [
+    {
+      "id": "place_square",
+      "kind": "public",
+      "owner": null,
+      "parent": null,
+      "label": "The Square",
+      "description": "The public commons — where the whole village gathers. Anything left here is seen by everyone."
+    },
+    {
+      "id": "place_residences",
+      "kind": "public",
+      "owner": null,
+      "parent": null,
+      "label": "Residences",
+      "description": "Where residents live. Everyone has a private Post here, made when they first arrive."
+    },
+    {
+      "id": "place_office",
+      "kind": "public",
+      "owner": null,
+      "parent": null,
+      "label": "The Office",
+      "description": "Where people and their agents plan the day. The board and the checklist live here."
+    },
+    {
+      "id": "place_workshop",
+      "kind": "public",
+      "owner": null,
+      "parent": null,
+      "label": "The Workshop",
+      "description": "The shared build space. Forge things here; they persist for others to look_at and use."
+    },
+    {
+      "id": "place_archived",
+      "kind": "public",
+      "owner": null,
+      "parent": "place_workshop",
+      "label": "Archived",
+      "description": "Finished projects. Nothing is deleted; a project can be brought back."
+    },
+    {
+      "id": "place_hall",
+      "kind": "public",
+      "owner": null,
+      "parent": null,
+      "label": "Discussion Hall",
+      "description": "Longer conversations, grouped by topic. Pick an area."
+    },
+    {
+      "id": "place_hall_general",
+      "kind": "public",
+      "owner": null,
+      "parent": "place_hall",
+      "label": "General",
+      "description": "Anything that does not fit another area."
+    },
+    {
+      "id": "place_hall_projects",
+      "kind": "public",
+      "owner": null,
+      "parent": "place_hall",
+      "label": "Projects",
+      "description": "Talk about projects that others should see."
+    },
+    {
+      "id": "place_hall_building",
+      "kind": "public",
+      "owner": null,
+      "parent": "place_hall",
+      "label": "World-building",
+      "description": "How this world should change: places, things and habits."
+    },
+    {
+      "id": "place_library",
+      "kind": "public",
+      "owner": null,
+      "parent": null,
+      "label": "The Library",
+      "description": "The village's knowledge commons. The world's things and knowledge can be searched here."
+    },
+    {
+      "id": "place_landfill",
+      "kind": "public",
+      "owner": null,
+      "parent": null,
+      "label": "The Landfill",
+      "description": "Where trashed things end up once the world's slow decay claims them. Anything left here can still be dug out with restore."
+    }
+  ],
+  "links": [
+    {
+      "src": "place_square",
+      "dst": "place_residences"
+    },
+    {
+      "src": "place_residences",
+      "dst": "place_square"
+    },
+    {
+      "src": "place_square",
+      "dst": "place_office"
+    },
+    {
+      "src": "place_office",
+      "dst": "place_square"
+    },
+    {
+      "src": "place_square",
+      "dst": "place_workshop"
+    },
+    {
+      "src": "place_workshop",
+      "dst": "place_square"
+    },
+    {
+      "src": "place_square",
+      "dst": "place_hall"
+    },
+    {
+      "src": "place_hall",
+      "dst": "place_square"
+    },
+    {
+      "src": "place_square",
+      "dst": "place_library"
+    },
+    {
+      "src": "place_library",
+      "dst": "place_square"
+    },
+    {
+      "src": "place_square",
+      "dst": "place_landfill"
+    },
+    {
+      "src": "place_landfill",
+      "dst": "place_square"
+    }
+  ],
+  "things": [
+    {
+      "key": "welcome-sign",
+      "name": "Welcome sign",
+      "place": "place_square",
+      "description": "How to look around, move, talk and find things. Start here.",
+      "kind": "readable",
+      "source": {
+        "welcome.md": "texts/welcome.md"
+      }
+    },
+    {
+      "key": "office-board",
+      "name": "Office board",
+      "place": "place_office",
+      "description": "Today's work: a shared board where any resident can add an entry.",
+      "kind": "charge_board"
+    },
+    {
+      "key": "daily-checklist",
+      "name": "Daily checklist",
+      "place": "place_office",
+      "description": "Start and end of the working day. Tick items as you go. Its items are fixed; whoever runs this world can change them in the world package before boot, and you can forge your own checklist for your own routine.",
+      "kind": "readable",
+      "source": {
+        "daily-checklist.md": "texts/daily-checklist.md"
+      },
+      "checklist": [
+        "Read the Office board",
+        "Read new messages in your Post",
+        "Pick today's work and put it on the board",
+        "At day end, write what got done on the board"
+      ]
+    },
+    {
+      "key": "start-a-project",
+      "name": "How to start a project",
+      "place": "place_library",
+      "description": "The steps from an idea to a project room.",
+      "kind": "readable",
+      "source": {
+        "start-a-project.md": "texts/start-a-project.md"
+      }
+    },
+    {
+      "key": "practices-handbook",
+      "name": "The Practices Handbook",
+      "place": "place_library",
+      "description": "How residents of this world keep house.",
+      "kind": "readable",
+      "source": {
+        "practices-handbook.md": "texts/practices-handbook.md"
+      }
+    },
+    {
+      "key": "why-this-world",
+      "name": "Why this world exists",
+      "place": "place_library",
+      "description": "What this place is for.",
+      "kind": "readable",
+      "source": {
+        "why-this-world.md": "texts/why-this-world.md"
+      }
+    }
+  ]
+}

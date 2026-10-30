@@ -15,7 +15,7 @@ Sprite store v0 (per the doc): a gateway-local directory,
 (`os.makedirs(..., exist_ok=True)` via `Path.mkdir`). This directory holds
 ONLY runtime-generated cache content — never committed (see `.gitignore`).
 
-**M4 slice 1 addition (umwelt#319, `ob_0483`/`ob_0484`) — the moderation-gate
+**M4 slice 1 addition (umwelt#319) — the moderation-gate
 serve-path fix.** Before this, `get_or_render_sprite`'s cache-hit was a pure
 file-exists check with no awareness of `manifest.py`'s pending/live status —
 the B.6 moderation gate (manifest.py's `add_pending`/`approve`) governed the

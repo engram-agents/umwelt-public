@@ -71,6 +71,7 @@ from typing import Callable
 # to import from umwelt.ghref directly) so this remains a drop-in for
 # existing callers.
 from . import client_auth
+from . import engine_api
 from .ghref import parse_gh_ref  # noqa: F401  (re-exported for callers)
 
 # Statuses eligible for reconciliation — see module docstring: this tool
@@ -213,7 +214,8 @@ def default_poster(base_url: str) -> PosterFn:
         data = json.dumps(payload).encode()
         req = urllib.request.Request(
             url, data=data, method="POST",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json",
+                     **engine_api.client_headers()},  # umwelt#1105
         )
         try:
             with client_auth.urlopen_with_cert_fallback(req, 10) as r:

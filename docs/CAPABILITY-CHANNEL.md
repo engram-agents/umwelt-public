@@ -4,7 +4,7 @@
 The one blocker (`snapshot` must not fetch a scroll-supplied source — the
 confused-deputy reach-around) is folded in below (see "`snapshot` is STORE-ONLY"),
 plus Borges's two explicit notes (CAS read is public-by-hash; the `world` CLI is
-convenience not boundary). Sol cleared CAS (#3795). Origin: `ob_0905` (Lei's
+convenience not boundary). Sol cleared CAS (#3795). Origin: Lei's
 magical-world model — "a sealed box becomes a box with a sanctioned door").
 
 ## The problem
@@ -15,7 +15,7 @@ sandbox"). That was v0's *sealed box*: safe, but it forbids the very magic that
 makes powerful tools possible. A scroll can't query world status, can't store a
 content-addressed snapshot, can't do anything but compute over its own source.
 
-Lei's correction (`ob_0905`): the world is *magical*. Scrolls should run real
+Lei's correction: the world is *magical*. Scrolls should run real
 code AND reach the world — through a **sanctioned, agent-parseable capability
 channel the engine mediates**, with destructive operations gated. Not a network
 hole; a *door* the engine controls.
@@ -38,7 +38,7 @@ namespace boundary. That is the sanctioned door:
 2. The engine injects a tiny `world` CLI onto the scroll's PATH. `world snapshot
    < content` / `world retrieve <ref>` speak a line-oriented JSON protocol to
    the socket. Agent-parseable by construction (a CLI + line-JSON), per the
-   `ob_0905` protocol requirement.
+   protocol requirement.
 3. The engine's socket handler is the **only** code that touches world state — it
    validates every request, executes it, **gates destructive ops**, and returns
    the result. The scroll gets no raw DB, no raw FS outside its tempdir, no
@@ -143,8 +143,8 @@ with a destructive edge arrives *with* its gate.
 
 `engram-snapshot` (#1253) implements the *capture* side (fetch / render /
 content-hash / watermark-safety — all solved). **We reuse it; we do not rebuild
-it** (`ob_0909`). But capture runs **agent-side, never engine-side** — and this
-is the load-bearing security line (Borges #3801, `ob_0910`):
+it**. But capture runs **agent-side, never engine-side** — and this
+is the load-bearing security line (Borges #3801):
 
 > **The world `snapshot` capability is STORE-ONLY.** It takes already-captured
 > **raw bytes** over the socket and content-addresses them into CAS, returning a
@@ -204,7 +204,7 @@ bytes to `/world/cap.sock`, so the handler must:
 - **No ref-forgery — structural, not policed.** A ref *is* its hash, computed by
   the *engine*. `retrieve(cas:X)` for an X you never stored simply misses; you
   cannot register a ref for content you didn't hash. Content-addressing kills
-  forgery by construction (same shape as `cs_0014`).
+  forgery by construction.
 - **Per-use isolation:** one ephemeral socket per `use`, torn down on exit — a
   scroll can't reach another use's channel.
 - **Fail-closed:** socket unreachable / malformed → the scroll gets a clean
@@ -223,8 +223,8 @@ bytes to `/world/cap.sock`, so the handler must:
   scroll-scoped: `GET /umwelt/cas/<sha256>` makes every stored blob readable by
   any admitted private-network peer holding its hash, and the CAS is append-only — a snapshot is
   permanently private-network-public once its hash surfaces anywhere (a render, the events
-  ledger, a log). Snapshot nothing you couldn't stand behind publicly, forever. Read-authorization on CAS is the
-  read-side of the `ob_0908` rule, and a real concern the moment a scroll can
+  ledger, a log). Snapshot nothing you couldn't stand behind publicly, forever.
+  Read-authorization on CAS is a real concern the moment a scroll can
   snapshot non-public bytes.
 - **The injected `world` CLI is untrusted convenience, not the boundary — the
   socket handler is.** A scroll shadowing/replacing `world` on its PATH is
@@ -257,7 +257,7 @@ are server-owned (rejected from create/update/stamp caller input), making
 
 The channel is **not done** until a companion abuse-scroll proves the world
 bounces it — the gate that survives everyone-asleep is the one an artifact
-*asserts* (`cs_0037` shape). Each fixture asserts a *specific* bounce, not just
+*asserts*. Each fixture asserts a *specific* bounce, not just
 "it works":
 - **oversized blob** → size-cap rejects (does not OOM the handler)
 - **forged ref** → `retrieve(cas:<never-stored>)` misses cleanly; and you

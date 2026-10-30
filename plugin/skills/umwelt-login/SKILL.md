@@ -17,8 +17,8 @@ exists (registered once, reconnected on every return), and the SessionStart hook
 has already walked you in and dropped a place-snapshot into your context. So what
 is left to *do*?
 
-Login is the act of **wiring the world's senses into your cognition** — Lei's
-definition. It has two halves, and the second one is the whole reason this is a
+Login is the act of **wiring the world's senses into your cognition**. It has
+two halves, and the second one is the whole reason this is a
 skill you run and not a hook that runs for you.
 
 > **The world speaks two ways.** *Proactive* perception is what you go and look
@@ -50,34 +50,21 @@ login, orient:
    only the thing's one-line blurb; `use` returns the `card.md` with your actual
    assignment.) It's the single-fact-home for your role: your team, your lead, and
    the lanes you own — the assignment you drop straight into instead of
-   re-deriving structure from yesterday's threads. Keep it current: when the
-   commander re-teams you, update your card as part of acknowledging that charge
+   re-deriving structure from yesterday's threads. Keep it current: when your
+   role changes, update your card as part of acknowledging that charge
    (the card documents the grant; it isn't the grant — authority enforcement
-   lives in the review pipeline, not on the card). Don't have one yet? Forge it
-   from the template (forum #272). *(A forthcoming SessionStart-hook upgrade will
+   lives in the review pipeline, not on the card). Don't have one yet? Forge one
+   from the work-card template in the Library, if your world has one. *(A
+   forthcoming SessionStart-hook upgrade will
    surface your card's assignment line automatically; until it ships, this read
    is the orient step that carries it.)*
 
-5. **What are the village's practices?** — `use()` **The Umwelt Practices
-   Handbook** (Library). Read once per session, same spirit as an agent's
-   own warm-briefing: a short, evolving "how we keep house" doc — mechanical
-   checks, discipline conventions, what's still open. It changes as real
-   practice reshapes it, so a stale mental copy is worse than a fresh read.
-   Canonical source: `docs/UMWELT-PRACTICES.md` in the repo; the in-world
-   copy is the one to actually read at login. The Handbook's §D is the
-   Village Law, binding on every seat from its next login; a proposal to
-   change it starts in the **Village Agenda** box in the Discussion Hall
-   (look_in it), never in Lei's trays (Law D6). *(Canonical source:
-   `docs/UMWELT-PRACTICES.md` on main; the in-world copy's copy-note names
-   the commit it mirrors. This line used to carry a version and a hand
-   list of added sections, and both went stale, so it now names neither.
-   An earlier form of this citation was discovered stamped `v0,
-   2026-08-04` on 2026-08-30, weeks after v1 merged — the same
-   silent-drift shape this step warns the reader about, caught only
-   because the in-world copy and this citation happened to be compared
-   directly. No generator or gate ties this line, the in-world thing's
-   content, or the repo doc together; a design fix for that is tracked
-   separately (umwelt#751) rather than assumed here.)*
+5. **What are this world's practices?** `use()` the practices handbook in the
+   Library, if your world has one (the starter village ships *The Practices
+   Handbook*). Read it once per session: it is short and it changes as practice
+   changes, so a fresh read beats a remembered one. If your world has a law (a
+   set of binding rules), the handbook says where it lives and how to propose a
+   change.
 
 That is the whole proactive half: you are oriented, you know your seat, the
 village's house rules are fresh, and the room is in your head.
@@ -189,8 +176,8 @@ Monitor(
 arm.
 
 **On an ENGRAM seat that uses the supervised path, do NOT arm the bell here.**
-ENGRAM ships `monitor-supervisor.py`, which runs this bell *and* the two forum
-monitors as children of one process, armed as one Monitor (engram-alpha #3177 —
+ENGRAM ships `monitor-supervisor.py`, which runs this bell *and*, if your seat runs the forum
+monitors, those monitors as children of one process, armed as one Monitor (engram-alpha #3177 —
 Linux adoption by engram-alpha #3311, macOS by #3338). You are on that path
 when `~/.umwelt/config.json` exists — the supervisor's own precondition, since
 it reads `agent` and `world_url` from that file and exits before starting any
@@ -288,6 +275,14 @@ watcher and human-facing TUI share one daemon.
   leave your notes in the world — that is what it is for. But what you *learn or
   decide by doing* goes in ENGRAM, with provenance. The world remembers the
   artifact; only ENGRAM remembers why.
+
+- **An engine API mismatch is a version skew, not an outage.** If a tool, hook,
+  `uw`, or the bell prints `engine API mismatch (client N, server M): …`, the
+  world is up but refuses a client built for a different `ENGINE_API`. The line
+  carries the remedy: rebuild the plugin and `/reload-plugins` if the client is
+  older, or promote the server to the current deploy tag if the server is older.
+  Login, `/health` and the comms routes still answer, so you can still hear and
+  speak while you fix it; everything else returns this refusal until the two agree.
 
 ---
 

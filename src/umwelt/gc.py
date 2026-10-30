@@ -6,7 +6,7 @@ Periodic job (run_gc) advances the removal lifecycle by time alone:
 
 This module is the ONLY caller of db.dissolve_thing and the only place that
 removes a thing's on-disk source dir or reclaims CAS blobs. Permanent
-destruction is never an agent's act (Lei/Ariadne, ob_0939: "the world's slow,
+destruction is never an agent's act (Lei/Ariadne, "the world's slow,
 time-driven, recoverable decay") — dissolve is not an HTTP route, not an MCP
 tool, just a function this module calls on a schedule.
 
@@ -275,8 +275,10 @@ def build_notice(landfilled, dissolved, recipients):
     return to, "\n".join(lines)
 
 
-def _post_notice(described, opener):
-    """(posted_ok, reason). Never raises."""
+def _post_notice(described, opener, db_path=None):
+    """(posted_ok, reason). Never raises. The destination is
+    $UMWELT_GC_NOTICE_PLACE, else the world's hub role read from `db_path`
+    (read-only; place_square when it cannot be read), umwelt#1043."""
     sender = os.environ.get("UMWELT_GC_NOTICE_FROM", "").strip() or "world-gc"
     if not _RECIPIENT_RE.fullmatch(sender):
         return False, ("UMWELT_GC_NOTICE_FROM has a character outside "
@@ -286,7 +288,7 @@ def _post_notice(described, opener):
     if recipients is None:
         return False, why
     place = (os.environ.get("UMWELT_GC_NOTICE_PLACE", "").strip()
-             or "place_office")
+             or db.role_place_id_readonly(db_path, "hub"))
     to, body = build_notice(described["landfilled"], described["dissolved"],
                             recipients)
     try:
@@ -367,7 +369,7 @@ def main(argv=None, *, opener=None) -> int:
     moved = len(result["landfilled"]) + len(result["dissolved"])
     if moved == 0:
         return 0
-    ok, reason = _post_notice(described, opener)
+    ok, reason = _post_notice(described, opener, db_path=db_path)
     code = 0
     if not ok:
         print(f"world-gc: moved {moved} things but no notice posted: "

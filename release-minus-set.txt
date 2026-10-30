@@ -49,3 +49,7 @@ tools/pixel_art_*
 tools/promote_art_library.py
 tools/populate_generics.py
 tools/s3d_backfill_boards.py
+# tools/gpu-notice is the notice_command of a private, host-specific GPU broker
+# (a separate repo); its only caller is not in the snapshot. If that broker
+# ever goes public, this line comes out with it.
+tools/gpu-notice

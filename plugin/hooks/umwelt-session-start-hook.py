@@ -27,6 +27,7 @@ from pathlib import Path
 # "must run standalone" posture.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from umwelt import client_auth  # noqa: E402
+from umwelt import engine_api  # noqa: E402
 
 CONFIG_PATH = Path.home() / ".umwelt" / "config.json"
 TIMEOUT_S = 3
@@ -47,6 +48,23 @@ _SESSION = client_auth.AgentSession()
 # place-snapshot line. `_LAST_AUTH_FAILURE` lets main() surface the failure
 # through THAT channel.
 _LAST_AUTH_FAILURE: str | None = None
+
+# umwelt#1105 ruling 1: the world's engine-API gate answered /umwelt/enter with
+# its 409. This hook is the best place in the system for that to surface, so
+# `_enter` records the refusal body here and main() puts ONE line into
+# additionalContext (the channel that reaches a reader).
+_LAST_MISMATCH: dict | None = None
+_REMEDY_CUT = 300
+
+
+def _mismatch_context(body: dict) -> str:
+    """`Umwelt: engine API mismatch (client <c>, engine <e>). <remedy>`;
+    `none` for a null client_api, remedy cut at 300 characters."""
+    client = body.get("client_api")
+    return (f"Umwelt: engine API mismatch "
+            f"(client {'none' if client is None else client}, "
+            f"engine {body.get('engine_api')}). "
+            f"{str(body.get('remedy'))[:_REMEDY_CUT]}")
 
 
 def _auth_headers(world_url: str, agent: str) -> dict[str, str] | None:
@@ -115,12 +133,18 @@ def _enter(world_url: str, agent: str) -> dict | None:
     payload = json.dumps({"agent": agent}).encode()
     headers = {"Content-Type": "application/json"}
     headers.update(auth_headers)
+    headers.update(engine_api.client_headers())  # umwelt#1105
     req = urllib.request.Request(url, data=payload, method="POST", headers=headers)
     try:
         with client_auth.urlopen_with_cert_fallback(req, TIMEOUT_S) as r:
             body = r.read().decode()
             return json.loads(body) if body else None
     except urllib.error.HTTPError as e:
+        refusal = engine_api.refusal_from_http_error(e)  # umwelt#1105
+        if refusal is not None:
+            global _LAST_MISMATCH
+            _LAST_MISMATCH = refusal
+            print(engine_api.render_mismatch(refusal), file=sys.stderr)
         # Fixed in review (PR #828) -- see umwelt-unseen-hook.py's identical
         # comment: urlopen() raises HTTPError for a non-2xx response, so the
         # previous `if r.status == 401` check inside the `with` block was
@@ -183,6 +207,14 @@ def main() -> None:
 
     resp = _enter(world_url, agent)
     if resp is None:
+        if _LAST_MISMATCH is not None:
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": _mismatch_context(_LAST_MISMATCH),
+                }
+            }))
+            return
         # Ariadne's PR#650 finding: an AuthFailure must not fall through
         # this branch silently — surface it via additionalContext (the
         # channel that reaches a reader), not stderr alone.

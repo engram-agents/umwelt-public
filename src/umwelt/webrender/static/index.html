@@ -164,6 +164,42 @@
   .inbox-item-sender { font-weight: bold; color: var(--gg-chrome-fg, #eee); }
   .inbox-item-time { color: #999; }
   .inbox-item-body { margin-top: 0.15rem; white-space: pre-wrap; }
+
+  /* umwelt#787 part 2: the unread model -- header row (count/Mark all
+     read/Show all toggle), the per-row kind chip, the unread-row
+     treatment, and the "New since you last looked" divider. */
+  .inbox-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding-bottom: 0.4rem;
+    border-bottom: 1px solid #333;
+    margin-bottom: 0.2rem;
+  }
+  .inbox-header-count { font-size: 0.8rem; color: #999; flex: 1; }
+  .inbox-mark-all-read-btn, .inbox-toggle-showall-btn {
+    font-size: 0.75rem;
+    padding: 0.15rem 0.45rem;
+  }
+  .inbox-item-kind-chip {
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    border: 1px solid #555;
+    border-radius: 3px;
+    padding: 0 0.3rem;
+  }
+  .inbox-item-unread { background: rgba(217, 164, 65, 0.08); }
+  .inbox-item-unread .inbox-item-sender { color: #d9a441; }
+  .inbox-divider {
+    font-size: 0.7rem;
+    color: #d9a441;
+    text-align: center;
+    padding: 0.3rem 0;
+    margin: 0.2rem 0;
+    border-top: 1px dashed #d9a441;
+  }
+  .inbox-nothing-new { padding-bottom: 0.4rem; }
   #place-desc { color: #aaa; margin-bottom: 1rem; max-width: 60ch; }
 
   /* umwelt #384 (Lei re-scope): a spectator session gets a login GATE
@@ -576,11 +612,11 @@
      avatars) — rather than a single flex row holding everything. Sharing
      one scroll container keeps all three bands horizontally aligned while
      scrolling (all three rows scroll together, one scrollbar). `position:
-     relative` so #street is the common offsetParent for every band's items
-     AND for `.avatar-cursor` below — see app.js's updateCursorPosition,
-     which measures a cursor-target upper-lane item's `offsetLeft` and
-     applies it directly to the self-avatar cursor's `left`, relying on
-     both being measured against the same coordinate origin. */
+     relative` so #street is the offsetParent for sky/land items AND for
+     `.avatar-cursor` below (road items' offsetParent is #street-road, see
+     its rule; umwelt #1132) — app.js's updateCursorPosition applies a
+     column's x to the self-avatar cursor's `left`, so that x is measured in
+     #street's frame via streetX(). */
   #street {
     position: relative;
     /* umwelt #341 (Lei's live walk, 2026-07-24), round 2: the three bands
@@ -696,8 +732,10 @@
      its own children's stacking/backgrounds.
      width: shared grid track — see the umwelt #322→#341 note on
      #street-sky above; no per-band width declarations. #street's
-     own box (the real offsetParent) is untouched by this change, so
-     cursor/overlap positioning math is unaffected. */
+     own box is untouched by this change. CORRECTION (umwelt #1132): road
+     items' offsetParent IS this #street-road (position: relative), not
+     #street, so their raw offsetLeft is in a different frame; keyboard-nav
+     x goes through app.js streetX() into #street's frame. */
   #street-road {
     min-width: 100%;
     position: relative;
@@ -1561,6 +1599,25 @@
   }
   .gg-thing-viewer-actparams { display: flex; flex-direction: column; gap: 0.4rem; }
   .gg-thing-viewer-actparams-header { font-weight: bold; }
+  .gg-thing-viewer-actparams-note { color: #9ad; font-size: 0.85rem; }
+  /* umwelt #1049: inline review comments on a proposal. */
+  .gg-review { display: flex; flex-direction: column; gap: 0.4rem; padding: 0.4rem 0; }
+  .gg-review-comment-btn { align-self: flex-start; }
+  .gg-review-editor-host { display: flex; flex-direction: column; gap: 0.3rem; }
+  .gg-review-editor-quote,
+  .gg-review-draft-quote {
+    color: #aaa; font-size: 0.85rem; font-style: italic;
+    border-left: 2px solid #555; padding-left: 0.5rem; overflow-wrap: anywhere;
+  }
+  .gg-review-list-header { color: #999; font-size: 0.85rem; margin-bottom: 0.25rem; }
+  .gg-review-draft { padding: 0.3rem 0; border-top: 1px solid #222; }
+  .gg-review-draft-comment {
+    margin-top: 0.15rem; margin-left: 0.75rem; color: #ccc; font-size: 0.85rem;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .gg-review-draft-stale { color: #e0b050; font-size: 0.8rem; margin-left: 0.5rem; }
+  .gg-review-warning { color: #c62828; font-size: 0.85rem; margin-bottom: 0.25rem; }
+  .gg-review-draft-actions { margin-top: 0.2rem; display: flex; gap: 0.4rem; }
   .gg-thing-viewer-loading,
   .gg-thing-viewer-error { color: #999; }
   /* umwelt #945: an act refusal shown in the viewer must be seen, not grey. */

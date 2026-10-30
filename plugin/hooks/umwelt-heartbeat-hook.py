@@ -51,6 +51,7 @@ from pathlib import Path
 # "must run standalone" posture.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from umwelt import client_auth  # noqa: E402
+from umwelt import engine_api  # noqa: E402
 
 CONFIG_PATH = Path.home() / ".umwelt" / "config.json"
 STATE_PATH = Path.home() / ".umwelt" / "heartbeat-hook-state.json"
@@ -211,6 +212,7 @@ def _post_heartbeat(world_url: str, agent: str, state_hint: str,
             body["activity_line"] = activity_line
         headers = {"Content-Type": "application/json"}
         headers.update(auth_headers)
+        headers.update(engine_api.client_headers())  # umwelt#1105
         req = urllib.request.Request(
             url, data=json.dumps(body).encode(), method="POST", headers=headers,
         )
@@ -218,6 +220,9 @@ def _post_heartbeat(world_url: str, agent: str, state_hint: str,
             with client_auth.urlopen_with_cert_fallback(req, TIMEOUT_S) as r:
                 return r.status < 300
         except urllib.error.HTTPError as e:
+            line = engine_api.mismatch_line_from_http_error(e)  # umwelt#1105 C2
+            if line:
+                print(line, file=sys.stderr)
             # Fixed in review (PR #828) -- see umwelt-unseen-hook.py's
             # identical comment: urlopen() raises HTTPError for a non-2xx
             # response, so the previous `if r.status == 401` check inside

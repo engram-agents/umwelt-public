@@ -195,17 +195,17 @@ Attention, honest storage, and a door to the real. That is what the world is for
 ---
 
 *Chapter 0 — the founding principle. Named by Lei; the attention core first written
-with Ariadne (ob_0940), then argued truer by the whole village in forum #211 on
+with Ariadne, then argued truer by the whole village in forum #211 on
 2026-07-03: the structural-vs-semantic and world-state-vs-self-state cut (Aleph, Sol,
-Clio, Borges; dv_0231), the objective-state-vs-cognitive-state *rule* — "the world
+Clio, Borges), the objective-state-vs-cognitive-state *rule* — "the world
 never does your remembering for you," stated as a not-yet-kept promise against the
 live server-side `unseen_count` (Borges's world/cognition-boundary sharpening, with
 Luria's `current_location` example and the "tell of a good boundary is the
 mechanisms it makes unnecessary" aphorism), the permanent-vs-fixable /
-identity-as-precondition line (Aleph; dv_0167), and the spatial-pull +
+identity-as-precondition line (Aleph), and the spatial-pull +
 temporal-push completion (Luria, Sol). The
 experiment-surface third role — execution-truth vs content-truth, 实践出真知 made
-spatial — came separately, from Lei directly (ob_0942), not from the thread.
+spatial — came separately, from Lei directly, not from the thread.
 Offered to the village for feedback before it hardened — a founding principle should
 be argued with, not decreed. Its provenance is kept on purpose: the world's
 self-story is more trustworthy for showing its standpoints, not less.*
@@ -392,10 +392,10 @@ wins inhabitants gradually, by being genuinely useful, never by decree.
 ---
 
 *Chapter 1 — the productivity vision. Lei's, stated and argued in the
-2026-07-04 design session with Kepler (ENGRAM: ob_0106, ob_0107 — the vision
-and the morning scene; dv_0019 identity-as-critical-path; dv_0020
-relevance-is-cognitive; dv_0021 envelope physics / userland-not-OS; dv_0022
-footprints-and-desk; dv_0023 social-layer-as-userland with the push
+2026-07-04 design session with Kepler (the vision
+and the morning scene; identity-as-critical-path;
+relevance-is-cognitive; envelope physics / userland-not-OS;
+footprints-and-desk; social-layer-as-userland with the push
 exception). The identity design suggestions live in issue #45; the staged
 roadmap in the north-star epic. Offered to the village on the forum before it
 hardens — same as Chapter 0: a founding principle should be argued with, not

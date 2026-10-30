@@ -16,7 +16,7 @@
 #      restart doesn't land a dead MCP server (umwelt #132 colleague review)
 #
 # Usage:
-#   tools/install-local-marketplace-umwelt.sh [--target claude|codex] [--skip-build] [--skip-add] [--skip-venv] [--allow-dirty]
+#   tools/install-local-marketplace-umwelt.sh [--target claude|codex] [--skip-build] [--skip-add] [--skip-venv] [--allow-dirty] [--allow-untagged]
 #
 #   --skip-build   don't run tools/build-umwelt-plugin.sh first (assumes
 #                  plugin/umwelt/ is already fresh)
@@ -28,20 +28,26 @@
 #                  pip install on every test run)
 #   --allow-dirty  explicitly assemble uncommitted source; the stamped
 #                  version includes a hash of the dirty contents
+#   --allow-untagged  build although HEAD has no deployable tag (deploy/* or
+#                  v*) merged into origin/main; the marker records the override
 #   -h, --help     show this help and exit
 #
 # Env:
+#   UMWELT_HOME               state dir for the .deployed-version marker
+#                             (default: $HOME/.umwelt)
 #   UMWELT_MARKETPLACE_ROOT   marketplace dir to assemble (default:
 #                             $HOME/.umwelt/marketplace). Overriding this is
 #                             what makes the script testable against a
 #                             throwaway directory — load-bearing for
 #                             tools/test-install-local-marketplace-umwelt.sh;
 #                             do not remove the override.
+#   UMWELT_LSREMOTE_TIMEOUT   seconds before the guard's `git ls-remote` query of
+#                             origin is cut off (default: 8)
 set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: install-local-marketplace-umwelt.sh [--target claude|codex] [--skip-build] [--skip-add] [--skip-venv] [--allow-dirty]
+Usage: install-local-marketplace-umwelt.sh [--target claude|codex] [--skip-build] [--skip-add] [--skip-venv] [--allow-dirty] [--allow-untagged]
 
   --target       install target (`claude` by default; `codex` to register +
                  install into Codex)
@@ -50,11 +56,26 @@ Usage: install-local-marketplace-umwelt.sh [--target claude|codex] [--skip-build
                  client's live plugin state
   --skip-venv    don't create/populate the ~/.umwelt/venv MCP-server venv
   --allow-dirty  assemble despite uncommitted changes; identity includes a diff hash
+  --allow-untagged
+                 build although HEAD has no deployable tag. The rule:
+                 deployable tags = deploy/* and v*, and the tagged commit must
+                 be reachable from origin/main. Without this flag the installer
+                 refuses (no tag, tag not merged into origin/main, or a tag
+                 origin has but this clone lacks: git fetch --tags). The
+                 override is recorded in the marker (umwelt_untagged_override=1).
   -h, --help     show this help
+
+A build writes $UMWELT_HOME/.deployed-version (default
+$HOME/.umwelt/.deployed-version) once the assembled tree validates,
+before registration. It does not attest registration (--skip-add or a
+missing claude/codex leaves none, exit 0). A refused build writes nothing.
 
 Env:
   UMWELT_MARKETPLACE_ROOT   marketplace dir to assemble (default:
                             $HOME/.umwelt/marketplace)
+  UMWELT_HOME               state dir for the marker (default: $HOME/.umwelt)
+  UMWELT_LSREMOTE_TIMEOUT   seconds before the guard's `git ls-remote` query of
+                            origin is cut off (default: 8)
 EOF
 }
 
@@ -62,6 +83,7 @@ skip_build=0
 skip_add=0
 skip_venv=0
 allow_dirty=0
+allow_untagged=0
 target="claude"
 
 while [[ $# -gt 0 ]]; do
@@ -92,6 +114,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --allow-dirty)
             allow_dirty=1
+            shift
+            ;;
+        --allow-untagged)
+            allow_untagged=1
             shift
             ;;
         -h|--help)
@@ -197,6 +223,99 @@ check_dirty_tree() {
         exit 1
     fi
 }
+
+# --- Deploy-tag guard (umwelt #1104) ---------------------------------------
+# Every commit a deployment is built from carries a deployable tag
+# (`deploy/YYYY-MM-DD-<name>` or `v*`), and that commit is reachable from
+# origin/main. This runs BEFORE the build and before any marketplace or marker
+# write, so a refusal leaves no trace. Plain `git` only.
+#
+#   A. no deployable tag at HEAD                   -> refuse
+#   B. deployable tag at HEAD, but HEAD is not reachable from origin/main
+#      (tag on an unmerged commit, or origin/main not available locally)
+#                                                  -> refuse, distinct message
+#   C. no deployable tag locally, but origin has one on this commit
+#      (stale local tags)                          -> refuse, names `git fetch --tags`
+#
+# --allow-untagged bypasses ALL THREE refusals (A, B and C) and repeats the
+# guard message as a WARNING; the marker then records umwelt_tag=none and
+# umwelt_untagged_override=1. There is deliberately no automatic fetch.
+deployable_tag_rule="deployable tags = deploy/* and v*"
+deploy_tag=""
+untagged_override=0
+guard_reason=""
+guard_hint=""
+
+# Limit (seconds) for the one network call the guard makes. A stock Mac has
+# neither `timeout` nor `gtimeout`, so the last branch uses python3 (already a
+# hard installer dependency); it kills the child on expiry and exits 124.
+run_with_timeout() {
+    local limit="${UMWELT_LSREMOTE_TIMEOUT:-8}"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$limit" "$@"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        gtimeout "$limit" "$@"
+    else
+        python3 -c '
+import subprocess
+import sys
+
+try:
+    raise SystemExit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode)
+except subprocess.TimeoutExpired:
+    raise SystemExit(124)
+' "$limit" "$@"
+    fi
+}
+
+evaluate_tag_guard() {
+    local tags_at_head
+    tags_at_head="$(git -C "$repo_root" tag --points-at HEAD --list 'deploy/*' 'v*' | LC_ALL=C sort | sed -n 1p)"
+    if [[ -n "$tags_at_head" ]]; then
+        if git -C "$repo_root" merge-base --is-ancestor HEAD refs/remotes/origin/main >/dev/null 2>&1; then
+            deploy_tag="$tags_at_head"
+            return 0
+        fi
+        guard_reason="tag $tags_at_head is at HEAD $source_short_commit, but the tagged commit is not confirmed merged into origin/main ($deployable_tag_rule)"
+        guard_hint="run \`git fetch origin\` if origin/main is stale, or merge the commit to main first"
+        return 1
+    fi
+
+    local nearest remote_tag ls_status ls_out ls_note=""
+    nearest="$(git -C "$repo_root" describe --tags --abbrev=0 2>/dev/null || true)"
+    [[ -n "$nearest" ]] || nearest="none"
+
+    # Stale local tags: does origin already have a deployable tag on this commit?
+    ls_status=0
+    ls_out="$(GIT_TERMINAL_PROMPT=0 run_with_timeout git -C "$repo_root" ls-remote --tags origin 'refs/tags/deploy/*' 'refs/tags/v*' 2>/dev/null)" || ls_status=$?
+    if [[ "$ls_status" -ne 0 ]]; then
+        ls_note=" [could not query origin for tags (git ls-remote failed)]"
+    else
+        # A lightweight tag lists the commit itself; an annotated tag lists the
+        # tag object and, on a second `^{}` line, the peeled commit.
+        remote_tag="$(printf '%s\n' "$ls_out" | awk -v head="$source_commit" '$1 == head { sub(/^refs\/tags\//, "", $2); sub(/\^\{\}$/, "", $2); print $2; exit }')"
+        if [[ -n "$remote_tag" ]]; then
+            guard_reason="no deployable tag at HEAD locally ($deployable_tag_rule), but origin has $remote_tag on this commit; \`git fetch --tags\` brings it local"
+            guard_hint="run \`git fetch --tags\` and rebuild"
+            return 1
+        fi
+    fi
+    guard_reason="no deployable tag at HEAD ($deployable_tag_rule): HEAD $source_short_commit, nearest tag: $nearest$ls_note"
+    guard_hint="tag the commit (deploy/YYYY-MM-DD-<name>) and rebuild"
+    return 1
+}
+
+if ! evaluate_tag_guard; then
+    if [[ "$allow_untagged" -eq 1 ]]; then
+        echo "install-local-marketplace-umwelt.sh: WARNING — --allow-untagged override: $guard_reason" >&2
+        untagged_override=1
+        deploy_tag=""
+    else
+        echo "install-local-marketplace-umwelt.sh: refusing to build: $guard_reason" >&2
+        echo "install-local-marketplace-umwelt.sh: $guard_hint, or pass --allow-untagged to build anyway (recorded in the marker as an override)" >&2
+        exit 1
+    fi
+fi
 
 check_dirty_tree "before build"
 
@@ -418,6 +537,52 @@ python3 -c "import json; json.load(open('$marketplace_json'))" \
     || { echo "install-local-marketplace-umwelt.sh: wrote invalid JSON to $marketplace_json" >&2; exit 1; }
 python3 -c "import json; json.load(open('$plugins_dest/.codex-plugin/plugin.json'))" \
     || { echo "install-local-marketplace-umwelt.sh: copied invalid JSON to $plugins_dest/.codex-plugin/plugin.json" >&2; exit 1; }
+
+# --- Deployed-version marker (umwelt #1104) -------------------------------
+# Written on EVERY successful assembly (also with --skip-add), never on a
+# refused one (the guard above exits first). It is written HERE, right after
+# the assembled tree validates and BEFORE registration: the marker describes
+# what was assembled, so a failed registration (which aborts under `set -e`)
+# leaves the assembled tree and its marker in agreement, never a marker naming
+# the previous deploy beside a rewritten tree. key=value lines; the
+# umwelt-owned keys carry the `umwelt_` prefix so a reader of another system's
+# marker never confuses the two. Atomic: write a temp file in the same
+# directory, then mv.
+umwelt_state_home="${UMWELT_HOME:-$HOME/.umwelt}"
+marker_path="$umwelt_state_home/.deployed-version"
+mkdir -p "$umwelt_state_home"
+marker_tmp="$(mktemp "$umwelt_state_home/.deployed-version.XXXXXX")"
+marker_branch="$(git -C "$repo_root" rev-parse --abbrev-ref HEAD)"
+marker_dirty="clean"
+if [[ -n "$(git -C "$repo_root" status --porcelain --untracked-files=no)" ]]; then
+    marker_dirty="dirty"
+fi
+marker_tag="${deploy_tag:-none}"
+# umwelt_engine_api is the #1105 field (umwelt-owned, so `umwelt_`-prefixed; the
+# unprefixed `engine_api` key of #1104 is retired). The key is ALWAYS present: its
+# value is the ENGINE_API number of the tree being deployed, read from that tree's
+# src/umwelt/engine_api.py (the one place the number lives -- never hard-coded
+# here), or `unknown` if the file or the line is missing.
+marker_engine_api="$(sed -n 's/^ENGINE_API: int = \([0-9][0-9]*\)$/\1/p' "$repo_root/src/umwelt/engine_api.py" 2>/dev/null | head -n 1)" || marker_engine_api=""
+if [[ -z "$marker_engine_api" ]]; then
+    marker_engine_api="unknown"
+    echo "install-local-marketplace-umwelt.sh: WARNING could not read ENGINE_API from $repo_root/src/umwelt/engine_api.py; recording umwelt_engine_api=unknown" >&2
+fi
+{
+    printf 'umwelt_sha=%s\n' "$source_commit"
+    printf 'umwelt_branch=%s\n' "$marker_branch"
+    printf 'umwelt_tag=%s\n' "$marker_tag"
+    if [[ "$untagged_override" -eq 1 ]]; then
+        printf 'umwelt_untagged_override=1\n'
+    fi
+    printf 'umwelt_dirty=%s\n' "$marker_dirty"
+    printf 'deployed_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'deployed_from=%s\n' "$repo_root"
+    printf 'umwelt_engine_api=%s\n' "$marker_engine_api"
+} > "$marker_tmp" || { rm -f "$marker_tmp"; echo "install-local-marketplace-umwelt.sh: could not write $marker_path" >&2; exit 1; }
+chmod 644 "$marker_tmp"
+mv -f "$marker_tmp" "$marker_path"
+echo "install-local-marketplace-umwelt.sh: deployed-version marker -> $marker_path"
 
 echo "install-local-marketplace-umwelt.sh: assembled marketplace at $marketplace_root"
 echo "install-local-marketplace-umwelt.sh: derived version -> $version"

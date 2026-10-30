@@ -20,6 +20,7 @@ import os
 import re
 import socket
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,6 +31,7 @@ from typing import Any
 from . import _ids
 from . import avatar_status as _avatar_status
 from . import client_auth as _client_auth
+from . import engine_api as _engine_api
 from . import mentions as _mentions
 
 try:
@@ -69,6 +71,40 @@ _WHATS_NEW_RENDER_CAP = 6000
 
 class WorldUnreachable(Exception):
     """The world server could not be reached (connection-level failure)."""
+
+
+# Cap on the bytes ONE world response may deliver (umwelt #1119 follow-up).
+# Twin of the same constant in tools/uw: keep the two equal.
+# Measured: the largest single response on the prod copy is 6,693,004 bytes
+# (crossings_for_agent without `since`); the cap is 2**25 bytes (32 MiB), the
+# smallest power of two at or above 4 x that figure (4 x 6,693,004 =
+# 26,772,016; the cap is 5.01 x it; the owner's rule is 4 x, rounded up to a
+# power of two). It refuses a legitimate single response over 32 MiB rather
+# than truncate it (the engine side is umwelt #1122). Applied where the body
+# is read off the socket, on the success AND the HTTP-error path.
+_MAX_RESPONSE_BYTES = 33554432
+# Cap on the files in ONE download (umwelt #1119 follow-up). Twin of the same
+# constant in tools/uw: keep the two equal. An
+# operational ceiling, not a measurement: a download plan above it is refused
+# before the first write, whatever its byte total.
+_MAX_DOWNLOAD_FILES = 10000
+
+
+class ResponseTooLarge(Exception):
+    """The world's answer (or a download plan) went past a volume cap. Its own
+    signal, deliberately NOT a WorldUnreachable: the world answered, and the
+    client refused to read or write that much. Tools render it as one line,
+    `⚠️ response too large: ...` (see `_request` and `_err`)."""
+
+
+def _too_large(e: "_client_auth.BodyTooLarge") -> ResponseTooLarge:
+    if e.advertised is not None:
+        return ResponseTooLarge(
+            f"response too large: advertised {e.advertised} bytes, "
+            f"cap is {_MAX_RESPONSE_BYTES} bytes")
+    return ResponseTooLarge(
+        f"response too large: read at least {e.read} bytes, "
+        f"cap is {_MAX_RESPONSE_BYTES} bytes")
 
 
 def _agent() -> str:
@@ -172,9 +208,11 @@ def _request_once(path: str, payload: dict | None, timeout: int,
     data = json.dumps(payload).encode() if payload is not None else None
     headers = {"Content-Type": "application/json"}
     headers.update(auth_headers)
-    req = urllib.request.Request(
+    # umwelt#1105: the engine-API number this client was built against.
+    headers.update(_engine_api.client_headers())
+    req = _client_auth.BoundedRequest(
         url, data=data, method="POST" if payload is not None else "GET",
-        headers=headers,
+        headers=headers, max_bytes=_MAX_RESPONSE_BYTES,
     )
     for attempt in range(2):
         try:
@@ -195,6 +233,8 @@ def _request_once(path: str, payload: dict | None, timeout: int,
                 # a ValueError -- named explicitly (umwelt#887).
                 return {"_status": e.code,
                         "error": "world returned a non-JSON error response"}
+        except _client_auth.BodyTooLarge as e:
+            raise _too_large(e) from e
         except urllib.error.URLError as e:
             if attempt == 0 and isinstance(e.reason, socket.gaierror):
                 time.sleep(0.5)
@@ -254,7 +294,14 @@ def _request(path: str, payload: dict | None, timeout: int) -> dict[str, Any]:
             auth_headers = _client_auth.get_auth_header(world_url, _agent(), _SESSION)
         except _client_auth.AuthFailure as e:
             return {"_status": 401, "error": f"authentication failed: {e}"}
-        resp = _request_once(path, payload, timeout, auth_headers)
+        try:
+            resp = _request_once(path, payload, timeout, auth_headers)
+        except ResponseTooLarge as e:
+            # Not an exception for the ~50 tool bodies (each catches only
+            # WorldUnreachable): a 502-shaped marker response that `_err`
+            # renders as the one-line refusal. The world's text is never
+            # echoed.
+            return {"_status": 502, "error": str(e), "_response_too_large": str(e)}
         # Retry once only if we sent a bearer token (not a declared-fallback
         # request) and the server rejected it — a fresh token may clear it.
         if resp.get("_status") == 401 and attempt == 0 and auth_headers:
@@ -315,7 +362,15 @@ def _informational_tail(resp: dict) -> str:
 
 
 def _err(resp: dict) -> str | None:
+    if resp.get("_response_too_large"):
+        # The volume refusal is its own signal: not "the world said no", not
+        # "unreachable" (see `_request`).
+        return f"⚠️ {resp['_response_too_large']}"
     if resp.get("_status", 200) >= 400:
+        # umwelt#1105 C1: the engine-API gate's refusal is rendered here, once,
+        # for every tool -- one line, the remedy in the server's own words.
+        if _engine_api.is_mismatch_refusal(resp["_status"], resp):
+            return _engine_api.render_mismatch(resp)
         return (f"⚠️ the world said no ({resp['_status']}): "
                 f"{resp.get('error', 'unknown')}{_informational_tail(resp)}")
     return None
@@ -536,8 +591,9 @@ def _render_arrival_counts(view: dict) -> str:
     if unseen:
         parts.append(f"{unseen} unseen crossing{'s' if unseen != 1 else ''}"
                      f" — 'hear' to read")
-    exits = sum(1 for r in (view.get("reachable") or [])
-                if r.get("relation") != "parent")
+    # umwelt#1043 slice 4: the way up IS an exit -- a Post whose only way
+    # out is its parent said "0 exits" and read as a dead end.
+    exits = len(view.get("reachable") or [])
     parts.append(f"{exits} exit{'s' if exits != 1 else ''}")
     return (" · ".join(parts) + "\n"
             "look_around for the room · where_can_i_go for exits")
@@ -594,30 +650,35 @@ def _render_place_view(view: dict, arrival: bool = False) -> str:
     if unseen_count:
         lines.append(f"{unseen_count} unseen crossing"
                      f"{'s' if unseen_count != 1 else ''} — 'hear' to read")
-    # umwelt #239 (street-view build-input, folded into #241): `reachable`
-    # now carries `relation: "child"|"link"|"parent"` per entry and includes
-    # the parent. This prose line stays parent-EXCLUSIVE (unchanged CLI/MCP
-    # behavior) — the parent isn't surfaced here at all today, and silently
-    # starting to fold it into "you can reach" would be an out-of-scope
-    # text-UX change riding along with a data-shape fix. Same call gateway.py
-    # makes for `/scene`'s `exits`, same reasoning.
+    # umwelt #239 / #1043 slice 4: `reachable` carries `relation:
+    # "child"|"link"|"parent"` per entry and includes the parent. The parent
+    # is the way UP: it is listed apart from the sideways/downward exits
+    # (`from here you can reach: A, B · the way up: Workshop`), and a place
+    # with only a parent prints just `the way up: Workshop`. (/scene's
+    # `exits` in the webrender gateway is deliberately unchanged.)
     reachable = [r for r in (view.get("reachable") or [])
                  if r.get("relation") != "parent"]
+    ways_up = [r for r in (view.get("reachable") or [])
+               if r.get("relation") == "parent"]
+
+    def _reach_label(r: dict) -> str:
+        # umwelt#543: each reachable entry carries the real marker string
+        # (server.py's _place_view) -- surfaced alongside the label, as every
+        # other consumer surface does. `.rstrip()` because this site
+        # comma-joins bare "label marker" pairs into prose with no bracketed
+        # `[id]` after the marker, so an untrimmed suffix would leave a stray
+        # space before each comma (Luria's colleague-pass catch on PR#545).
+        return (f"{r.get('label') or r.get('id')}"
+                f"{_marker_suffix(r.get('marker')).rstrip()}")
+
+    parts = []
     if reachable:
-        # umwelt#543: each reachable entry now carries the real marker
-        # string (server.py's _place_view) — surfaced alongside the label
-        # rather than a bare name, same as every other consumer surface.
-        # `.rstrip()` here, unlike every other _marker_suffix call site in
-        # this file: those all follow the marker with a bracketed `[id]`,
-        # so the suffix's trailing space is load-bearing (separates marker
-        # from bracket). This site instead comma-joins bare "label marker"
-        # pairs into a prose list with no trailing bracket to separate
-        # from — an untrimmed suffix would leave a stray space before each
-        # comma (Luria's colleague-pass catch on PR#545).
-        labels = [f"{r.get('label') or r.get('id')}"
-                  f"{_marker_suffix(r.get('marker')).rstrip()}"
-                  for r in reachable]
-        lines.append("from here you can reach: " + ", ".join(labels))
+        parts.append("from here you can reach: "
+                     + ", ".join(_reach_label(r) for r in reachable))
+    if ways_up:
+        parts.append("the way up: " + ", ".join(_reach_label(r) for r in ways_up))
+    if parts:
+        lines.append(" · ".join(parts))
     return "\n".join(lines)
 
 
@@ -1158,6 +1219,20 @@ def _summarize_metadata_for_default_render(metadata: dict) -> dict:
     return summarized
 
 
+def _render_thing_actions(actions: list) -> str | None:
+    """umwelt#1043 slice 4: what a typed thing can DO, one line per action as
+    `name(requires...)` -- the answer to "what do I `act` with here". The list
+    is /umwelt/thing_actions' (the kind chain, the one source of truth); this
+    only shapes it. None when there is nothing to list. TWIN CODE: the same
+    function sits in src/umwelt/mcp_server.py and tools/uw (separate files
+    across the plugin boundary); change one, change both."""
+    rows = [f"  {a['verb']}({', '.join(a.get('requires') or [])})"
+            for a in actions if isinstance(a, dict) and a.get("verb")]
+    if not rows:
+        return None
+    return "actions (use with act):\n" + "\n".join(rows)
+
+
 @mcp.tool()
 def look_at(payload_json: str) -> str:
     """Look closely at a thing (id or a name in view) — its description,
@@ -1296,7 +1371,332 @@ def look_at(payload_json: str) -> str:
         else:
             charge_board_headline = resp.get("charge_board_headline")
             out += f"\n{charge_board_headline if charge_board_headline is not None else charge_board_render}"
+    # umwelt#1043 slice 4: a TYPED thing (metadata.kind_id) lists its actions,
+    # read from the kind chain via /umwelt/thing_actions. An untyped thing
+    # makes no extra call and prints exactly what it always did. The list is
+    # an addition: if the call fails, the look_at stands without it.
+    if (t.get("metadata") or {}).get("kind_id"):
+        try:
+            acts = _get(f"/umwelt/thing_actions?thing={urllib.parse.quote(thing_id)}"
+                        f"&agent={urllib.parse.quote(agent)}")
+        except WorldUnreachable:
+            acts = None
+        if acts is not None and not _err(acts):
+            listing = _render_thing_actions(acts.get("actions") or [])
+            if listing:
+                out += f"\n{listing}"
     return out
+
+
+# --------------------------------------------------------------------------
+# umwelt #647 / #708: long-read verbs (`read`, `search`), the tome table of
+# contents, and `download` writing the CLIENT's own disk.
+#
+# TWIN CODE: this block is byte-identical in src/umwelt/mcp_server.py and
+# tools/uw (each client is a self-contained file; the plugin build vendors a
+# fixed file list, so a shared module would be a packaging change). Change
+# one, change the other. The engine does the paging; neither client re-pages.
+# --------------------------------------------------------------------------
+
+def _render_read_page(resp: dict) -> str:
+    """One `read` page the way the harness shows a file: a header, each line
+    as `cat -n` (`f"{n:>6}\t{text}"`), then `next: --offset X` or `(end)`.
+    A line the engine cut ends with a marker saying so."""
+    lines = resp.get("lines") or []
+    offset = resp.get("offset", 1)
+    total = resp.get("total_lines", 0)
+    cut = set(resp.get("cut_lines") or [])
+    head = f"[{resp.get('size_class')}] {resp.get('name')} · {resp.get('file')} · "
+    if lines:
+        head += f"lines {offset}–{offset + len(lines) - 1} of {total}"
+    else:
+        head += f"no lines at offset {offset} (the file has {total})"
+    rows = [head]
+    for i, text in enumerate(lines):
+        n = offset + i
+        row = f"{n:>6}\t{text}"
+        if n in cut:
+            row += f"… [line cut at {len(text)} chars]"
+        rows.append(row)
+    nxt = resp.get("next_offset")
+    rows.append(f"next: --offset {nxt}" if nxt is not None else "(end)")
+    return "\n".join(rows)
+
+
+def _render_edit(resp: dict) -> str:
+    """One `edit` confirmation the way the harness shows it: a header (what
+    was edited, how many replacements, the lines the first one now spans) and
+    the reply's excerpt as `cat -n` rows, numbered from where it starts (3
+    lines above the first replacement, or line 1)."""
+    n = resp.get("replaced", 1)
+    where = resp.get("file") or resp.get("field")
+    first, last = resp.get("first_line"), resp.get("last_line")
+    rows = [f"edited {resp.get('thing_id')} · {where} · {n} "
+            f"replacement{'' if n == 1 else 's'} · lines {first}–{last}"]
+    excerpt = resp.get("excerpt") or ""
+    if excerpt and isinstance(first, int):
+        start = max(1, first - 3)
+        rows += [f"{start + i:>6}\t{text}"
+                 for i, text in enumerate(excerpt.split("\n"))]
+    return "\n".join(rows)
+
+
+def _render_search(resp: dict) -> str:
+    """One `search` page in ripgrep form: `file:line:text` for a match,
+    `file-line-text` for a context line, `--` between groups that are not
+    adjacent; count mode `file:N`; files mode one path per line; then a
+    footer `total N · next: --offset X` or `total N · (end)`."""
+    mode = resp.get("output_mode")
+    rows: list[str] = []
+    last: tuple | None = None            # (file, last line number printed)
+    for e in resp.get("entries") or []:
+        if mode == "count":
+            rows.append(f"{e.get('file')}:{e.get('count')}")
+        elif mode == "files_with_matches":
+            rows.append(f"{e.get('file')}")
+        else:
+            group = ([(k, t, "-") for k, t in e.get("before") or []]
+                     + [(e.get("line"), e.get("text"), ":")]
+                     + [(k, t, "-") for k, t in e.get("after") or []])
+            if last is not None and (last[0] != e.get("file")
+                                     or group[0][0] != last[1] + 1):
+                rows.append("--")
+            for k, t, sep in group:
+                rows.append(f"{e.get('file')}{sep}{k}{sep}{t}")
+            last = (e.get("file"), group[-1][0])
+    nxt = resp.get("next_offset")
+    tail = f"next: --offset {nxt}" if nxt is not None else "(end)"
+    rows.append(f"total {resp.get('total')} · {tail}")
+    return "\n".join(rows)
+
+
+def _render_toc(toc: dict) -> str:
+    """The table of contents `use` returns for a tome/library: per file its
+    size, then its headings as indented `L{start}-{end}  ## title  (N chars)`
+    rows (the line range is what `read --offset/--limit` takes)."""
+    rows = ["contents:"]
+    heads = toc.get("headings") or []
+    for f in toc.get("files") or []:
+        rows.append(f"  {f.get('file')} — {f.get('lines')} lines, "
+                    f"{f.get('chars')} chars")
+        for h in heads:
+            if h.get("file") == f.get("file"):
+                rows.append(
+                    f"    L{h.get('start_line')}-{h.get('end_line')}  "
+                    f"{'#' * int(h.get('level', 1))} {h.get('title')}  "
+                    f"({h.get('chars')} chars)")
+    if toc.get("shown", 0) < toc.get("total", 0):
+        rows.append(f"  (showing {toc.get('shown')} of {toc.get('total')} "
+                    f"headings)")
+    return "\n".join(rows)
+
+
+def _download_bad_relpath(rel: Any) -> str | None:
+    """Why a world-supplied source relpath may not be written, or None. The
+    source dict is WORLD-supplied; the disk is yours: refuse empty, `.`/`..`
+    components, absolute, and NUL / control characters."""
+    if not isinstance(rel, str) or not rel:
+        return "empty or not a string"
+    if any(ord(c) < 32 or 0x7F <= ord(c) <= 0x9F for c in rel):
+        return "contains a NUL or control character"
+    # ANY surrogate code point: os.fsencode alone accepts U+DC80..U+DCFF
+    # (surrogateescape would turn them into raw bytes on disk).
+    if any(0xD800 <= ord(c) <= 0xDFFF for c in rel):
+        return "cannot be encoded as a file name (a lone surrogate)"
+    try:
+        os.fsencode(rel)
+    except UnicodeError:
+        return "cannot be encoded as a file name"
+    if (rel.startswith(("/", "\\")) or os.path.isabs(rel)
+            or re.match(r"^[A-Za-z]:", rel)):
+        return "is an absolute path"
+    for part in rel.replace("\\", "/").split("/"):
+        if part in ("", ".", ".."):
+            return "has an empty, '.' or '..' path component"
+        if len(os.fsencode(part)) > 255:
+            return "has a path component over 255 bytes"
+    return None
+
+
+def _write_download(source: Any, path: str, overwrite: bool) -> list[tuple[str, int]]:
+    """Write a `/umwelt/download` source dict to the client's disk; return
+    `[(written path, chars)]`. One file: `path` IS the file. Several: `path`
+    is a directory (made if absent) and each relpath goes under it.
+
+    Before ANYTHING is written (no directory made either), the whole plan
+    is validated: the target `path` itself (EVERY component at most
+    255 bytes, its total length under PC_PATH_MAX); every file's
+    text must encode as UTF-8; every relpath (several files) must be
+    non-empty, relative, free of `.`/`..`/empty components and of NUL /
+    control characters, free of any surrogate code point U+D800..U+DFFF, with
+    no component over 255 bytes and a total path the OS accepts; no two names
+    may collide after NFC + casefold (so `{A, a}` is refused on every
+    filesystem), nor a file also be a directory (`{a, a/b}`); no target may
+    resolve outside `path` (symlinks resolved), be a symlink or directory, or
+    already exist without `overwrite`. Before any write the volume is bounded:
+    the file count by an operational ceiling (`_MAX_DOWNLOAD_FILES`, not a
+    measurement and not a server limit) and the sum of the files' UTF-8 bytes
+    by `_MAX_RESPONSE_BYTES`; past either, `ResponseTooLarge` is raised and
+    nothing is written. A refusal leaves the disk untouched.
+
+    What is NOT checked up front: a disk error, or a symlink planted after
+    the check. Files are then opened O_EXCL (O_TRUNC with overwrite) and
+    O_NOFOLLOW, but O_NOFOLLOW protects only the final component of the path,
+    never a directory above it. Two residuals follow, both unguarded.
+    (1) With `overwrite`, a hard link at the destination is a regular file
+    and passes O_NOFOLLOW, and O_TRUNC truncates the linked inode; no guard
+    is promised. (2) A race: an empty directory can land outside the root if
+    a symlink is planted after the plan-time check and before makedirs on a
+    path the attacker controls; no file content is written there, and the
+    recheck after makedirs cannot be the fix, because it fires after both the
+    mkdir and the escape. A per-component mkdir with O_NOFOLLOW would close
+    it and is tracked on its own. Raises ValueError with the reason (or
+    `ResponseTooLarge` for the volume caps)."""
+    if not isinstance(source, dict) or not source:
+        raise ValueError("the world sent no files to write")
+    if not all(v is None or isinstance(v, str) for v in source.values()):
+        raise ValueError("the world sent a file that is not text; "
+                         "nothing was written")
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("path is required")
+    if any(ord(c) < 32 or 0x7F <= ord(c) <= 0x9F for c in path):
+        raise ValueError("path contains a NUL or control character")
+    target = os.path.abspath(os.path.expanduser(path))
+    # The TARGET's own limits, checked before anything (a makedirs included)
+    # touches the disk: EVERY component of it (the file for a single-file
+    # download, the directory for several) and its total length.
+    try:
+        path_max = os.pathconf("/", "PC_PATH_MAX")
+    except (OSError, ValueError, AttributeError):
+        path_max = 4096
+    try:
+        target_bytes = os.fsencode(target)
+    except UnicodeError:
+        raise ValueError("path cannot be encoded as a file name; "
+                         "nothing was written")
+    if any(len(part) > 255 for part in target_bytes.split(os.fsencode(os.sep))):
+        raise ValueError("refusing path: a component of it is over 255 "
+                         "bytes; nothing was written")
+    if len(target_bytes) >= path_max:
+        raise ValueError("refusing path: it is too long for this system; "
+                         "nothing was written")
+    if len(source) > _MAX_DOWNLOAD_FILES:
+        raise ResponseTooLarge(
+            f"response too large: {len(source)} files in the download, "
+            f"ceiling is {_MAX_DOWNLOAD_FILES} files; nothing was written")
+    total_bytes = 0
+    for rel, text in source.items():
+        try:
+            total_bytes += len((text or "").encode("utf-8"))
+        except UnicodeError:
+            raise ValueError(
+                f"refusing {rel!r}: its text cannot be encoded as UTF-8; "
+                f"nothing was written")
+    if total_bytes > _MAX_RESPONSE_BYTES:
+        raise ResponseTooLarge(
+            f"response too large: {total_bytes} bytes of file text in the "
+            f"download, cap is {_MAX_RESPONSE_BYTES} bytes; nothing was "
+            f"written")
+
+    def fold(name: str) -> str:
+        """NFC + casefold (+ NFC again: casefold can denormalise)."""
+        return unicodedata.normalize(
+            "NFC", unicodedata.normalize("NFC", name).casefold())
+
+    def check_free(dest: str, label: str) -> None:
+        if os.path.islink(dest):
+            raise ValueError(f"refusing {label}: it is a symlink")
+        if os.path.isdir(dest):
+            raise ValueError(f"refusing {label}: it is a directory")
+        if os.path.lexists(dest) and not overwrite:
+            raise ValueError(
+                f"refusing {label}: it already exists (pass overwrite to "
+                f"replace it); nothing was written")
+
+    plan: list[tuple[str, str]] = []           # (dest, text)
+    real_root: str | None = None
+    if len(source) == 1:
+        check_free(target, repr(path))
+        plan.append((target, next(iter(source.values())) or ""))
+    else:
+        norm: dict[str, str] = {}
+        folded: dict[str, str] = {}
+        for rel in source:
+            reason = _download_bad_relpath(rel)
+            if reason:
+                raise ValueError(
+                    f"refusing {rel!r}: it {reason}; nothing was written")
+            key = rel.replace("\\", "/")
+            if fold(key) in folded:
+                raise ValueError(
+                    f"refusing {rel!r}: it names the same file as "
+                    f"{folded[fold(key)]!r} (names are compared after "
+                    f"Unicode normalisation and case folding); nothing was "
+                    f"written")
+            norm[key] = rel
+            folded[fold(key)] = rel
+        for key, rel in norm.items():
+            parts = key.split("/")
+            for i in range(1, len(parts)):
+                hit = folded.get(fold("/".join(parts[:i])))
+                if hit is not None:
+                    raise ValueError(
+                        f"refusing {rel!r}: {hit!r} is "
+                        f"a file and also a directory; nothing was written")
+        if os.path.lexists(target) and not os.path.isdir(target):
+            raise ValueError(f"path {path!r} exists and is not a directory")
+        real_root = os.path.realpath(target)
+        for key, rel in norm.items():
+            dest = os.path.join(target, *key.split("/"))
+            if len(os.fsencode(dest)) >= path_max:
+                raise ValueError(
+                    f"refusing {rel!r}: the full path is too long for this "
+                    f"system; nothing was written")
+            real_parent = os.path.realpath(os.path.dirname(dest))
+            if os.path.commonpath([real_root, real_parent]) != real_root:
+                raise ValueError(
+                    f"refusing {rel!r}: it would land outside {path!r}; "
+                    f"nothing was written")
+            walk = os.path.dirname(dest)
+            while len(walk) > len(target):
+                if os.path.lexists(walk) and not os.path.isdir(walk):
+                    raise ValueError(
+                        f"refusing {rel!r}: a parent of it exists and is "
+                        f"not a directory; nothing was written")
+                walk = os.path.dirname(walk)
+            check_free(dest, repr(rel))
+            plan.append((dest, source[rel] or ""))
+
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    flags |= os.O_TRUNC if overwrite else os.O_EXCL
+    written: list[tuple[str, int]] = []
+    for dest, text in plan:
+        try:
+            parent = os.path.dirname(dest)
+            os.makedirs(parent, exist_ok=True)
+            if real_root is not None and os.path.commonpath(
+                    [real_root, os.path.realpath(parent)]) != real_root:
+                raise ValueError(f"refusing {dest!r}: it would land outside "
+                                 f"{path!r}")
+            fd = os.open(dest, flags, 0o644)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+                fh.write(text)
+        except (OSError, UnicodeError) as e:
+            done = ", ".join(p for p, _n in written) or "none"
+            raise ValueError(f"could not write {dest!r}: {e} "
+                             f"(written before the failure: {done})")
+        written.append((dest, len(text)))
+    return written
+
+
+def _render_download(name: Any, size_class: Any,
+                     written: list[tuple[str, int]]) -> str:
+    """The paths written and their char counts."""
+    total = sum(n for _p, n in written)
+    rows = [f"downloaded {name!r} ({size_class}): {len(written)} file(s), "
+            f"{total} chars"]
+    rows += [f"  {p}  ({n} chars)" for p, n in written]
+    return "\n".join(rows)
 
 
 @mcp.tool()
@@ -1388,6 +1788,10 @@ def use(payload_json: str) -> str:
                     parts.append(f"  {k}: {manifest[k]}")
             if manifest.get("metadata_keys"):
                 parts.append(f"  metadata_keys: {manifest['metadata_keys']}")
+        # umwelt #647: a tome/library's table of contents (where to `read`).
+        if o.get("toc"):
+            parts.append("")
+            parts.append(_render_toc(o["toc"]))
         for path, content in (o.get("content") or {}).items():
             parts.append(f"\n--- {path} ---\n{content}")
         return "\n".join(parts)
@@ -1404,6 +1808,205 @@ def use(payload_json: str) -> str:
     if diff.get("created") or diff.get("modified"):
         lines.append(f"  world_diff: {json.dumps(diff)}")
     return "\n".join(lines)
+
+
+def _long_read_body(agent: str, thing_id: str, params: dict[str, Any],
+                    keys: tuple[str, ...]) -> dict[str, Any]:
+    """The request body for `read` / `search`: agent + thing, then only the
+    optional fields the caller actually gave (so `uw` and this tool send the
+    same bytes for the same arguments)."""
+    body: dict[str, Any] = {"agent": agent, "thing": thing_id}
+    for key in keys:
+        if params.get(key) is not None:
+            body[key] = params[key]
+    return body
+
+
+@mcp.tool()
+def read(payload_json: str) -> str:
+    """Read part of a readable thing, like the harness's Read: one page of
+    numbered lines. Use it on a tome/library (`use` gives you its table of
+    contents, with the line range of each section).
+
+    `thing` resolves like `use` (an id, or a name in view or in your
+    inventory). A page ends at `limit` lines or at about 4 KB of text,
+    whichever comes first, and always holds at least one line; the footer
+    gives `next: --offset N` for the following page, or `(end)`. Line numbers
+    are 1-based. A line longer than 2000 chars is cut and marked. Reading
+    writes no use row.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            thing (str, required): A thing id or the name you see.
+            file (str, optional): Which file of the thing. Needed only when
+                the thing has more than one.
+            offset (int, optional): 1-based line to start at. Default: 1.
+            limit (int, optional): Most lines to return. Default: 2000.
+    """
+    params, err = _parse_payload(
+        payload_json, required=frozenset({"thing"}),
+        allowed=frozenset({"thing", "file", "offset", "limit"}))
+    if err:
+        return err
+    agent = _agent()
+    thing_id, err = _resolve_thing_ref(agent, params["thing"],
+                                       include_inventory=True)
+    if err:
+        return err
+    try:
+        resp = _post("/umwelt/read", _long_read_body(
+            agent, thing_id, params, ("file", "offset", "limit")))
+    except WorldUnreachable as e:
+        return f"⚠️ the world is unreachable at {WORLD_URL}: {e}"
+    if (e := _err(resp)):
+        return e
+    return _render_read_page(resp)
+
+
+@mcp.tool()
+def search(payload_json: str) -> str:
+    """Search a readable thing's text for a regular expression, like the
+    harness's Grep (same argument names, dashes included). Matching is per
+    line; files are searched in sorted order. `pattern` is a `regex`-package
+    (Python `re` style) expression, NOT ripgrep's: lookarounds work. A plain
+    word is a valid pattern. A pattern that takes more than 2 seconds in
+    total is refused ("pattern timed out"), whole.
+
+    Output (`output_mode`): `content` (default) prints `file:line:text` for a
+    match and `file-line-text` for a context line, `--` between groups that
+    are not adjacent; `count` prints `file:N`; `files_with_matches` prints one
+    path per line. The footer says `total N` and `next: --offset X` when there
+    are more entries (`offset` and `head_limit` count entries, not lines).
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            thing (str, required): A thing id or the name you see.
+            pattern (str, required): The expression, at most 512 chars.
+            file (str, optional): Restrict to one file. Default: all files.
+            output_mode (str, optional): content | count | files_with_matches.
+            -i (bool, optional): Case-insensitive.
+            -A (int, optional): Context lines after a match, 0-10.
+            -B (int, optional): Context lines before a match, 0-10.
+            -C (int, optional): Context lines both sides, 0-10 (-A / -B win).
+            head_limit (int, optional): Most entries to return. Default: 50.
+            offset (int, optional): Skip this many entries. Default: 0.
+    """
+    keys = ("file", "output_mode", "-i", "-A", "-B", "-C", "head_limit",
+            "offset")
+    params, err = _parse_payload(
+        payload_json, required=frozenset({"thing", "pattern"}),
+        allowed=frozenset({"thing", "pattern", *keys}))
+    if err:
+        return err
+    agent = _agent()
+    thing_id, err = _resolve_thing_ref(agent, params["thing"],
+                                       include_inventory=True)
+    if err:
+        return err
+    body = _long_read_body(agent, thing_id, params, ("pattern", *keys))
+    try:
+        resp = _post("/umwelt/search", body)
+    except WorldUnreachable as e:
+        return f"⚠️ the world is unreachable at {WORLD_URL}: {e}"
+    if (e := _err(resp)):
+        return e
+    return _render_search(resp)
+
+
+@mcp.tool()
+def edit(payload_json: str) -> str:
+    """Like Claude Code's Edit: old_string must match exactly once, or pass
+    replace_all. Replaces text in a thing you may update (the same gate as
+    update_thing) without re-sending the rest of it.
+
+    Matching is exact and case-sensitive, on the text as stored (a file with
+    CRLF line endings needs \\r\\n in old_string). Zero matches, or several
+    without replace_all, is refused with the count (and the first line
+    numbers); nothing is written. The reply is the line range the first
+    replacement now spans and a short excerpt, never the whole text. Editing
+    writes no use row.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            thing (str, required): A thing id or the name you see.
+            old_string (str, required): The exact text to find (at most
+                32,768 chars, not empty).
+            new_string (str, required): The replacement (at most 32,768
+                chars; must differ from old_string).
+            file (str, optional): Which file of the thing's source. Needed
+                only when it has more than one. Not valid with
+                field=description.
+            field (str, optional): "source" (default) or "description" (a
+                board header, a blurb: at most 8192 chars after the edit).
+            replace_all (bool, optional): Replace every occurrence.
+                Default: false.
+    """
+    keys = ("file", "field", "replace_all")
+    params, err = _parse_payload(
+        payload_json, required=frozenset({"thing", "old_string", "new_string"}),
+        allowed=frozenset({"thing", "old_string", "new_string", *keys}))
+    if err:
+        return err
+    agent = _agent()
+    thing_id, err = _resolve_thing_ref(agent, params["thing"],
+                                       include_inventory=True)
+    if err:
+        return err
+    body = _long_read_body(agent, thing_id, params,
+                           ("old_string", "new_string", *keys))
+    try:
+        resp = _post("/umwelt/edit", body)
+    except WorldUnreachable as e:
+        return f"⚠️ the world is unreachable at {WORLD_URL}: {e}"
+    if (e := _err(resp)):
+        return e
+    return _render_edit(resp)
+
+
+@mcp.tool()
+def download(payload_json: str) -> str:
+    """Download a readable thing's whole text to YOUR disk (the world never
+    writes it). One file: `path` is the file. Several files: `path` is a
+    directory (made if absent) and each file goes under it. An existing file
+    is refused unless `overwrite` is true. The whole download is refused,
+    before anything is written, if any file name would land outside `path`
+    (empty, `.`, `..`, absolute, control characters, a symlink out, or both
+    `a` and `a/b`), because the world supplies those names.
+
+    Prefer `read` / `search` for a tome: this puts all of it on disk.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            thing (str, required): A thing id or the name you see.
+            path (str, required): The file (one-file thing) or directory.
+            overwrite (bool, optional): Replace existing files. Default: false.
+    """
+    params, err = _parse_payload(
+        payload_json, required=frozenset({"thing", "path"}),
+        allowed=frozenset({"thing", "path", "overwrite"}))
+    if err:
+        return err
+    overwrite = params.get("overwrite", False)
+    if not isinstance(overwrite, bool):
+        return "⚠️ overwrite must be true or false"
+    agent = _agent()
+    thing_id, err = _resolve_thing_ref(agent, params["thing"],
+                                       include_inventory=True)
+    if err:
+        return err
+    try:
+        resp = _post("/umwelt/download", {"agent": agent, "thing": thing_id})
+    except WorldUnreachable as e:
+        return f"⚠️ the world is unreachable at {WORLD_URL}: {e}"
+    if (e := _err(resp)):
+        return e
+    try:
+        written = _write_download(resp.get("source"), params["path"], overwrite)
+    except ResponseTooLarge as e:
+        return f"⚠️ {e}"
+    except ValueError as e:
+        return f"⚠️ {e}"
+    return _render_download(resp.get("name"), resp.get("size_class"), written)
 
 
 @mcp.tool()
@@ -3300,7 +3903,15 @@ def act(payload_json: str) -> str:
         return f"⚠️ the world is unreachable at {WORLD_URL}: {e}"
     if (e := _err(resp)):
         return e
-    out = f"{action} on {resp['thing_id']}: status={resp.get('status')}"
+    status = resp.get("status")
+    if status is not None:
+        out = f"{action} on {resp['thing_id']}: status={status}"
+    elif resp.get("effect_failures"):
+        # No state transition AND a failed effect: the old `status=None`
+        # headline was byte-identical to a success. Say so up front.
+        out = f"{action} on {resp['thing_id']}: ⚠️ effect failed (no status change)"
+    else:
+        out = f"{action} on {resp['thing_id']}: ok (no status change)"
     if resp.get("effect_failures"):
         out += f"\n  ⚠️ effect_failures: {resp['effect_failures']}"
     if resp.get("effect_results"):
@@ -3532,10 +4143,10 @@ def checklist(payload_json: str) -> str:
     `full: true` to get the full block instead (today's behavior); `full`
     is client-only and is never sent to the world.
 
-    Examples: checklist('{"thing": "thing_bed_ariadne", "op": "check", "item": 2}')
-              checklist('{"thing": "thing_bed_ariadne", "op": "add", "text": "Water the plants"}')
-              checklist('{"thing": "thing_bed_ariadne", "op": "reset"}')
-              checklist('{"thing": "thing_bed_ariadne", "op": "check", "item": 2, "full": true}')
+    Examples: checklist('{"thing": "<thing-id>", "op": "check", "item": 2}')
+              checklist('{"thing": "<thing-id>", "op": "add", "text": "Water the plants"}')
+              checklist('{"thing": "<thing-id>", "op": "reset"}')
+              checklist('{"thing": "<thing-id>", "op": "check", "item": 2, "full": true}')
 
     Args:
         payload_json: JSON object (as a string) with these fields:

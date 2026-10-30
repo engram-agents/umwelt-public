@@ -18,7 +18,7 @@ procedural sprite on `None` is the caller's (gateway/service's)
 responsibility, same reject-and-fallback pattern `gateway.py`'s
 `_apply_render_spec` already uses for a malformed `render_spec`.
 
-**Provenance (ob_0491):** this is a fresh authoring against current `main`,
+**Provenance:** this is a fresh authoring against current `main`,
 not a rebase of `origin/webrender/m4-prompt-composition` (Luria's original,
 commit `d8a819e`, which predates `manifest.py`/`library.py` and is stale
 against them). Kepler's 2026-07-24 ruling (forum #277): port the *taxonomy*
@@ -30,7 +30,7 @@ required subject), not the old branch's code verbatim.
 
 **One deliberate deviation from the old branch's `_DESCRIPTOR_RE`/cap:** the
 M4 design-of-record (`docs/web-render/ART-GENERATION-PIPELINE-M4.md` §6.1,
-`dv_1161`, Kepler-endorsed 2026-07-23) supersedes the old branch's
+Kepler-endorsed 2026-07-23) supersedes the old branch's
 lowercase-only `^[a-z0-9 '-]+$` / 20-char cap with `^[A-Za-z0-9 -]+$` (mixed
 case, apostrophe dropped as a DOM-quote-injection risk) / 24-char cap. This
 module implements the DoR's newer charset, not the old branch's — the DoR
@@ -96,9 +96,9 @@ PALETTE_ADJECTIVES: dict[str, str] = {
 SPRITE_SIZE = 64  # DoR §9 Q2 (Lei, 2026-07-23) -- see module docstring.
 
 MAX_DESCRIPTORS = 6
-MAX_DESCRIPTOR_LEN = 24  # DoR dv_1161 (was 20 in the old branch)
+MAX_DESCRIPTOR_LEN = 24  # DoR (was 20 in the old branch)
 # Mixed-case letters, digits, spaces, hyphens. Apostrophe deliberately
-# excluded (DoR dv_1161 -- DOM/quote-injection risk in the Library browser's
+# excluded (DoR -- DOM/quote-injection risk in the Library browser's
 # display, per ART-GENERATION-PIPELINE-M4.md §6.2). No other punctuation --
 # nothing that could plausibly be prompt-injection or markup syntax.
 _DESCRIPTOR_RE = re.compile(r"^[A-Za-z0-9 -]+$")

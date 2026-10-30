@@ -117,6 +117,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from umwelt import client_auth as _client_auth  # noqa: E402
+from umwelt import engine_api as _engine_api  # noqa: E402
 from umwelt.webrender import library  # noqa: E402
 from umwelt.webrender.sprites import spec_key  # noqa: E402
 
@@ -237,6 +238,7 @@ def _http_request_once(method: str, path: str, *, params: dict | None,
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {"Content-Type": "application/json"} if data is not None else {}
     headers.update(auth_headers)
+    headers.update(_engine_api.client_headers())  # umwelt#1105
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with _client_auth.urlopen_with_cert_fallback(req, 30) as r:
@@ -320,7 +322,8 @@ def _http_status(path: str, *, base_url: str) -> int:
     fetch in `fetch_library_manifest` succeeded first)."""
     base = base_url.rstrip("/")
     url = f"{base}{path}"
-    req = urllib.request.Request(url, method="HEAD")
+    req = urllib.request.Request(url, method="HEAD",
+                                 headers=_engine_api.client_headers())  # umwelt#1105
     try:
         with _client_auth.urlopen_with_cert_fallback(req, 30) as r:
             return r.status

@@ -43,6 +43,10 @@ extra_bg_pid=""
 scratch_repo=""
 scratch_runtime_base=""
 
+# b_root: parent of every throwaway runtime base made by the backup cells
+# (B1-B9, umwelt #1106); declared here so cleanup() removes it unconditionally.
+b_root=""
+
 cleanup() {
     if [[ -n "$extra_bg_pid" ]]; then
         for _bg_pid in $extra_bg_pid; do
@@ -50,7 +54,7 @@ cleanup() {
             wait "$_bg_pid" 2>/dev/null || true
         done
     fi
-    rm -rf "$tmp_base" "$stub_bin" "$scratch_repo" "$scratch_runtime_base"
+    rm -rf "$tmp_base" "$stub_bin" "$scratch_repo" "$scratch_runtime_base" "$b_root"
 }
 trap cleanup EXIT
 
@@ -453,13 +457,22 @@ git -C "$scratch_repo" init -q
 git -C "$scratch_repo" config user.email "test@example.com"
 git -C "$scratch_repo" config user.name "Test Harness"
 
-mkdir -p "$scratch_repo/src/umwelt" "$scratch_repo/tools" "$scratch_repo/plugin"
+mkdir -p "$scratch_repo/src/umwelt" "$scratch_repo/tools" "$scratch_repo/plugin" \
+    "$scratch_repo/worlds/starter-village"
 cp "$installer" "$scratch_repo/tools/install-world.sh"
 chmod +x "$scratch_repo/tools/install-world.sh"
 echo "print('hello')" > "$scratch_repo/src/umwelt/__init__.py"
 echo "flask" > "$scratch_repo/requirements.txt"
 echo "# protocol" > "$scratch_repo/PROTOCOL.md"
 echo "# plugin stub" > "$scratch_repo/plugin/stub.py"
+# umwelt#1043: the world package ships inside the runtime archive; the real
+# loader module is copied in so test 16c can run the INSTALLED code.
+cp "$repo_root/src/umwelt/world_package.py" "$scratch_repo/src/umwelt/world_package.py"
+cat > "$scratch_repo/worlds/starter-village/world.json" <<'JSON'
+{"format": 1, "name": "starter-village",
+ "roles": {"hub": "place_a", "workshop": "place_a"},
+ "places": [{"id": "place_a", "kind": "public", "label": "A"}]}
+JSON
 git -C "$scratch_repo" add -A
 git -C "$scratch_repo" commit -q -m "commit A: baseline"
 commit_a="$(git -C "$scratch_repo" rev-parse HEAD)"
@@ -522,12 +535,29 @@ pass "a diff including an outside-archive file prints the report and names exact
 #         else -- in particular, plugin/ must NOT be exported. ---
 scratch_version_dir_c="$scratch_runtime_base/runtime-alpha/versions/$commit_c"
 actual_top_level="$(LC_ALL=C ls -A "$scratch_version_dir_c" | LC_ALL=C sort | tr '\n' ' ')"
-expected_top_level="$(printf '%s\n' COMMIT_SHA PROTOCOL.md requirements.txt src .export-complete | LC_ALL=C sort | tr '\n' ' ')"
+expected_top_level="$(printf '%s\n' COMMIT_SHA PROTOCOL.md requirements.txt src worlds .export-complete | LC_ALL=C sort | tr '\n' ' ')"
 [[ "$actual_top_level" == "$expected_top_level" ]] \
     || fail "exported versions/$commit_c top level is '$actual_top_level', expected '$expected_top_level' -- the archive-path refactor changed what gets exported"
 [[ ! -e "$scratch_version_dir_c/plugin" ]] \
     || fail "plugin/ was exported into versions/$commit_c -- the archive path list leaked something it shouldn't"
-pass "the runtime_archive_paths refactor exports exactly src/umwelt/, requirements.txt, PROTOCOL.md (plus the script's own COMMIT_SHA/.export-complete markers) and nothing else"
+pass "the runtime_archive_paths refactor exports exactly src/umwelt/, worlds/, requirements.txt, PROTOCOL.md (plus the script's own COMMIT_SHA/.export-complete markers) and nothing else"
+
+# --- 16b. umwelt#1043: the world package ships in the installed runtime. ---
+[[ -s "$scratch_version_dir_c/worlds/starter-village/world.json" ]] \
+    || fail "versions/$commit_c/worlds/starter-village/world.json is missing or empty -- the installed runtime does not ship the world package"
+pass "the installed runtime ships worlds/starter-village/world.json (non-empty)"
+
+# --- 16c. umwelt#1043: the INSTALLED code (not the repo's) finds the package.
+#          Python runs with the installed src on sys.path and a cwd outside
+#          both trees, so only the installed layout can answer. ---
+elsewhere="$(mktemp -d)"
+resolved="$(cd "$elsewhere" && env -u UMWELT_WORLD_PACKAGE PYTHONPATH="$scratch_version_dir_c/src" \
+    python3 -c 'from umwelt import world_package as w; print("RESOLVED=" + str(w.default_package_path().resolve()))' 2>&1 | grep '^RESOLVED=' | cut -d= -f2- || true)"
+rm -rf "$elsewhere"
+expected_pkg="$(cd "$scratch_version_dir_c/worlds/starter-village" 2>/dev/null && pwd -P || true)"
+[[ -n "$resolved" && "$resolved" == "$expected_pkg" ]] \
+    || fail "the installed loader resolved the package to '$resolved', expected '$expected_pkg'"
+pass "the installed loader resolves versions/<sha>/worlds/starter-village from the installed layout"
 
 # --- 17. NO-OP RE-INSTALL (umwelt #799): installing the SAME --ref twice in
 #         a row (prev_sha == sha) must print NO outside-archive-boundary
@@ -542,8 +572,366 @@ if echo "$out17" | grep -qi 'fall OUTSIDE the runtime archive'; then
 fi
 pass "installing the same --ref twice in a row (prev_sha == sha) prints no outside-archive-boundary report"
 
+# --- 18. umwelt#1043: a change to worlds/ is INSIDE the archive -- it is
+#         exported and is NOT named in the outside-archive report. ---
+echo ' ' >> "$scratch_repo/worlds/starter-village/world.json"
+git -C "$scratch_repo" add -A
+git -C "$scratch_repo" commit -q -m "commit D: worlds/ only"
+commit_d="$(git -C "$scratch_repo" rev-parse HEAD)"
+out18="$(UMWELT_RUNTIME_BASE="$scratch_runtime_base" bash "$scratch_installer" --target alpha --ref "$commit_d" 2>&1)"
+echo "$out18"
+if echo "$out18" | grep -qiE 'fall OUTSIDE the runtime archive|worlds/starter-village'; then
+    fail "a change to worlds/ was reported as outside the runtime archive"
+fi
+cmp -s "$scratch_repo/worlds/starter-village/world.json" "$scratch_runtime_base/runtime-alpha/versions/$commit_d/worlds/starter-village/world.json" \
+    || fail "the changed worlds/ file was not exported into versions/$commit_d"
+pass "a worlds/-only change is inside the archive: exported, and absent from the outside-archive report"
+
+# --- 19. umwelt#1043 review: only `worlds` is optional. A ref that lacks a
+#         REQUIRED path (requirements.txt here) must still fail the archive
+#         loudly, export nothing complete, and leave `live` where it was. ---
+live_before="$(readlink "$scratch_runtime_base/runtime-alpha/live")"
+git -C "$scratch_repo" rm -q requirements.txt
+git -C "$scratch_repo" commit -q -m "commit E: required path removed"
+commit_e="$(git -C "$scratch_repo" rev-parse HEAD)"
+if out19="$(UMWELT_RUNTIME_BASE="$scratch_runtime_base" bash "$scratch_installer" --target alpha --ref "$commit_e" 2>&1)"; then
+    echo "$out19"
+    fail "installing a ref that lacks requirements.txt succeeded -- a missing REQUIRED archive path was silently skipped"
+fi
+echo "$out19" | grep -q 'pathspec' \
+    || fail "the failed install did not report the missing path from git archive: $out19"
+[[ ! -e "$scratch_runtime_base/runtime-alpha/versions/$commit_e/.export-complete" ]] \
+    || fail "a failed export left a completion marker"
+[[ "$(readlink "$scratch_runtime_base/runtime-alpha/live")" == "$live_before" ]] \
+    || fail "a failed install moved the live symlink"
+pass "a ref missing a required archive path (requirements.txt) fails loudly and leaves live untouched"
+
+# --- 20. umwelt#1043: a ref from BEFORE world packages (no worlds/) still
+#         installs, so a rollback to an older version keeps working. ---
+echo "flask" > "$scratch_repo/requirements.txt"
+git -C "$scratch_repo" rm -q -r worlds
+git -C "$scratch_repo" add -A
+git -C "$scratch_repo" commit -q -m "commit F: no worlds/, requirements restored"
+commit_f="$(git -C "$scratch_repo" rev-parse HEAD)"
+out20="$(UMWELT_RUNTIME_BASE="$scratch_runtime_base" bash "$scratch_installer" --target alpha --ref "$commit_f" 2>&1)" \
+    || fail "installing a ref without worlds/ failed: $out20"
+[[ -d "$scratch_runtime_base/runtime-alpha/versions/$commit_f/src/umwelt" && ! -e "$scratch_runtime_base/runtime-alpha/versions/$commit_f/worlds" ]] \
+    || fail "a ref without worlds/ was not exported as src-only"
+pass "a ref without worlds/ (pre-package) installs, exporting no worlds/"
+
 rm -rf "$scratch_repo" "$scratch_runtime_base"
 scratch_repo=""
 scratch_runtime_base=""
+
+# =============================================================================
+# umwelt #1106 -- install-world.sh takes a consistent DB backup before every
+# prod promotion. Cells B1-B9.
+#
+# THE FAILURE CONTRACT these cells pin (stated in install-world.sh's header too):
+#   Order: the backup runs AFTER the export completes and BEFORE `live` is
+#   re-pointed.
+#   1. --target real ALWAYS backs up. --no-backup is accepted ONLY with
+#      --target alpha; `--no-backup --target real` is refused at argument
+#      parsing, exit 1, nothing touched.
+#   2. Backup dir is its OWN dir $base/backups/pre-promotion-<target> (keep 14),
+#      never the scheduled-backup dir $base/backups.
+#   3. world_backup non-zero for ANY reason => exit non-zero, stderr names
+#      "backup" + the exit code, `live` UNCHANGED, manifest UNCHANGED, nothing
+#      restarted (--activate never reaches systemctl).
+#   4. Missing DB: real + existing live => refused (message names the db path);
+#      real + no live (first install) => proceeds and says so; alpha + missing
+#      db => proceeds with a "skipped: no db" line.
+#   5. Success => manifest gains "backup": "<abs path of the verified copy>"
+#      (null when no verified copy exists); stdout `backup -> <path>` precedes
+#      the `live -> ...` line. --no-backup (alpha) => "backup": null.
+#   6. Never a raw copy: no cp/rsync/cat of a *.db in the script.
+#
+# These cells run every cell even after one fails (each is a subshell), so a
+# red run shows all of B1-B9; the exit status is non-zero if any failed.
+# `fail` inside a cell exits only that cell's subshell.
+# =============================================================================
+b_root="$(mktemp -d)"
+b_failed=0
+
+b_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+    else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+# b_mkdb <path>: a real small SQLite db (table t, 25 rows).
+b_mkdb() {
+    python3 - "$1" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("create table t(id integer primary key, v text)")
+c.executemany("insert into t(v) values (?)", [("row%d" % i,) for i in range(25)])
+c.commit()
+c.close()
+PY
+}
+
+b_rows() {
+    python3 -c 'import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute("select count(*) from t").fetchone()[0])' "$1"
+}
+
+b_quick_check() {
+    python3 -c 'import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute("PRAGMA quick_check").fetchone()[0])' "$1"
+}
+
+# b_newbase: a fresh throwaway runtime base under $b_root; prints its path.
+b_newbase() { mktemp -d "$b_root/base.XXXXXX"; }
+
+# b_inst <base> <args...>: run the installer against <base>; sets b_out, b_err,
+# b_rc (never aborts the cell on a non-zero exit -- the cell asserts on it).
+b_inst() {
+    local base="$1"; shift
+    local errf="$base.err"
+    b_rc=0
+    b_out="$(UMWELT_RUNTIME_BASE="$base" bash "$installer" "$@" 2>"$errf")" || b_rc=$?
+    b_err="$(cat "$errf")"
+}
+
+# b_manifest_backup <manifest>: the "backup" value ("null" for JSON null).
+b_manifest_backup() {
+    local m="$1"
+    if grep -q '"backup": null' "$m"; then echo null
+    else grep -o '"backup": "[^"]*"' "$m" | head -1 | cut -d'"' -f4; fi
+}
+
+b_run_cell() {
+    local name="$1"
+    if ( set -euo pipefail; "$name" ); then :; else
+        echo "CELL RED: $name" >&2
+        b_failed=1
+    fi
+}
+
+# --- B1: real + db present -> verified consistent copy in the promotion dir ---
+b1() {
+    local base; base="$(b_newbase)"
+    b_mkdb "$base/umwelt.db"
+    b_inst "$base" --target real --ref HEAD
+    [[ "$b_rc" -eq 0 ]] || fail "B1: real install with a db exited $b_rc: $b_err"
+    local d="$base/backups/pre-promotion-real" n
+    n="$(ls "$d"/umwelt-*.db 2>/dev/null | wc -l | tr -d ' ')"
+    [[ "$n" == "1" ]] || fail "B1: expected exactly 1 umwelt-*.db in $d, found $n"
+    local f; f="$(ls "$d"/umwelt-*.db)"
+    [[ "$(b_quick_check "$f")" == "ok" ]] || fail "B1: backup copy fails PRAGMA quick_check"
+    [[ "$(b_rows "$f")" == "25" ]] || fail "B1: backup copy does not have the source's 25 rows"
+    [[ "$(readlink -f "$base/runtime-real/live")" == "$(readlink -f "$base/runtime-real/versions/$head_sha")" ]] \
+        || fail "B1: live does not point at the new sha"
+    pass "B1: real + db -> one quick_check-clean copy with the source rows, live at new sha"
+}
+
+# --- B2: manifest backup == the copy == .last-ok.json; `backup ->` precedes `live ->` ---
+b2() {
+    local base; base="$(b_newbase)"
+    b_mkdb "$base/umwelt.db"
+    b_inst "$base" --target real --ref HEAD
+    [[ "$b_rc" -eq 0 ]] || fail "B2: install exited $b_rc: $b_err"
+    local d="$base/backups/pre-promotion-real" f mb sp
+    f="$(ls "$d"/umwelt-*.db | head -1)"
+    mb="$(b_manifest_backup "$base/runtime-real/.installed-version")"
+    [[ "$mb" == "$f" ]] || fail "B2: manifest backup '$mb' != the copy '$f'"
+    sp="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["path"])' "$d/.last-ok.json")"
+    [[ "$sp" == "$f" ]] || fail "B2: .last-ok.json path '$sp' != the copy '$f'"
+    local nb nl
+    nb="$(echo "$b_out" | grep -n 'install-world.sh: backup -> ' | head -1 | cut -d: -f1)"
+    nl="$(echo "$b_out" | grep -n 'install-world.sh: live -> ' | head -1 | cut -d: -f1)"
+    [[ -n "$nb" && -n "$nl" ]] || fail "B2: stdout lacks a 'backup ->' or 'live ->' line: $b_out"
+    [[ "$nb" -lt "$nl" ]] || fail "B2: 'backup ->' (line $nb) does not precede 'live ->' (line $nl)"
+    echo "$b_out" | grep -qF "install-world.sh: backup -> $f" || fail "B2: backup line does not carry the path $f"
+    # existing manifest keys + the sha extraction other tooling relies on
+    [[ "$(grep -o '"sha": "[^"]*"' "$base/runtime-real/.installed-version" | head -1 | cut -d'"' -f4)" == "$head_sha" ]] \
+        || fail "B2: the sha extraction on the manifest no longer works"
+    grep -q '"ref": "HEAD"' "$base/runtime-real/.installed-version" || fail "B2: manifest lost its ref key"
+    grep -q '"installed_at": "' "$base/runtime-real/.installed-version" || fail "B2: manifest lost its installed_at key"
+    pass "B2: manifest backup == copy == .last-ok.json path; backup line precedes live line; old keys intact"
+}
+
+# b3_assert_refused <base> <label>: after a failed promotion of HEAD over an
+# installed prev_sha: non-zero, stderr names backup + a code, live and manifest
+# unchanged, nothing restarted.
+b3_assert_refused() {
+    local base="$1" label="$2"
+    local rr="$base/runtime-real"
+    local live_before manifest_copy calls_before
+    live_before="$(readlink "$rr/live")"
+    manifest_copy="$base/manifest.before"
+    cp "$rr/.installed-version" "$manifest_copy"
+    calls_before="$(cat "$systemctl_marker" 2>/dev/null | wc -l | tr -d ' ')"
+    b_inst "$base" --target real --ref HEAD --activate
+    [[ "$b_rc" -ne 0 ]] || fail "$label: a failed backup still exited 0: $b_out"
+    echo "$b_err" | grep -qi 'backup' || fail "$label: stderr does not name the backup: $b_err"
+    echo "$b_err" | grep -Eq 'exit [0-9]+' || fail "$label: stderr does not carry world_backup's exit code: $b_err"
+    [[ "$(readlink "$rr/live")" == "$live_before" ]] || fail "$label: live moved (was $live_before)"
+    [[ "$(readlink -f "$rr/live")" == "$(readlink -f "$rr/versions/$prev_sha")" ]] || fail "$label: live is not still at the OLD sha"
+    cmp -s "$rr/.installed-version" "$manifest_copy" || fail "$label: the manifest changed"
+    [[ "$(cat "$systemctl_marker" 2>/dev/null | wc -l | tr -d ' ')" == "$calls_before" ]] \
+        || fail "$label: systemctl was called -- something was restarted after a failed backup"
+}
+
+# --- B3: forced backup failures leave live + manifest untouched (proves ordering) ---
+b3() {
+    # (a) the db is not a SQLite file
+    local base; base="$(b_newbase)"
+    b_mkdb "$base/umwelt.db"
+    b_inst "$base" --target real --ref HEAD~1
+    [[ "$b_rc" -eq 0 ]] || fail "B3a: setup install of the old sha failed: $b_err"
+    echo "this is not a sqlite database" > "$base/umwelt.db"
+    b3_assert_refused "$base" "B3a (corrupt db)"
+    pass "B3a: a non-SQLite db => non-zero, stderr names backup+code, live+manifest unchanged, no restart"
+    # (b) the promotion backup dir is a symlink (world_backup refuses unsafe dirs)
+    base="$(b_newbase)"
+    b_mkdb "$base/umwelt.db"
+    b_inst "$base" --target real --ref HEAD~1
+    [[ "$b_rc" -eq 0 ]] || fail "B3b: setup install of the old sha failed: $b_err"
+    rm -rf "$base/backups/pre-promotion-real"
+    mkdir "$base/elsewhere"
+    ln -s "$base/elsewhere" "$base/backups/pre-promotion-real"
+    b3_assert_refused "$base" "B3b (symlinked backup dir)"
+    [[ -z "$(ls -A "$base/elsewhere")" ]] || fail "B3b: something was written through the symlink"
+    pass "B3b: a symlinked promotion backup dir => same refusal, nothing written through it"
+}
+
+# --- B4: missing db ---
+b4() {
+    local base; base="$(b_newbase)"
+    b_mkdb "$base/umwelt.db"
+    b_inst "$base" --target real --ref HEAD~1
+    [[ "$b_rc" -eq 0 ]] || fail "B4: setup install failed: $b_err"
+    rm -f "$base/umwelt.db"
+    local rr="$base/runtime-real" live_before manifest_copy
+    live_before="$(readlink "$rr/live")"
+    manifest_copy="$base/manifest.before"
+    cp "$rr/.installed-version" "$manifest_copy"
+    b_inst "$base" --target real --ref HEAD
+    [[ "$b_rc" -ne 0 ]] || fail "B4: real + missing db + existing live was NOT refused"
+    echo "$b_err" | grep -qF "$base/umwelt.db" || fail "B4: the refusal does not name the db path: $b_err"
+    [[ "$(readlink "$rr/live")" == "$live_before" ]] || fail "B4: live moved on a refused promotion"
+    cmp -s "$rr/.installed-version" "$manifest_copy" || fail "B4: manifest changed on a refused promotion"
+    pass "B4a: real + missing db + existing live => refused, db path named, live+manifest unchanged"
+
+    base="$(b_newbase)"
+    b_inst "$base" --target real --ref HEAD
+    [[ "$b_rc" -eq 0 ]] || fail "B4: first-ever real install with no db failed: $b_err"
+    echo "$b_out" | grep -qi 'no live' || fail "B4: first-ever install did not say there was no live to back up: $b_out"
+    [[ "$(readlink -f "$base/runtime-real/live")" == "$(readlink -f "$base/runtime-real/versions/$head_sha")" ]] \
+        || fail "B4: first-ever install did not point live at the new sha"
+    [[ "$(b_manifest_backup "$base/runtime-real/.installed-version")" == "null" ]] \
+        || fail "B4: no backup was taken, so the manifest backup must be null"
+    pass "B4b: real + missing db + NO live (first install) => proceeds, says there was no live to back up"
+}
+
+# --- B5: --no-backup is alpha-only ---
+b5() {
+    local base; base="$(b_newbase)"
+    b_mkdb "$base/umwelt.db"
+    b_inst "$base" --target real --ref HEAD~1
+    [[ "$b_rc" -eq 0 ]] || fail "B5: setup install failed: $b_err"
+    local before after live_before
+    live_before="$(readlink "$base/runtime-real/live")"
+    before="$(cd "$base" && find . | LC_ALL=C sort)"
+    b_inst "$base" --target real --ref HEAD --no-backup
+    [[ "$b_rc" -eq 1 ]] || fail "B5: --no-backup --target real exited $b_rc, expected 1"
+    # a deliberate refusal that names the flag, not the generic unknown-argument error
+    echo "$b_err" | grep -q -- '--no-backup' || fail "B5: the refusal does not name --no-backup: $b_err"
+    if echo "$b_err" | grep -qi 'unknown argument'; then fail "B5: --no-backup is unknown, not deliberately refused for real: $b_err"; fi
+    after="$(cd "$base" && find . | LC_ALL=C sort)"
+    # b_inst's own stderr capture file sits beside $base, not inside it.
+    [[ "$before" == "$after" ]] || fail "B5: the refused run touched the base"
+    [[ "$(readlink "$base/runtime-real/live")" == "$live_before" ]] || fail "B5: live moved"
+    # and with NOTHING installed yet: still nothing created
+    base="$(b_newbase)"
+    b_mkdb "$base/umwelt.db"
+    b_inst "$base" --target real --ref HEAD --no-backup
+    [[ "$b_rc" -eq 1 ]] || fail "B5: fresh --no-backup --target real exited $b_rc, expected 1"
+    [[ ! -e "$base/runtime-real" && ! -e "$base/backups" ]] || fail "B5: the refused run created runtime-real/ or backups/"
+    pass "B5: --no-backup --target real => exit 1 at argument parsing, nothing created or moved"
+}
+
+# --- B6: alpha ---
+b6() {
+    local base; base="$(b_newbase)"
+    b_mkdb "$base/alpha-world.db"
+    b_inst "$base" --target alpha --ref HEAD --no-backup
+    [[ "$b_rc" -eq 0 ]] || fail "B6: alpha --no-backup failed: $b_err"
+    [[ ! -e "$base/backups" ]] || fail "B6: --no-backup still created a backup dir"
+    [[ "$(b_manifest_backup "$base/runtime-alpha/.installed-version")" == "null" ]] || fail "B6: --no-backup manifest backup is not null"
+    echo "$b_out" | grep -qF 'backup skipped (--no-backup)' || fail "B6: no 'backup skipped (--no-backup)' line: $b_out"
+    pass "B6a: alpha --no-backup => no backup dir, manifest backup null, skip line printed"
+
+    base="$(b_newbase)"
+    b_mkdb "$base/alpha-world.db"
+    b_inst "$base" --target alpha --ref HEAD
+    [[ "$b_rc" -eq 0 ]] || fail "B6: alpha default with a db failed: $b_err"
+    local f; f="$(ls "$base/backups/pre-promotion-alpha"/umwelt-*.db 2>/dev/null | head -1)"
+    [[ -n "$f" && "$(b_quick_check "$f")" == "ok" ]] || fail "B6: alpha default with a db took no verified backup"
+    [[ "$(b_manifest_backup "$base/runtime-alpha/.installed-version")" == "$f" ]] || fail "B6: alpha manifest backup != the copy"
+    pass "B6b: alpha default + db => backup taken in backups/pre-promotion-alpha"
+
+    base="$(b_newbase)"
+    b_inst "$base" --target alpha --ref HEAD
+    [[ "$b_rc" -eq 0 ]] || fail "B6: alpha with a missing db failed: $b_err"
+    echo "$b_out" | grep -qF 'skipped: no db' || fail "B6: no 'skipped: no db' line: $b_out"
+    pass "B6c: alpha default + missing db => proceeds with an explicit 'skipped: no db' line"
+}
+
+# --- B7: retention isolation ---
+b7() {
+    local base; base="$(b_newbase)"
+    b_mkdb "$base/umwelt.db"
+    mkdir -p "$base/backups"
+    # A full scheduled dir (14 valid-named copies = the scheduled keep): if a
+    # promotion ever wrote into it with --keep 14, its 15th copy would prune
+    # the OLDEST scheduled one.
+    local i
+    for i in 01 02 03 04 05 06 07 08 09 10 11 12 13 14; do
+        : > "$base/backups/umwelt-201901${i}T000000Z.db"
+    done
+    local d="$base/backups/pre-promotion-real"
+    mkdir -p "$d"; chmod 700 "$d"
+    for i in 01 02 03 04 05 06 07 08 09 10 11 12 13 14; do
+        : > "$d/umwelt-202002${i}T000000Z.db"
+    done
+    b_inst "$base" --target real --ref HEAD
+    [[ "$b_rc" -eq 0 ]] || fail "B7: promotion failed: $b_err"
+    [[ "$(ls "$base/backups" | grep -c '^umwelt-201901')" == "14" ]] || fail "B7: a promotion pruned a SCHEDULED backup"
+    local n; n="$(ls "$d"/umwelt-*.db | wc -l | tr -d ' ')"
+    [[ "$n" -le 14 ]] || fail "B7: the promotion dir holds $n copies, expected at most 14"
+    [[ ! -e "$d/umwelt-20200201T000000Z.db" ]] || fail "B7: the promotion dir's own oldest copy was not pruned"
+    [[ "$(ls "$base/backups" | grep -c '^umwelt-')" == "14" ]] || fail "B7: the scheduled dir gained or lost files"
+    pass "B7: promotion prunes only its own dir (<=14); the scheduled backup is untouched"
+}
+
+# --- B8: the source db is untouched (read-only online backup) ---
+b8() {
+    local base; base="$(b_newbase)"
+    b_mkdb "$base/umwelt.db"
+    local before after
+    before="$(b_sha256 "$base/umwelt.db")"
+    b_inst "$base" --target real --ref HEAD
+    [[ "$b_rc" -eq 0 ]] || fail "B8: promotion failed: $b_err"
+    after="$(b_sha256 "$base/umwelt.db")"
+    # the source is only proven untouched by a run that really read it
+    [[ "$(ls "$base/backups/pre-promotion-real"/umwelt-*.db 2>/dev/null | wc -l | tr -d ' ')" == "1" ]] \
+        || fail "B8: no backup was taken, so 'source untouched' proves nothing"
+    [[ "$before" == "$after" ]] || fail "B8: the promotion changed the source db"
+    pass "B8: sha256 of the source db is unchanged by a promotion"
+}
+
+# --- B9: never a raw copy; the only db access is world_backup ---
+b9() {
+    local code; code="$(grep -vE '^[[:space:]]*#' "$installer")"
+    if echo "$code" | grep -En '(^|[^[:alnum:]_-])(cp|rsync|cat|dd|install|ln)[[:space:]]+[^|;&]*(\.db|db_path)'; then
+        fail "B9: the script copies/reads a *.db with a raw tool"
+    fi
+    echo "$code" | grep -q 'umwelt\.world_backup' || fail "B9: the script does not call umwelt.world_backup"
+    pass "B9: no raw cp/rsync/cat of a *.db in install-world.sh; db access goes through umwelt.world_backup"
+}
+
+for cell in b1 b2 b3 b4 b5 b6 b7 b8 b9; do b_run_cell "$cell"; done
+[[ "$b_failed" -eq 0 ]] || { echo "FAIL: one or more B-cells (umwelt #1106) are red" >&2; exit 1; }
+rm -rf "$b_root"; b_root=""
 
 echo "ALL TESTS PASSED"

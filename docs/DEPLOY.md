@@ -83,7 +83,13 @@ WantedBy=multi-user.target
 ```
 
 Give each instance on a host its own `--bind-socket-path` (see the identity bind
-socket section below). `README.md` has a `--user` unit for a single-instance
+socket section below).
+
+Project admins are world configuration: `Environment=UMWELT_PROJECT_OWNER_ADMINS=<handles>`
+and `Environment=UMWELT_PROJECT_ARCHIVE_ADMINS=<handles>` (comma-separated; unset
+means no name-based admins). Both are read on each request. On an open-registration
+world they grant admin to whoever registers those names first, so set them only
+where names are issued (README, "Trust model"). `README.md` has a `--user` unit for a single-instance
 setup.
 
 ## The pipeline
@@ -116,7 +122,7 @@ setup.
    tools/install-world.sh --target real --ref <vetted-sha> --activate
    ```
    `install-world.sh` exports `<vetted-sha>`'s runtime tree (`src/umwelt/`,
-   `requirements.txt`, `PROTOCOL.md`) into a new, immutable
+   `worlds/`, `requirements.txt`, `PROTOCOL.md`) into a new, immutable
    `~/.umwelt/runtime-real/versions/<sha>/` directory, then ATOMICALLY
    re-points the `~/.umwelt/runtime-real/live` symlink at it (temp symlink +
    `mv -T`, so `live` is never missing mid-swap) before `--activate` restarts
@@ -232,8 +238,16 @@ untested feature. The deploy lead owns that judgment, and the safeguards below
 are not optional courtesy — they are the load-bearing protection of the live
 world Lei and others use:
 
-- **Back up the real DB first** (`~/.umwelt/umwelt.db` → timestamped `.bak`);
-  note the current pinned SHA as the rollback target. **Also snapshot it**
+- **Back up the real DB first.** `tools/install-world.sh` now takes this backup
+  itself on every promotion (umwelt #1106): after the export and **before** `live`
+  is re-pointed, it runs `umwelt.world_backup` (SQLite online backup, `quick_check`
+  on the copy) into `~/.umwelt/backups/pre-promotion-real/` (its own dir, keep 14 —
+  never the scheduled-backup dir). The copy's path is printed (`backup -> <path>`)
+  and recorded as `"backup"` in `runtime-real/.installed-version`. If the backup
+  fails, or the real db is missing while a `live` exists, the script exits non-zero
+  and `live` is **not** moved. `--target real` cannot skip it; `--no-backup` is
+  accepted for `--target alpha` only. Still note the current pinned SHA as the
+  rollback target. **Also snapshot it**
   with `tools/world-state-snapshot.py` (read-only, stdlib-only, safe to point
   at the live db) so the restart's effect on row-counts and schema is
   something you can actually diff rather than eyeball:

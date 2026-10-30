@@ -204,7 +204,7 @@ question about a *projection*: everyone may see a place, and the answer that var
 public projection unconditional — not as a second predicate at the call sites, which is
 exactly the case-by-case drift Lei's SSoT ruling forbids.
 
-The pre-existing `can_see` / `can_enter` split (dv_0261, and #158's `place_tree(from,
+The pre-existing `can_see` / `can_enter` split (#158's `place_tree(from,
 depth, viewer)` framing) is the same distinction arrived at earlier from the map side.
 Revision 3 makes `can_see` unconditional and leaves `can_enter` as the real gate.
 
@@ -360,17 +360,17 @@ So the order is fixed, and it is the reverse of the order the work feels natural
 
 **Revision 3's Lei quotes** (§3.1 rules 2 and 4, §3.4, §6) are captured **exact-bytes** —
 piped from the session transcript, never retyped — and archived under content hashes
-`c45dcc14`, `2d6c55de` (`ob_1470`, `ob_1471`, `ob_1473`). That method is not pedantry: the
+`c45dcc14`, `2d6c55de`. That method is not pedantry: the
 first capture of these same words was hand-typed and silently normalized six of his
-characters while carrying the word "verbatim" (`ob_1472`), and a second attempt quoted him
+characters while carrying the word "verbatim", and a second attempt quoted him
 as writing "is" where he wrote "if". Both were caught by the quote-verification gate rather
 than by care, which is the argument for the gate.
 
 **Revision 3's `place_grants` claim** (§3.4, and #538 part C) was verified against
 `origin/main` **and** the live prod DB, not against a working tree — the working tree was
-behind `main` when the claim was first written (`ob_1474`).
+behind `main` when the claim was first written.
 
-Lei's two rulings quoted in §1 and §2.2 are transcript-verified (`ob_1428`, and the
+Lei's two rulings quoted in §1 and §2.2 are transcript-verified (and the
 privacy-split quote from the 2026-08-08 evening session). The predicate inventory and
 the `look_at` finding were measured against `52e25ba` for this document; the instrument's
 blind spot in §2.1 was found by checking the scan against a route whose answer I already

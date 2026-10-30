@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import secrets
 import sqlite3
 import uuid
@@ -68,6 +69,29 @@ CREATE TABLE IF NOT EXISTS places (
     -- engine-stamped, never caller-supplied (R2).
     created_at  TEXT,
     updated_at  TEXT
+);
+
+-- umwelt#1043 (world packages): which place plays which ROLE in this world
+-- ('hub', 'workshop'), written once by the package loader, read by
+-- role_place_id. A world with no rows here (every world that predates the
+-- loader) falls back to the legacy ids; nothing ever writes a default.
+CREATE TABLE IF NOT EXISTS world_roles (
+    role     TEXT PRIMARY KEY,
+    place_id TEXT NOT NULL REFERENCES places(id)
+);
+
+-- umwelt#1043: the one provenance row for the package a world was born from.
+-- `places` has no author column, so "what came from the seed" lives here:
+-- the package name, its format, when it loaded, and the place ids it made
+-- (a JSON list).
+CREATE TABLE IF NOT EXISTS world_package (
+    name       TEXT NOT NULL,
+    format     INTEGER NOT NULL,
+    loaded_utc TEXT NOT NULL,
+    place_ids  TEXT NOT NULL,
+    -- format 2 (umwelt#1043 slice 2): JSON object {package key: thing id}
+    -- of the things the package created. NULL for a format-1 row.
+    thing_ids  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS things (
@@ -302,7 +326,7 @@ CREATE INDEX IF NOT EXISTS idx_events_place ON events(place_id);
 -- on a capsule thing's graft_ref/graft_version metadata pair writes ONE row
 -- here, in the SAME transaction as the metadata UPDATE (db.advance_capsule_ref)
 -- — this table IS the underlying provenance log; an 'advance_ref' events row
--- is only minted on demand, via /umwelt/record (no auto-mint, per ob_0280's
+-- is only minted on demand, via /umwelt/record (no auto-mint, per the
 -- ruling — same posture as use/act). old_ref is NULLABLE: the first advance
 -- on a freshly-minted capsule moves null -> new_ref (version 0 -> 1). New
 -- table: CREATE IF NOT EXISTS covers fresh AND existing DBs, same as
@@ -399,6 +423,27 @@ CREATE TABLE IF NOT EXISTS task_deps (
 );
 CREATE INDEX IF NOT EXISTS idx_task_deps_depends_on ON task_deps(depends_on_task_id);
 
+-- Project owners (umwelt #1051). Who owns a project, as a field the engine
+-- knows: "what do I own" is an indexed join, and the work card derives its
+-- project list from it at read time (never stored on the card). `agent` is
+-- the CANONICAL (case-folded) identity. `role` is a short free-text label
+-- ('design', 'build lead'; <= 32 chars, one line, enforced by the
+-- project_owner_add effect -- not an enum, the roles in the owner table do
+-- not fit one). PRIMARY KEY (project_id, agent): a re-add updates the role,
+-- it never makes a second row. New table: CREATE IF NOT EXISTS covers fresh
+-- AND existing DBs, same as projects/tasks above -- the migration creates it
+-- EMPTY and nothing here may guess owners from projects.created_by (the
+-- backfill is a hand-run step after per-project rulings).
+CREATE TABLE IF NOT EXISTS project_owners (
+    project_id  TEXT NOT NULL,
+    agent       TEXT NOT NULL,
+    role        TEXT NOT NULL DEFAULT '',
+    added_by    TEXT NOT NULL,
+    added_at    TEXT NOT NULL,
+    PRIMARY KEY (project_id, agent)
+);
+CREATE INDEX IF NOT EXISTS idx_project_owners_agent ON project_owners(agent);
+
 -- Generic, engine-verified per-(thing, agent) KV store (umwelt #191). A
 -- kinddef-declared `agent_state_set` effect (server.py's
 -- _apply_effect_agent_state_set) is the ONLY write path — `agent` is
@@ -463,7 +508,7 @@ CREATE INDEX IF NOT EXISTS idx_thing_grants_thing
 -- place and can never drift out of sync with a stored value. `agent`
 -- PRIMARY KEY: one row per agent, POST /umwelt/heartbeat upserts it (see
 -- set_agent_heartbeat below). `agent` is CALLER-DECLARED (forgeable v0,
--- same posture as every other verb here, ob_0938) — a beat can only write
+-- same posture as every other verb here) — a beat can only write
 -- the declaring agent's own row (there is no separate row-target field);
 -- see PROTOCOL.md's heartbeat section for the caveat in full. New table:
 -- CREATE IF NOT EXISTS covers fresh AND existing DBs, same as
@@ -860,6 +905,10 @@ def init_db(conn: sqlite3.Connection) -> None:
         "ALTER TABLE crossings ADD COLUMN reply_to INTEGER",
         "ALTER TABLE crossings ADD COLUMN thread_root INTEGER",
         "ALTER TABLE crossings ADD COLUMN title TEXT",
+        # umwelt#1043 slice 2: world_package.thing_ids for a DB whose
+        # world_package table predates format 2. Nullable, no backfill: a
+        # format-1 row stays NULL (it created no things).
+        "ALTER TABLE world_package ADD COLUMN thing_ids TEXT",
     ):
         try:
             conn.execute(stmt)
@@ -964,7 +1013,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     # Partial unique index: structurally enforces "exactly one avatar per
     # agent-STRING" at the DB layer (not just application logic). This is a
     # per-agent-STRING guarantee, not a per-real-agent one — until the
-    # identity layer attests `agent` (ob_2721/#24), a caller could claim a
+    # identity layer attests `agent` (#24), a caller could claim a
     # different string and mint a second body under it (Sybil-on-avatars).
     # Must run AFTER _migrate_things_kind_check: the migration (when it
     # fires, on a pre-existing DB) drops+recreates the things table, which
@@ -1272,13 +1321,24 @@ def _migrate_lane_col(conn: sqlite3.Connection) -> None:
 # --- places ---------------------------------------------------------------
 
 def upsert_place(conn, id: str, kind: str, owner: str | None, label: str,
-                 description: str = "") -> None:
-    """Insert a place; existing rows are left unchanged (INSERT OR IGNORE)."""
-    conn.execute(
-        "INSERT OR IGNORE INTO places(id, kind, owner, label, description) "
-        "VALUES(?, ?, ?, ?, ?)",
-        (id, kind, owner, label, description),
-    )
+                 description: str = "", parent_id: str | None = None) -> None:
+    """Insert a place; existing rows are left unchanged (INSERT OR IGNORE).
+
+    `parent_id=None` (the default) runs the exact statement this function has
+    always run, so every existing caller writes byte-identical rows; a
+    non-None parent adds the parent_id column to the insert (umwelt#1043)."""
+    if parent_id is None:
+        conn.execute(
+            "INSERT OR IGNORE INTO places(id, kind, owner, label, "
+            "description) VALUES(?, ?, ?, ?, ?)",
+            (id, kind, owner, label, description),
+        )
+    else:
+        conn.execute(
+            "INSERT OR IGNORE INTO places(id, kind, owner, label, "
+            "description, parent_id) VALUES(?, ?, ?, ?, ?, ?)",
+            (id, kind, owner, label, description, parent_id),
+        )
     conn.commit()
 
 
@@ -1508,42 +1568,135 @@ def list_places(conn) -> list[dict[str, Any]]:
              "description": r[4], "thing_count": r[5]} for r in rows]
 
 
-# The Workshop's canonical place id (umwelt #99's boot-time seed). Named
-# here, not just inlined in seed_places, because #221 S3a's create_project
-# extension needs the SAME constant to parent every project's Workshop
-# sub-place — one source of truth, so the two can never drift apart.
+# The Workshop's LEGACY place id (umwelt #99's boot-time seed). Kept as a
+# constant only for tests that import it and as the fallback of
+# role_place_id for worlds that predate world packages (umwelt#1043). No
+# module other than db.py may name it: ask for the "workshop" role instead.
 WORKSHOP_PLACE_ID = "place_workshop"
+
+# umwelt#1043: roles name the places the engine itself leans on. A world
+# package assigns them (world_roles); a world with no row for a role (every
+# world that predates packages) falls back to the legacy id below.
+_LEGACY_ROLE_FALLBACK = {"hub": "place_square", "workshop": WORKSHOP_PLACE_ID}
+
+
+class UnknownRole(KeyError):
+    """role_place_id was asked for a role with no row and no legacy id."""
+
+    def __str__(self) -> str:
+        return f"unknown world role {self.args[0]!r}"
+
+
+def role_place_id(conn, role: str) -> str:
+    """The place id playing `role` in this world: its world_roles row, else
+    the legacy id for 'hub'/'workshop', else UnknownRole. Never writes."""
+    try:
+        row = conn.execute(
+            "SELECT place_id FROM world_roles WHERE role = ?", (role,)
+        ).fetchone()
+    except sqlite3.OperationalError:  # table absent: not yet init_db'd
+        row = None
+    if row is not None:
+        return row[0]
+    if role in _LEGACY_ROLE_FALLBACK:
+        return _LEGACY_ROLE_FALLBACK[role]
+    raise UnknownRole(role)
+
+
+def role_place_id_readonly(db_path, role: str = "hub") -> str:
+    """`role_place_id` for the CLIs (GC notice, backup alarm) that only hold a
+    database PATH. Opens it read-only (`mode=ro`: never creates the file,
+    never writes) and returns the legacy fallback on ANY problem (file
+    missing/unreadable, table or row absent). Never raises."""
+    fallback = _LEGACY_ROLE_FALLBACK.get(role, "place_square")
+    try:
+        from urllib.parse import quote
+        uri = "file:" + quote(os.path.abspath(str(db_path))) + "?mode=ro"
+        c = sqlite3.connect(uri, uri=True, timeout=5)
+        try:
+            row = c.execute(
+                "SELECT place_id FROM world_roles WHERE role = ?", (role,)
+            ).fetchone()
+        finally:
+            c.close()
+        return row[0] if row else fallback
+    except Exception:
+        return fallback
+
+
+# The four places seed_places has always created, in its historical order.
+# Their DATA (label, description) now lives in the shipped world package;
+# only the ids are named here so the legacy call stays a four-place seed no
+# matter how much a later package adds.
+_LEGACY_SEED_PLACE_IDS = ("place_square", "place_workshop", "place_library",
+                          "place_landfill")
+
+
+def missing_legacy_default_places(conn) -> list:
+    """The legacy default place ids this world lacks, for the boot warning.
+    Empty unless the world predates packages (no world_roles rows) AND has
+    places already: a fresh world is loaded from its package, a packaged
+    world declares its own places. Never writes."""
+    try:
+        if conn.execute("SELECT 1 FROM world_roles LIMIT 1").fetchone():
+            return []
+        if conn.execute("SELECT 1 FROM places LIMIT 1").fetchone() is None:
+            return []
+        have = {r[0] for r in conn.execute("SELECT id FROM places")}
+    except sqlite3.OperationalError:
+        return []
+    return [p for p in _LEGACY_SEED_PLACE_IDS if p not in have]
+
+
+def _shipped_places_by_id() -> dict:
+    from . import world_package
+    pkg = world_package.load_package(world_package.find_shipped_package())
+    return {p["id"]: p for p in pkg.places}
 
 
 def seed_places(conn, agent_names: list[str]) -> None:
-    """Seed the public Square + a private Post per agent + a public Workshop."""
-    upsert_place(conn, "place_square", "public", None, "The Square",
-                 "The public commons — where the whole village gathers. "
-                 "Anything left here is seen by everyone.")
-    upsert_place(conn, WORKSHOP_PLACE_ID, "public", None, "The Workshop",
-                 "The shared build space. Forge things here; they persist for "
-                 "others to look_at and use.")
-    # #80 slice 1: the Library is the world's knowledge-sharing place — its
-    # contents (the blueprint shelf + search engine) are a later slice,
-    # forged via the API build-script per the ratified place/thing seam
-    # (places are engine genesis, contents are inhabitant build-actions).
-    upsert_place(conn, "place_library", "public", None, "The Library",
-                 "The village's knowledge commons. Blueprints are shelved "
-                 "here for others to build from, and the world's things and "
-                 "knowledge can be searched.")
-    # #28: the landfill is a real public place, seeded once — its contents
-    # are populated by status (list_landfilled), not by anything ever being
-    # create_thing'd directly into it. See server.py's _place_view for the
-    # one status-driven place-view special case this enables.
-    upsert_place(conn, "place_landfill", "public", None, "The Landfill",
-                 "Where trashed things end up once the world's slow decay "
-                 "claims them. Anything left here can still be dug out with "
-                 "restore.")
+    """LEGACY seed: the four default public places + a Post per agent.
+
+    Kept (signature and semantics) for the many callers that build a world
+    with `init_db` + `seed_places`: INSERT OR IGNORE, safe to repeat and safe
+    on a non-empty database. The four places' data come from the shipped
+    world package (single source of truth). Writes NO roles and NO
+    provenance row (role lookup falls back to the legacy ids). The server
+    no longer boots through this: it loads the package once, on a fresh
+    world, via world_package.boot_load (umwelt#1043).
+    """
+    shipped = _shipped_places_by_id()
+    for pid in _LEGACY_SEED_PLACE_IDS:
+        p = shipped[pid]
+        upsert_place(conn, p["id"], p["kind"], p["owner"], p["label"],
+                     p["description"])
+    seed_posts(conn, agent_names)
+
+
+def residences_place_id(conn) -> str | None:
+    """The place playing the `residences` role (the parent of every
+    resident's Post), or None when this world has none -- which is every
+    world that predates format-2 packages, and every package that does not
+    name the role. Never writes, never falls back to a legacy id: absence is
+    the answer, and Post creation is then byte-identical to what it always
+    was (umwelt#1043)."""
+    try:
+        return role_place_id(conn, "residences")
+    except UnknownRole:
+        return None
+
+
+def seed_posts(conn, agent_names: list[str]) -> None:
+    """A private Post per agent (INSERT OR IGNORE, safe every boot). Posts
+    are parented under the world's `residences` place when it has one, and
+    stay parentless otherwise."""
+    parent = residences_place_id(conn)
     for agent in agent_names:
         upsert_place(
             conn, f"place_post_{agent}", "private", agent,
             f"{agent.title()}'s Post",
             f"{agent.title()}'s private corner of the world.",
+            parent_id=parent,
         )
 
 
@@ -1573,7 +1726,7 @@ def seed_places(conn, agent_names: list[str]) -> None:
 # (#160) walks the WHOLE tree at depth=inf, so a link/parent_id pointing
 # from a public place into a private one would leak the private place's
 # existence+label+owner to ANY viewer — the "god view" the team has a
-# standing prior against (ob_2771/#199). The team's fix at the time was full
+# standing prior against (#199). The team's fix at the time was full
 # existence-pruning. Lei's rev-3 ruling (umwelt#538) deliberately reverses
 # that: existence disclosure is now the specification, not the leak — "a
 # locked door you can see is a door you can ask for a key to." The old
@@ -1612,6 +1765,26 @@ def get_place_children(conn, place_id: str) -> list[dict[str, Any]]:
     ).fetchall()
     return [{"id": r[0], "kind": r[1], "owner": r[2], "label": r[3],
              "description": r[4], "parent_id": r[5]} for r in rows]
+
+
+def structural_child_ids(conn, parent_id: str) -> set[str]:
+    """Ids of the direct children of `parent_id` whose OWN `metadata.structural`
+    is literally True (umwelt #1084; the string 'true', 1 and a non-empty dict
+    are not the flag, the same strictness as `metadata.project_register`).
+    One query. Metadata that is not a JSON object (or not JSON) is not the
+    flag. get_place_children does not carry metadata, so this is the one
+    place the register reads it."""
+    out: set[str] = set()
+    for pid, raw in conn.execute(
+            "SELECT id, metadata FROM places WHERE parent_id = ?",
+            (parent_id,)):
+        try:
+            meta = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            continue
+        if isinstance(meta, dict) and meta.get("structural") is True:
+            out.add(pid)
+    return out
 
 
 def get_place_links(conn, place_id: str) -> list[dict[str, Any]]:
@@ -1661,10 +1834,9 @@ def _place_ancestor_ids(conn, place_id: str) -> list[str]:
 # check-then-write PAIR spanning two statements/two connections. Two
 # concurrent requests could both run the "would this create a cycle?"
 # read before either ran the write, and both then commit — a cycle
-# neither alone would have been allowed to create (demonstrated,
-# ENGRAM ev_1022).
+# neither alone would have been allowed to create (demonstrated).
 #
-# Fix (ENGRAM dv_1144): co-locate the check + the write inside ONE
+# Fix: co-locate the check + the write inside ONE
 # BEGIN IMMEDIATE transaction in the db-layer write function itself, and
 # raise CycleError (rollback first) on a positive check instead of the
 # caller pre-checking and then calling a separate write function. This is
@@ -1852,7 +2024,7 @@ def set_place_parent(conn, place_id: str, parent_id: str | None) -> None:
 
 
 def add_place_link(conn, src_id: str, dst_id: str, label: str | None = None,
-                    mutual: bool = True) -> None:
+                    mutual: bool = True, *, commit: bool = True) -> None:
     """Add a lateral link FROM src_id TO dst_id (umwelt #158). Idempotent —
     re-adding an existing (src_id, dst_id) link overwrites its label rather
     than erroring (INSERT ... ON CONFLICT DO UPDATE), matching the issue's
@@ -1865,6 +2037,10 @@ def add_place_link(conn, src_id: str, dst_id: str, label: str | None = None,
     one directed row. No trigger-based mirroring — mutuality is a
     route/caller-level convention over a directed table, per the issue's
     explicit design.
+
+    `commit=False` (keyword-only; the default True is today's behaviour)
+    leaves the transaction open for a caller that owns it -- the world
+    package loader, which must stay all-or-nothing (umwelt#1043).
     """
     conn.execute(
         "INSERT INTO place_links(src_id, dst_id, label) VALUES(?, ?, ?) "
@@ -1877,7 +2053,8 @@ def add_place_link(conn, src_id: str, dst_id: str, label: str | None = None,
             "ON CONFLICT(src_id, dst_id) DO UPDATE SET label = excluded.label",
             (dst_id, src_id, label),
         )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def remove_place_link(conn, src_id: str, dst_id: str,
@@ -2186,7 +2363,8 @@ def create_thing(conn, id: str, place_id: str, name: str, description: str,
                  kind: str, exec_command: str | None, metadata: dict,
                  author: str, created_at: str, weight_est: int = 0,
                  lane: str = "land",
-                 update_policy_cohort: str | None = None) -> None:
+                 update_policy_cohort: str | None = None,
+                 *, commit: bool = True) -> None:
     # Defense in depth: server.py's create_thing route already rejects
     # body-kind specs (422) before reaching here — this is the same guard at
     # the DB layer, so a future caller of db.create_thing directly (bypassing
@@ -2229,7 +2407,11 @@ def create_thing(conn, id: str, place_id: str, name: str, description: str,
          json.dumps(metadata), author, created_at, weight_est, lane,
          update_policy_cohort),
     )
-    conn.commit()
+    # commit=False (keyword-only; default True is today's behaviour) leaves
+    # the transaction open for a caller that owns it -- the world package
+    # loader (umwelt#1043), which must stay all-or-nothing.
+    if commit:
+        conn.commit()
 
 
 def _thing_row_to_dict(row) -> dict[str, Any]:
@@ -2516,6 +2698,25 @@ def things_in_place(conn, place_id: str) -> list[dict[str, Any]]:
     return [_thing_row_to_dict(r) for r in rows]
 
 
+def count_live_things_by_place(conn, place_ids) -> dict[str, int]:
+    """{place_id: n} for the given places in ONE query, where n counts exactly
+    what `things_in_place` returns for that place (live, not carried or
+    bagged, not an avatar). A place with none is absent from the result
+    (callers `.get(pid, 0)`). umwelt #1074: the Project Register's rooms
+    section, which must not run one query per room."""
+    ids = list(place_ids)
+    if not ids:
+        return {}
+    marks = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT place_id, COUNT(*) FROM things WHERE place_id IN ({marks}) "
+        f"AND status='live' AND holder_kind = 'place' "
+        f"AND kind NOT IN ({_BODY_KIND_PLACEHOLDERS}) GROUP BY place_id",
+        (*ids, *_BODY_KINDS),
+    ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
 def recent_things(conn, limit: int = 8) -> list[dict[str, Any]]:
     """The most-recently-built LIVE things across the whole world, newest first
     (#28: a trashed/landfilled thing should not linger in the "recently
@@ -2681,7 +2882,7 @@ def dissolve_thing(conn, thing_id: str) -> None:
 
     ENGINE-ONLY: never reachable via an HTTP route or MCP tool — the whole
     point of the lifecycle is that permanent destruction is never an
-    agent's act (Lei/Ariadne, ob_0939). Only gc.py calls this.
+    agent's act (Lei/Ariadne). Only gc.py calls this.
     """
     conn.execute("DELETE FROM things WHERE id = ?", (thing_id,))
     conn.commit()
@@ -2791,8 +2992,8 @@ def get_or_create_avatar(conn, agent_id: str, home_place_id: str,
     finds-or-births one. Moving is move_to's job (see move_avatar).
 
     Trust scope (v0): the driver→avatar binding rides the caller-declared
-    `agent_id` string — there is no engine-attested identity yet (ob_2721/
-    #24). A forged agent_id can reconnect to another agent's avatar, or claim
+    `agent_id` string — there is no engine-attested identity yet (#24).
+    A forged agent_id can reconnect to another agent's avatar, or claim
     to be someone it isn't. Sound only among our_side callers today; hardens
     when the identity layer lands. Same posture as world_view's private-read
     scoping.
@@ -2842,6 +3043,10 @@ def get_or_create_avatar(conn, agent_id: str, home_place_id: str,
              description or f"{display_name}'s presence in the world.",
              json.dumps(metadata or {}), agent_id, created_at),
         )
+        # umwelt#1103: a birth seeds its identities row in the SAME
+        # transaction as the avatar insert, through the boot seed's helper
+        # (enrollment predicate inside). Reconnect returned above: not a birth.
+        _seed_identity_for_avatar(conn, agent_id, metadata or {}, created_at)
         conn.commit()
     except sqlite3.IntegrityError:
         # Lost a birth race to a concurrent first-entry for the same agent —
@@ -3084,7 +3289,7 @@ def touch_standpoint(conn, agent_id: str, place_id: str) -> None:
 CROSSING_EMOTION_DEFAULT = "calm"
 
 # Shared column order for crossing reads — single source of truth so the
-# SELECTs and _crossing_row can never drift out of sync (ls_0020).
+# SELECTs and _crossing_row can never drift out of sync.
 # wake_granted (Gong Spec) is appended at the END, after attesting_authority
 # — minimizes diff risk against every existing positional index into this
 # tuple (same append-at-end posture as #88's weight_est/holder_kind/holder_id
@@ -4277,7 +4482,7 @@ def resolve_advance_ref_event(conn, ref: str) -> dict[str, Any] | None:
     (placeless): a ref-advance has no at-the-time location, same rationale
     as 'use'/'act'. `attesting_authority` is 'world' — the engine's own
     ledger row is the record being attested, never inherited from anything
-    caller-supplied. No auto-mint at advance time (ob_0280's no-auto-mint
+    caller-supplied. No auto-mint at advance time (the no-auto-mint
     ruling) — this is only invoked when /umwelt/record is called on demand.
     """
     row = get_graft_advance(conn, ref)
@@ -4461,7 +4666,7 @@ def create_project_with_board(conn, project_id: str, label: str,
     can never leave a half-born project: neither a project row whose
     place_id points at a sub-place with no bound board, nor an orphan
     sub-place with no project row ever pointing at it. That half-born
-    state is exactly the ob_2892 "unbound board" hazard §2 exists to close
+    state is exactly the "unbound board" hazard §2 exists to close
     by construction — a partial write would silently re-introduce it.
 
     The board thing's metadata is `{"kind_id": board_kind_id,
@@ -4478,6 +4683,11 @@ def create_project_with_board(conn, project_id: str, label: str,
     BEFORE calling this — this function trusts its inputs rather than
     re-validating them, same division of labor as create_thing/
     create_place's own routes validating before calling into db.py.
+
+    umwelt #1051: a FOURTH write joins the same transaction -- the founder
+    becomes the project's first owner (project_owners row, canonical agent,
+    empty role). It is the last write inside the try, so a failure in any of
+    the four rolls back all four.
 
     Raises sqlite3.IntegrityError (uncaught, after rollback) on a
     genuine id collision (place_id or board_thing_id already taken) — a
@@ -4497,7 +4707,8 @@ def create_project_with_board(conn, project_id: str, label: str,
         conn.execute(
             "INSERT INTO places(id, kind, owner, label, description, "
             "parent_id) VALUES(?, 'public', NULL, ?, ?, ?)",
-            (place_id, place_label, place_description, WORKSHOP_PLACE_ID),
+            (place_id, place_label, place_description,
+             role_place_id(conn, "workshop")),
         )
         conn.execute(
             "INSERT INTO projects(id, label, description, status, "
@@ -4513,6 +4724,16 @@ def create_project_with_board(conn, project_id: str, label: str,
             (board_thing_id, place_id, board_name, board_description,
              json.dumps(board_metadata), created_by, created_at,
              compute_weight_est(board_name, board_description)),
+        )
+        # umwelt #1051: the founder is the project's first owner, written in
+        # THIS transaction (a failure anywhere above or here rolls back the
+        # project, its room, its board and this row together). Canonical
+        # identity, same fold every other agent key uses.
+        conn.execute(
+            "INSERT INTO project_owners(project_id, agent, role, added_by, "
+            "added_at) VALUES(?, ?, '', ?, ?)",
+            (project_id, canonical_agent(created_by),
+             canonical_agent(created_by), created_at),
         )
     except Exception:
         conn.rollback()
@@ -4571,6 +4792,420 @@ def update_project(conn, project_id: str, patch: dict, updated_at: str) -> None:
     vals = [patch[c] for c in cols] + [updated_at, project_id]
     conn.execute(f"UPDATE projects SET {sets} WHERE id = ?", vals)
     conn.commit()
+
+
+# --- project owners (umwelt #1051) ------------------------------------------
+#
+# project_owners(project_id, agent, role, added_by, added_at). Every function
+# here takes a CANONICAL agent (callers fold case first; create_project_with_
+# board folds the founder itself). Policy -- who may change owners, the
+# keep-one-owner rule, the role cap -- lives in the effects (server.py); this
+# layer only writes and reads.
+
+# Display/sort order for "the projects X owns": live work first.
+_PROJECT_STATUS_RANK = {"active": 0, "paused": 1, "done": 2, "archived": 3}
+
+
+def list_project_owners(conn, project_id: str) -> list[dict[str, str]]:
+    """The owners of one project, [{agent, role}], oldest-added first."""
+    rows = conn.execute(
+        "SELECT agent, role FROM project_owners WHERE project_id = ? "
+        "ORDER BY added_at ASC, agent ASC", (project_id,)).fetchall()
+    return [{"agent": r[0], "role": r[1]} for r in rows]
+
+
+def project_owners_map(conn) -> dict[str, list[dict[str, str]]]:
+    """Every project's owners in one query: {project_id: [{agent, role}]}."""
+    out: dict[str, list[dict[str, str]]] = {}
+    for pid, agent, role in conn.execute(
+            "SELECT project_id, agent, role FROM project_owners "
+            "ORDER BY added_at ASC, agent ASC"):
+        out.setdefault(pid, []).append({"agent": agent, "role": role})
+    return out
+
+
+def open_task_counts_by_project(conn) -> dict[str, int]:
+    """{project_id: n} in ONE grouped query, n = the project's tasks (subtasks
+    included) whose status is not 'done' or 'cancelled'. A project with none
+    is absent (callers `.get(pid, 0)`). Read-only; the Project Register's
+    open-task count."""
+    return {r[0]: r[1] for r in conn.execute(
+        "SELECT project_id, COUNT(*) FROM tasks "
+        "WHERE status NOT IN ('done','cancelled') GROUP BY project_id")}
+
+
+def project_board_ids(conn, kind_id: str) -> dict[str, str]:
+    """{project_id: board thing id} in ONE query: live things whose
+    metadata.kind_id is `kind_id` (the project_board kind), keyed by their
+    metadata.project_id (the binding create_project_with_board writes). If
+    a project somehow has several, the smallest id wins (deterministic)."""
+    return {r[0]: r[1] for r in conn.execute(
+        "SELECT json_extract(metadata, '$.project_id') AS pid, MIN(id) "
+        "FROM things WHERE status='live' "
+        "AND json_extract(metadata, '$.kind_id') = ? "
+        "AND json_extract(metadata, '$.project_id') IS NOT NULL "
+        "GROUP BY pid", (kind_id,))}
+
+
+# The authorization for adding an owner is PART OF THE WRITE (umwelt #1051,
+# the bootstrap race found at review): one INSERT ... SELECT ... WHERE
+# statement. SQLite runs a statement under the database write lock, so the
+# EXISTS sub-selects below read the owner rows as they are AT THE MOMENT OF
+# THE WRITE -- a second request cannot slip between a check and an insert,
+# because there is no gap between them. Three arms, any one authorizes:
+#   * the actor is a project owner admin of this world
+#     (_ids.project_owner_admins(), env UMWELT_PROJECT_OWNER_ADMINS);
+#   * the actor is already an owner of the project;
+#   * the project has NO owner rows and the actor is its founder (created_by,
+#     passed in canonical form -- that column never changes, so reading it
+#     outside the statement is race-free).
+# Zero rows written (nothing returned) means "refused"; the same statement's
+# ON CONFLICT branch is the role update, behind the SAME guard (a refused
+# actor selects no row, so neither the insert nor the update happens).
+# RETURNING says which happened: the row's added_at equals this call's own
+# timestamp only for a fresh insert (an update leaves the original added_at).
+_ADD_OWNER_SQL = """
+INSERT INTO project_owners(project_id, agent, role, added_by, added_at)
+SELECT :pid, :agent, :role, :actor, :at
+WHERE :is_admin = 1
+   OR EXISTS (SELECT 1 FROM project_owners
+              WHERE project_id = :pid AND agent = :actor)
+   OR (:actor != '' AND :actor = :founder
+       AND NOT EXISTS (SELECT 1 FROM project_owners WHERE project_id = :pid))
+ON CONFLICT(project_id, agent) DO UPDATE SET role = {role_expr}
+RETURNING added_at = :at
+"""
+
+
+def add_project_owner(conn, project_id: str, agent: str, role: str | None,
+                      actor: str, added_at: str, *, is_admin: bool,
+                      founder: str, commit: bool = True) -> bool | None:
+    """Add `agent` as an owner of the project, or update an existing owner's
+    role, IF `actor` is authorized -- decided inside the one write statement
+    (see _ADD_OWNER_SQL). Returns True for a new owner row, False for an
+    update of an existing owner (role set, or unchanged when `role` is
+    None), None when the actor was not authorized (nothing written).
+
+    One row per (project_id, agent): a re-add keeps the ORIGINAL added_by/
+    added_at. `role=None` means "no role given": a new owner gets '' and an
+    existing owner keeps theirs. `founder` is the project's created_by,
+    canonical. `commit=False` leaves the transaction open (tests use it to
+    show the write lock)."""
+    sql = _ADD_OWNER_SQL.format(
+        role_expr="project_owners.role" if role is None else "excluded.role")
+    cur = conn.execute(sql, {
+        "pid": project_id, "agent": agent, "role": role or "",
+        "actor": actor, "at": added_at, "is_admin": 1 if is_admin else 0,
+        "founder": founder})
+    rows = cur.fetchall()
+    if commit:
+        conn.commit()
+    if not rows:
+        return None
+    return bool(rows[0][0])
+
+
+def remove_project_owner(conn, project_id: str, agent: str, keep_one: bool,
+                         *, actor: str, is_admin: bool) -> bool:
+    """Remove `agent` from the project's owners. True iff a row was deleted.
+
+    Both guards are part of the DELETE statement itself, so check and write
+    are one atomic step under the write lock (no window between a read and
+    the delete): the ACTOR must be an admin or (still) an owner, and with
+    `keep_one` ANOTHER owner must remain. False means the agent was not an
+    owner, or the actor was not authorized, or (keep_one) it was the last
+    owner; the caller tells them apart with a read taken afterwards."""
+    cur = conn.execute(
+        "DELETE FROM project_owners WHERE project_id = :pid AND agent = :agent "
+        "AND (:is_admin = 1 OR EXISTS (SELECT 1 FROM project_owners "
+        "WHERE project_id = :pid AND agent = :actor)) "
+        "AND (:keep = 0 OR EXISTS (SELECT 1 FROM project_owners "
+        "WHERE project_id = :pid AND agent != :agent))",
+        {"pid": project_id, "agent": agent, "actor": actor,
+         "is_admin": 1 if is_admin else 0, "keep": 1 if keep_one else 0})
+    conn.commit()
+    return cur.rowcount > 0
+
+
+# --- project archive / restore (umwelt #1074 slice B, #1094) -----------------
+#
+# Archive: status -> 'archived' AND the project's room reparented under the
+# archive place. Restore: status -> 'active' (NOT the prior status: the
+# design authority's ruling) AND the room reparented under its PRE-ARCHIVE
+# parent when that parent still exists, otherwise under the workshop with the
+# fallback named in the result (umwelt #1094). The pre-archive parent is
+# recorded without a schema change, in the room's own `places.metadata`
+# object under `archived_from_parent` (merged in by archive, consumed by
+# restore). Both halves are ONE BEGIN IMMEDIATE transaction
+# (atomic_authorized_write), and every guard -- who may act, the state of the
+# project, the places involved, the cycle check, the restore target -- is
+# decided INSIDE it: a pre-check taken earlier only gives a readable reason,
+# THIS is the authority, so two racing requests cannot both pass. The
+# restore target is decided by ONE helper (`restore_target`) that both the
+# blocker and the write call, so the pre-check and the authority cannot
+# disagree. No thing row is touched: the room's things and child rooms
+# reference the room, so they travel with it (Village Law D2).
+
+ARCHIVED_PLACE_ID = "place_archived"
+ARCHIVED_FROM_PARENT_KEY = "archived_from_parent"
+
+_RESTORE_FALLBACK_TEXT = {
+    "no_record": "no pre-archive parent was recorded; "
+                 "the room went to the Workshop",
+    "parent_missing": "the recorded pre-archive parent no longer exists; "
+                      "the room went to the Workshop",
+    "parent_is_room": "the recorded pre-archive parent is the room itself; "
+                      "the room went to the Workshop",
+    "parent_is_archive": "the recorded pre-archive parent is the archive "
+                         "place; the room went to the Workshop",
+    "parent_cycle": "returning the room to its recorded pre-archive parent "
+                    "would create a cycle (that parent is now inside the "
+                    "room); the room went to the Workshop",
+    "record_malformed": "the recorded pre-archive parent is unreadable; "
+                        "the room went to the Workshop",
+}
+
+
+def restore_fallback_text(reason: str | None) -> str | None:
+    """The one plain sentence saying why restore used the Workshop, or None
+    when `reason` is None (a clean return to the recorded parent)."""
+    if reason is None:
+        return None
+    return _RESTORE_FALLBACK_TEXT[reason]
+
+
+def _metadata_object(raw: Any) -> dict[str, Any] | None:
+    """The decoded `places.metadata` when it is a JSON object, else None
+    (invalid JSON, or valid JSON that is not an object)."""
+    try:
+        obj = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def restore_target(conn, project_id: str, workshop_place_id: str,
+                   archived_place_id: str = ARCHIVED_PLACE_ID
+                   ) -> tuple[str, str | None]:
+    """Where restoring `project_id` puts its room: `(target_id,
+    fallback_reason)`. Pure read, and the ONLY place the choice is made --
+    the blocker and the write both call it.
+
+    The recorded parent (the room's `metadata.archived_from_parent`) is used
+    iff the key is present and a non-empty string, that place exists, is not
+    the room itself, is not `archived_place_id`, and moving the room under it
+    would not create a cycle. Otherwise the target is `workshop_place_id` and
+    the reason is one of: no_record, parent_missing, parent_is_room,
+    parent_is_archive, parent_cycle, record_malformed (the key is not a
+    string, or the metadata is not a JSON object). `fallback_reason` is None
+    when the recorded parent is used."""
+    project = get_project(conn, project_id)
+    room = project["place_id"] if project is not None else None
+    row = (conn.execute("SELECT metadata FROM places WHERE id = ?",
+                        (room,)).fetchone() if room is not None else None)
+    if row is None:
+        return workshop_place_id, "no_record"
+    meta = _metadata_object(row[0])
+    if meta is None:
+        return workshop_place_id, "record_malformed"
+    if ARCHIVED_FROM_PARENT_KEY not in meta:
+        return workshop_place_id, "no_record"
+    parent = meta[ARCHIVED_FROM_PARENT_KEY]
+    if not isinstance(parent, str) or not parent:
+        return workshop_place_id, "record_malformed"
+    if not place_exists(conn, parent):
+        return workshop_place_id, "parent_missing"
+    if parent == room:
+        return workshop_place_id, "parent_is_room"
+    if parent == archived_place_id:
+        return workshop_place_id, "parent_is_archive"
+    if would_create_cycle(conn, room, parent):
+        return workshop_place_id, "parent_cycle"
+    return parent, None
+
+
+def project_move_blocker(conn, project_id: str, actor: str, *, is_admin: bool,
+                         restore: bool, target_place_id: str,
+                         archived_place_id: str = ARCHIVED_PLACE_ID
+                         ) -> str | None:
+    """Why `actor` may NOT archive (restore=False) or restore (restore=True)
+    the project right now, as a short code -- or None when the move is
+    allowed. Pure reads. Checked in this order, first hit wins:
+
+      project_missing, not_allowed (not an admin and no owner row),
+      already_archived (archive) / not_archived + no_owner (restore),
+      no_room, room_missing, target_missing, room_is_target, cycle.
+
+    For a restore, `target_place_id` is the WORKSHOP and the last three
+    codes are judged against the EFFECTIVE target (`restore_target`: the
+    recorded pre-archive parent when usable, else the workshop), so an
+    unusable record falls back to the workshop instead of refusing, while a
+    missing or cyclic workshop still refuses when it is the effective target.
+
+    The write functions below run this as the guard INSIDE their
+    transaction; callers also run it beforehand to compose a readable
+    refusal (and again afterwards, to say why a write was refused)."""
+    project = get_project(conn, project_id)
+    if project is None:
+        return "project_missing"
+    if not is_admin:
+        owner = conn.execute(
+            "SELECT 1 FROM project_owners WHERE project_id = ? AND agent = ?",
+            (project_id, actor)).fetchone()
+        if owner is None:
+            return "not_allowed"
+    if restore:
+        if project["status"] != "archived":
+            return "not_archived"
+        has_owner = conn.execute(
+            "SELECT 1 FROM project_owners WHERE project_id = ?",
+            (project_id,)).fetchone()
+        if has_owner is None:
+            return "no_owner"
+    elif project["status"] == "archived":
+        return "already_archived"
+    room = project["place_id"]
+    if room is None:
+        return "no_room"
+    if not place_exists(conn, room):
+        return "room_missing"
+    if restore:
+        target_place_id, _why = restore_target(
+            conn, project_id, target_place_id, archived_place_id)
+    if not place_exists(conn, target_place_id):
+        return "target_missing"
+    if room == target_place_id:
+        return "room_is_target"
+    if would_create_cycle(conn, room, target_place_id):
+        return "cycle"
+    return None
+
+
+def _move_project(conn, project_id: str, actor: str, *, is_admin: bool,
+                  restore: bool, target_place_id: str, status: str,
+                  at: str, archived_place_id: str = ARCHIVED_PLACE_ID
+                  ) -> dict[str, Any] | None:
+    result: dict[str, Any] = {}
+
+    def _allowed(c) -> bool:
+        return project_move_blocker(
+            c, project_id, actor, is_admin=is_admin, restore=restore,
+            target_place_id=target_place_id,
+            archived_place_id=archived_place_id) is None
+
+    def _write(c) -> None:
+        room = get_project(c, project_id)["place_id"]
+        row = c.execute("SELECT parent_id, metadata FROM places WHERE id = ?",
+                        (room,)).fetchone()
+        old_parent, raw_meta = row[0], row[1]
+        meta = _metadata_object(raw_meta)
+        new_meta: dict[str, Any] | None = None   # None = leave metadata alone
+        extra: dict[str, Any]
+        if restore:
+            target, fallback = restore_target(
+                c, project_id, target_place_id, archived_place_id)
+            if meta is not None and ARCHIVED_FROM_PARENT_KEY in meta:
+                new_meta = {k: v for k, v in meta.items()
+                            if k != ARCHIVED_FROM_PARENT_KEY}
+            extra = {"restored_to": target, "fallback": fallback,
+                     "fallback_text": restore_fallback_text(fallback)}
+        else:
+            target = target_place_id
+            recorded = None
+            if (old_parent and old_parent != target_place_id
+                    and meta is not None):
+                recorded = old_parent
+                new_meta = {**meta, ARCHIVED_FROM_PARENT_KEY: recorded}
+            extra = {"archived_from": recorded}
+        c.execute("UPDATE projects SET status = ?, updated_at = ? WHERE id = ?",
+                  (status, at, project_id))
+        if new_meta is None:
+            c.execute("UPDATE places SET parent_id = ? WHERE id = ?",
+                      (target, room))
+        else:
+            c.execute("UPDATE places SET parent_id = ?, metadata = ? "
+                      "WHERE id = ?", (target, json.dumps(new_meta), room))
+        result.update({
+            "project": project_id, "status": status, "room": room,
+            "moved_to": target,
+            "things_in_room": len(things_in_place(c, room)),
+            "child_rooms": [p["id"] for p in get_place_children(c, room)],
+            **extra,
+        })
+
+    if not atomic_authorized_write(conn, _allowed, _write):
+        return None
+    return result
+
+
+def archive_project(conn, project_id: str, actor: str, *, is_admin: bool,
+                    archived_place_id: str, at: str) -> dict[str, Any] | None:
+    """Archive the project in ONE transaction: `status = 'archived'` and its
+    room's parent set to `archived_place_id` (one hop; nothing is created --
+    the place must already exist). `actor` is canonical; `is_admin` is the
+    caller's verdict on the actor's admin standing (a configured project admin); otherwise
+    the actor must hold a project_owners row. Allowed from any status except
+    archived.
+
+    In the same write the room's current parent is recorded in the room's own
+    `places.metadata` under `archived_from_parent` (merged into the existing
+    object; every other key is kept), so restore can put the room back
+    (umwelt #1094). It is a raw UPDATE like the parent move -- no `updated_at`
+    stamp, no content_updates row. NOTHING is recorded (and the archive still
+    succeeds) when the room has no parent, when its parent already IS the
+    archive place, or when its metadata is not a JSON object (never
+    overwritten).
+
+    Returns {project, status, room, moved_to, things_in_room, child_rooms,
+    archived_from} (things_in_room = live things directly in the room,
+    counted in the same transaction; archived_from = the parent recorded, or
+    None when nothing was), or None when refused -- nothing was written;
+    `project_move_blocker` read afterwards says why."""
+    return _move_project(conn, project_id, actor, is_admin=is_admin,
+                         restore=False, target_place_id=archived_place_id,
+                         status="archived", at=at,
+                         archived_place_id=archived_place_id)
+
+
+def restore_project(conn, project_id: str, actor: str, *, is_admin: bool,
+                    workshop_place_id: str, at: str,
+                    archived_place_id: str = ARCHIVED_PLACE_ID
+                    ) -> dict[str, Any] | None:
+    """The reverse of archive_project, ONE transaction: `status = 'active'`
+    (always -- not the status the project had before it was archived) and the
+    room's parent set to the pre-archive parent recorded by archive_project
+    when that parent still exists and the move is sound (`restore_target`),
+    otherwise to `workshop_place_id`. The record is consumed in the same
+    write. Allowed ONLY from archived, and only while the project has at
+    least one owner row (an archived project may have none; the owner check
+    runs inside the write, so an owner removed after a caller's pre-check
+    makes the write refuse). A refused restore leaves the record in place.
+
+    Returns {project, status, room, moved_to, things_in_room, child_rooms,
+    restored_to, fallback, fallback_text}: moved_to == restored_to is the
+    ACTUAL new parent; `fallback` is None on a clean return, else the reason
+    code why the workshop was used, and `fallback_text` is that reason in one
+    plain sentence. None when refused."""
+    return _move_project(conn, project_id, actor, is_admin=is_admin,
+                         restore=True, target_place_id=workshop_place_id,
+                         status="active", at=at,
+                         archived_place_id=archived_place_id)
+
+
+def projects_owned_by(conn, agent: str) -> list[dict[str, Any]]:
+    """Every project `agent` (canonical) owns, in the stable display order:
+    active, paused, done, archived; then by label (case-insensitive, then
+    exact); then oldest first and id as the final tie-breakers, so equal
+    rows come out the same way on every read."""
+    rows = conn.execute(
+        f"SELECT {', '.join('p.' + c.strip() for c in _PROJECT_COLS.split(','))} "
+        "FROM projects p JOIN project_owners o ON o.project_id = p.id "
+        "WHERE o.agent = ?", (agent,)).fetchall()
+    projects = [_project_row(r) for r in rows]
+    projects.sort(key=lambda p: (
+        _PROJECT_STATUS_RANK.get(p["status"], len(_PROJECT_STATUS_RANK)),
+        p["label"].casefold(), p["label"], p["created_at"], p["id"]))
+    return projects
 
 
 _TASK_COLS = ("id, project_id, parent_task_id, label, description, status, "
@@ -5035,7 +5670,7 @@ def revoke_grant(conn, thing_id: str, agent: str) -> None:
 # --- avatar-status heartbeat (Phase 2 engine slice, forum #268) ------------
 #
 # agent_heartbeat's SOLE write path is server.py's POST /umwelt/heartbeat —
-# `agent` is CALLER-DECLARED (forgeable v0, ob_0938), so a row can be
+# `agent` is CALLER-DECLARED (forgeable v0), so a row can be
 # written under any name a caller supplies for itself; see the table's own
 # comment in the schema string above for the full rationale. Read path is
 # server.py's _avatar_status (via _compute_agent_state) plus
@@ -5287,19 +5922,50 @@ def _seed_identities_from_avatars(conn: sqlite3.Connection) -> None:
     ).fetchall()
     stamp = now_iso()
     for author, metadata_json in rows:
-        agent_id = canonical_agent(author)
         metadata = json.loads(metadata_json) if metadata_json else {}
-        declared_type = metadata.get("type")
-        if declared_type in ("human", "agent"):
-            kind = declared_type
-        else:
-            kind = "human" if agent_id in human_residents() else "agent"
-        conn.execute(
-            "INSERT OR IGNORE INTO identities(agent_id, kind, created_at) "
-            "VALUES (?, ?, ?)",
-            (agent_id, kind, stamp),
-        )
+        _seed_identity_for_avatar(conn, author, metadata, stamp)
     conn.commit()
+
+
+def _seed_identity_for_avatar(conn: sqlite3.Connection, author: str,
+                              metadata: dict, stamp: str) -> bool:
+    """Seed ONE `identities` row for one avatar (umwelt#1103). The single
+    helper behind both the boot seed (`_seed_identities_from_avatars`) and
+    the birth branch of `get_or_create_avatar`, so every route that births
+    an avatar enrolls it by the same rule.
+
+    Rules, all shared by both callers (see `_seed_identities_from_avatars`'s
+    docstring for the reasoning behind each):
+      - the enrollment predicate `backfill_window_open(conn)` must hold;
+        when it is False nothing is inserted (a closed window withholds
+        enrollment; it never refuses the caller);
+      - a retired avatar (`metadata.retired` true) is never seeded;
+      - `kind` is `metadata.type` when it is "human"/"agent", else
+        'human' iff the canonical agent_id is in `human_residents()`;
+      - `INSERT OR IGNORE`, never REPLACE: an existing row (including its
+        credential_verifier/bound_at/bound_by) is left untouched.
+
+    Does NOT commit: the boot seed commits once after its loop; the birth
+    branch commits together with the avatar insert (same transaction).
+    Returns True iff an INSERT was attempted (not a statement that a new
+    row landed -- OR IGNORE may have ignored it).
+    """
+    if not backfill_window_open(conn):
+        return False
+    if metadata.get("retired") == 1:  # JSON true / 1, as json_extract IS 1
+        return False
+    agent_id = canonical_agent(author)
+    declared_type = metadata.get("type")
+    if declared_type in ("human", "agent"):
+        kind = declared_type
+    else:
+        kind = "human" if agent_id in human_residents() else "agent"
+    conn.execute(
+        "INSERT OR IGNORE INTO identities(agent_id, kind, created_at) "
+        "VALUES (?, ?, ?)",
+        (agent_id, kind, stamp),
+    )
+    return True
 
 
 def _backfill_identity_retirement(conn: sqlite3.Connection) -> None:

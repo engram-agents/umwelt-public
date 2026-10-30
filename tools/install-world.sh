@@ -3,7 +3,7 @@
 #
 # ENGRAM-style artifact install: run the world off an INSTALLED ARTIFACT,
 # not a live git checkout. Exports a given git ref's runtime tree
-# (src/umwelt/, requirements.txt, PROTOCOL.md) into a versioned, immutable
+# (src/umwelt/, worlds/, requirements.txt, PROTOCOL.md) into a versioned, immutable
 # directory under a runtime base, then atomically re-points a `live`
 # symlink at it. A running world instance's WorkingDirectory/PYTHONPATH
 # point through `live`, never through a checkout being actively pulled —
@@ -12,9 +12,14 @@
 #
 # Usage:
 #   tools/install-world.sh --target {real|alpha} --ref <git-ref> [--activate]
+#                          [--no-backup]   (--no-backup: --target alpha ONLY)
 #
 #   --target {real|alpha}  which runtime to install into (real: :5003,
 #                           alpha: :5005 — see docs/DEPLOY.md)
+#   --no-backup             skip the pre-promotion DB backup. Accepted ONLY
+#                           with --target alpha (the alpha db is disposable);
+#                           `--no-backup --target real` is refused at
+#                           argument parsing (exit 1, nothing touched).
 #   --ref <git-ref>         any git ref resolvable from the invoking repo
 #                           (branch, tag, SHA) — resolved to a full commit
 #                           SHA before anything else happens
@@ -37,6 +42,7 @@
 #
 # Layout produced under $UMWELT_RUNTIME_BASE/runtime-<target>/:
 #   versions/<sha>/           exported tree for that SHA: src/umwelt/,
+#                             worlds/ (the world packages, umwelt#1043),
 #                             requirements.txt, PROTOCOL.md
 #   versions/<sha>/COMMIT_SHA a one-line stamp of <sha>, read by
 #                             server.py's _resolve_commit_sha() fallback
@@ -52,7 +58,42 @@
 #   live -> versions/<sha>    the currently-active version; re-pointed
 #                             ATOMICALLY (temp symlink + `mv -T`), so `live`
 #                             is never missing mid-swap
-#   .installed-version        JSON manifest: {"sha", "ref", "installed_at"}
+#   .installed-version        JSON manifest: {"sha", "ref", "installed_at",
+#                             "backup"} -- "backup" is the absolute path of the
+#                             verified pre-promotion DB copy this run took, or
+#                             null when none was taken (--no-backup, alpha with
+#                             no db, or a first-ever install with no live)
+#
+# Layout produced under $UMWELT_RUNTIME_BASE/ (outside runtime-<target>/):
+#   backups/pre-promotion-<target>/
+#                             this script's OWN backup dir (umwelt-<UTC>.db
+#                             copies + .last-ok.json stamp, keep 14). Never
+#                             the scheduled-backup dir backups/ itself, so a
+#                             routine promotion can never prune the scheduled
+#                             daily backups and vice versa.
+#
+# THE BACKUP FAILURE CONTRACT (umwelt #1106; pinned by B1-B9 in
+# tools/test-install-world.sh):
+#   Order: the backup runs AFTER the export completes and BEFORE `live` is
+#   re-pointed. It is taken by `python3 -m umwelt.world_backup` (SQLite online
+#   backup + quick_check on the copy), run from the INVOKING checkout's src/
+#   (stdlib-only, so a rollback to an older --ref that predates world_backup
+#   still gets a backup) -- never a raw cp/rsync/cat of the db.
+#   1. --target real ALWAYS backs up; --no-backup is alpha-only (see above).
+#   2. Backup dir: backups/pre-promotion-<target>, --keep 14.
+#   3. world_backup non-zero for ANY reason (corrupt/not-sqlite source,
+#      unsafe backup dir, deadline, ...) => this script exits non-zero loudly
+#      (stderr names "backup" and the world_backup exit code), `live` and the
+#      manifest are UNCHANGED, and the --activate step never runs. The
+#      already-exported versions/<sha> dir may remain: it is immutable and
+#      harmless, and re-running is idempotent.
+#   4. Missing db: real + an existing `live` => refused (message names the db
+#      path); real with NO existing `live` (first-ever install) => proceeds and
+#      says there was no live to back up; alpha => proceeds with a
+#      "skipped: no db" line.
+#   5. Success => the manifest gains "backup" (path read from the stamp the
+#      run just wrote, only after rc 0, and checked to exist) and stdout
+#      prints `backup -> <path>` BEFORE the `live -> ...` line.
 #
 # Idempotent + safe to re-run: re-installing an already-exported SHA skips
 # the export and just re-points `live` + rewrites the manifest. Rollback is
@@ -61,13 +102,18 @@
 #
 # This script NEVER runs `git checkout` / `git pull` / `git reset` on any
 # tree (export is via `git archive`, read-only against the invoking repo),
-# and NEVER touches a `*.db` file.
+# and NEVER writes to, copies, or moves a `*.db` file itself. It READS the db
+# in exactly one place -- the pre-promotion backup -- and only through
+# umwelt.world_backup's read-only online backup (the source is opened
+# mode=ro; a promotion leaves the source db byte-identical).
 set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: install-world.sh --target {real|alpha} --ref <git-ref> [--activate]
+Usage: install-world.sh --target {real|alpha} --ref <git-ref> [--activate] [--no-backup]
 
+  --no-backup            skip the pre-promotion DB backup (alpha ONLY; a real
+                         promotion always backs up first)
   --target {real|alpha}  which runtime to install into
   --ref <git-ref>        git ref to resolve + export (branch, tag, SHA)
   --activate              restart BOTH of the target's systemd --user
@@ -83,6 +129,7 @@ EOF
 target=""
 ref=""
 activate=0
+no_backup=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -108,6 +155,10 @@ while [[ $# -gt 0 ]]; do
             activate=1
             shift
             ;;
+        --no-backup)
+            no_backup=1
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -127,6 +178,10 @@ if [[ -z "$target" ]]; then
 fi
 if [[ "$target" != "real" && "$target" != "alpha" ]]; then
     echo "install-world.sh: --target must be 'real' or 'alpha' (got: '$target')" >&2
+    exit 1
+fi
+if [[ "$no_backup" -eq 1 && "$target" != "alpha" ]]; then
+    echo "install-world.sh: --no-backup is accepted only with --target alpha; a --target $target promotion always takes a backup first" >&2
     exit 1
 fi
 if [[ -z "$ref" ]]; then
@@ -157,11 +212,21 @@ version_dir="$versions_dir/$sha"
 live_link="$runtime_root/live"
 manifest_file="$runtime_root/.installed-version"
 
+# The db this target's promotion protects, and the backup dir that is THIS
+# script's own (never $runtime_base/backups, the scheduled-backup dir -- see
+# the header). real = umwelt.db, alpha = alpha-world.db (docs/DEPLOY.md,
+# tools/alpha-world.sh's ALPHA_DB default).
+case "$target" in
+    real)  db_path="$runtime_base/umwelt.db" ;;
+    alpha) db_path="$runtime_base/alpha-world.db" ;;
+esac
+backup_dir="$runtime_base/backups/pre-promotion-$target"
+
 # The single source of truth for what this script's `git archive` exports --
 # used by BOTH the export call below AND the outside-archive-boundary report
 # further down, so the report can never drift from what's actually deployed
 # (umwelt #799).
-runtime_archive_paths=(src/umwelt requirements.txt PROTOCOL.md)
+runtime_archive_paths=(src/umwelt worlds requirements.txt PROTOCOL.md)
 
 # Capture the PREVIOUSLY-installed sha, if any, before this run's manifest
 # write (further below) overwrites it -- this is the "previously-live" half
@@ -185,11 +250,60 @@ else
     # stale/partial files never linger.
     rm -rf "$version_dir"
     mkdir -p "$version_dir"
-    git -C "$repo_root" archive "$sha" -- "${runtime_archive_paths[@]}" \
+    # `worlds` is exported when the ref has it. A ref from before world
+    # packages (umwelt#1043) has no worlds/ and must still install, so a
+    # rollback to an older version keeps working; every other path is
+    # required and a missing one still fails the archive loudly.
+    export_paths=()
+    for archive_path in "${runtime_archive_paths[@]}"; do
+        if [[ "$archive_path" == "worlds" ]] \
+            && ! git -C "$repo_root" cat-file -e "$sha:$archive_path" 2>/dev/null; then
+            continue
+        fi
+        export_paths+=("$archive_path")
+    done
+    git -C "$repo_root" archive "$sha" -- "${export_paths[@]}" \
         | tar -x -C "$version_dir"
     printf '%s\n' "$sha" > "$version_dir/COMMIT_SHA"
     touch "$export_marker"
     echo "install-world.sh: exported $sha -> $version_dir"
+fi
+
+# Pre-promotion DB backup (umwelt #1106) -- AFTER the export, BEFORE `live`
+# moves. Any failure exits here, so `live`, the manifest and the --activate
+# step are never reached. (versions/$sha stays behind on that path: it is
+# immutable and harmless, and a re-run skips its export.) The failure
+# contract is in the header.
+backup_path=""   # "" => manifest "backup": null
+if [[ "$no_backup" -eq 1 ]]; then
+    echo "install-world.sh: backup skipped (--no-backup)"
+elif [[ ! -e "$db_path" ]]; then
+    if [[ "$target" == "real" ]]; then
+        if [[ -L "$live_link" || -e "$live_link" ]]; then
+            echo "install-world.sh: refusing to promote: the real db is missing ($db_path) but a live version exists -- no backup is possible, so live is NOT re-pointed" >&2
+            exit 1
+        fi
+        echo "install-world.sh: backup skipped: no live version existed (first-ever install), so there was no db to back up ($db_path)"
+    else
+        echo "install-world.sh: backup skipped: no db at $db_path (the alpha db is disposable)"
+    fi
+else
+    wb_rc=0
+    # world_backup's own stderr is left attached: its reason is the loud part.
+    PYTHONPATH="$repo_root/src" python3 -m umwelt.world_backup \
+        --db "$db_path" --backup-dir "$backup_dir" --keep 14 >/dev/null || wb_rc=$?
+    if [[ "$wb_rc" -ne 0 ]]; then
+        echo "install-world.sh: backup FAILED (world_backup exit $wb_rc) for $db_path -- live and the manifest are UNCHANGED and nothing was restarted" >&2
+        exit 1
+    fi
+    # Read the verified copy's path from the stamp this run just wrote (rc 0
+    # means world_backup wrote it), and confirm the file is really there.
+    backup_path="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["path"])' "$backup_dir/.last-ok.json")" || backup_path=""
+    if [[ -z "$backup_path" || ! -f "$backup_path" ]]; then
+        echo "install-world.sh: backup FAILED (world_backup exit 0, but the stamp $backup_dir/.last-ok.json does not name an existing copy) -- live and the manifest are UNCHANGED and nothing was restarted" >&2
+        exit 1
+    fi
+    echo "install-world.sh: backup -> $backup_path"
 fi
 
 # Atomically re-point `live` -> versions/<sha>: build the new symlink under a
@@ -200,8 +314,14 @@ ln -sfn "$version_dir" "$tmp_link"
 mv -T "$tmp_link" "$live_link"
 
 installed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+if [[ -n "$backup_path" ]]; then
+    json_backup="${backup_path//\\/\\\\}"
+    json_backup="\"${json_backup//\"/\\\"}\""
+else
+    json_backup="null"
+fi
 cat > "$manifest_file" <<EOF
-{"sha": "$sha", "ref": "$ref", "installed_at": "$installed_at"}
+{"sha": "$sha", "ref": "$ref", "installed_at": "$installed_at", "backup": $json_backup}
 EOF
 
 echo "install-world.sh: resolved ref '$ref' -> $sha"

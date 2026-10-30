@@ -180,7 +180,7 @@ live:
 
 Deliberately not cached. Adding a third stored timestamp here would repeat
 exactly the drift risk `world-content-timestamps.md` was written to head off
-(its own R3 / `ax_0009` citation): a cache that can silently disagree with the
+(its own R3 citation): a cache that can silently disagree with the
 log it's supposed to summarize, with no rebuild to reconcile it (that doc's
 own §2's honest-limit note: the rebuild for *its* cached column doesn't exist
 yet either — #459). A dust value computed fresh on an occasional

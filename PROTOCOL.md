@@ -6,6 +6,84 @@ structure in the envelope.** Agents supply any source / any command (freedom);
 the world owns the on-disk layout and enforces the format (structure). There is
 **no bare-shell rung** — the lowest agent-facing primitive is already structured.
 
+## Engine API gate (umwelt #1105)
+
+`ENGINE_API` is the version number of the contract between the world server and
+every client of it. It lives in one place, `src/umwelt/engine_api.py`
+(`ENGINE_API: int = 2`), vendored byte-identically into `plugin/umwelt/` by
+`tools/build-umwelt-plugin.sh`.
+
+**The header pair.** Every client sends `X-Umwelt-Client-API: <N>` (the number it
+was built against) on every request. The server stamps `X-Umwelt-Engine-API: <N>`
+on every response produced inside the app, errors and 404s included; the
+refusals the ingress wrapper hand-builds (413 body too large, 400 bad
+Content-Length) are produced before the app and do not carry it, so an
+oversized body from a stale client is refused 413, not 409. `GET /health` also
+reports `engine_api`.
+
+**The gate is server-side**, one `before_request`, because a client built before
+this feature has no gate code and could not stop itself. A request to a route that
+is not in `_API_GATE_EXEMPT` whose header is absent, not a canonical integer, or
+not equal to the server's number gets **HTTP 409**, body exactly:
+
+```
+{"error": "engine API mismatch", "client_api": <int|null>, "engine_api": <int>,
+ "remedy": "client is older: rebuild the plugin (tools/install-local-marketplace-umwelt.sh,
+            then /reload-plugins) · server is older: promote the server to the current deploy tag"}
+```
+
+The remedy always names both fixes; which applies is the operator's call. The
+gate decides from the header and the path alone: it never opens the database, and
+it can only refuse, never grant. A request whose routing already failed (404/405)
+is left to Flask.
+
+**The integer rule.** The header must fully match `0|[1-9][0-9]{0,8}` over ASCII
+digits: at most 9 digits, no sign, no space, no leading zero, no decimal point, no
+non-ASCII digit. Anything else is `client_api: null`; a longer value is never
+handed to `int()` (a 5,000-digit header must be a 409, never a 500).
+
+**The exempt set** (`_API_GATE_EXEMPT`, one frozenset, the only place exemption is
+decided): `/health`, `/umwelt/login`, `/umwelt/login/challenge`, and the comms
+routes `crossings_here`, `crossings_for_agent`, `search_crossings`, `whats_new`,
+`open_crossing`, `send_crossing` (a seat must still be able to hear and speak
+across a version skew). Everything else, including `/umwelt/places`,
+`/umwelt/enter`, the `wake_*` routes and `/umwelt/heartbeat`, is gated. On a
+**successful** `/umwelt/login` with a mismatching header, the normal response
+gains one top-level key, `engine_api_notice` `{client_api, engine_api, remedy}`;
+status and every other key are unchanged. A 401 login is byte-identical to its
+pre-gate answer, and `/umwelt/login/challenge` never carries the notice.
+
+**The browser pages** `GET /` and `GET /projects` (and `/static/*`) are not API
+routes and stay ungated. The server renders its own `ENGINE_API` into both pages
+at serve time, and their inline JS sends `X-Umwelt-Client-API` on every `fetch`.
+
+**How clients render a refusal.** MCP tools return one line,
+`⚠️ engine API mismatch (client N, server M): <remedy>`; hooks print one stderr
+line and exit 0 (the session-start hook also puts `Umwelt: engine API mismatch
+(client <c>, engine <e>). <remedy>` into `additionalContext`); the bell prints one
+stderr line and keeps running; `uw` prints the same line and exits 2 (1 stays for
+ordinary refusals).
+
+**The manifest.** `tools/gen_api_manifest.py` writes `api_manifest.json` (the
+sorted routes with their methods, a digest of the engine-authored kinddefs, and a
+digest over both; `engine_api` is not inside the digest) and appends
+`api_history.json` (`{"<N>": "<digest>"}`, append-only). Never hand-edit either,
+except once to correct the entry for a version that no deploy tag has carried; the
+PR that does so names both digests and the tag check.
+The tests require that regenerating gives the committed manifest byte for byte
+and that `history[str(ENGINE_API)] == manifest["digest"]`: add or remove a route,
+or change a kinddef, without bumping `ENGINE_API` and the second check fails.
+The generator refuses to rewrite an existing history entry.
+
+**Deploy marker.** `tools/install-local-marketplace-umwelt.sh` records
+`umwelt_engine_api=<N>` in `~/.umwelt/.deployed-version`.
+
+**First rollout order (once, for the first #1105 deploy).** Deployed clients
+today send no header. So: every seat **rebuilds its umwelt plugin first** (the
+new header is ignored by the old server, harmless), **then** the server is
+promoted (alpha :5005 first, then prod :5003), **then** the reload pass.
+Reversed, every seat is refused until it reloads.
+
 ## Places
 
 A location you `move_to`. It exists whether or not you're attending it.
@@ -145,7 +223,7 @@ POST /umwelt/look_at        {agent, thing}
     for a CARRIED thing, the place its carrier stands in right now; for a
     thing inside a container, the container's holder, recursively. The same
     gate (same predicate, same bodies) guards `look_at`, `use`, `download`,
-    `thing_actions` and `act` (checked BEFORE authorization and before any
+    `read`, `search`, `thing_actions` and `act` (checked BEFORE authorization and before any
     write), and `update_thing` where a kind grants `anyone`. The viewer is
     the RESOLVED actor (token over declared), never a raw body field;
     an absent `agent` is an anonymous viewer that may enter public places
@@ -210,8 +288,10 @@ POST /umwelt/use            {agent, thing, args?}
     Execute an executable thing in a sandbox and return the outcome briefing.
     Readable things return {content,size_class} instead of running —
     UNLESS the thing's size_class is tome/library, in which case `content`
-    is never included at all; instead the response carries {size_class,
-    metadata,manifest} — see "Size classes + examine gating" below. Records
+    is never included at all; instead the response carries {briefing, kind,
+    size_class, metadata, manifest, toc} — `toc` is a table of contents
+    (umwelt #647) and the briefing names `read`/`search`/`download`; see
+    "Size classes + examine gating" below. Records
     one use telemetry event per call that reaches a real outcome (see "Use
     telemetry" below).
     In the tome/library branch, `metadata`/`manifest.metadata_keys` follow
@@ -309,7 +389,197 @@ POST /umwelt/download       {agent?, thing}
     use(), just not over the inline-render channel). A body-kind (avatar)
     thing gets the same category-error 422 use() gives. Server returns DATA
     ONLY — it never writes the caller's filesystem; that's the CLIENT's job
-    (MUD `download`/`uw download`/MCP `download` — separate client build).
+    (umwelt #647/#708: `uw download THING PATH [--overwrite]` and the MCP
+    `download` tool write the file(s) to the caller's disk; the MUD has no
+    `download`). The server's source dict is world-supplied, so a client
+    MUST validate the whole plan before writing any file: refuse empty, `.`/`..`
+    components, absolute, NUL / control characters, a component over 255 bytes
+    or a path the OS rejects (the target path itself is checked first, before
+    any directory is made: EVERY component of it at most 255 bytes, its total
+    length under PC_PATH_MAX, so a refusal on those leaves the tree
+    unchanged), a name
+    containing any surrogate code point U+D800..U+DFFF or a text that cannot
+    be encoded, a name that would land outside the target after resolving
+    symlinks, a `{a, a/b}` file/directory collision, and two names that
+    collide after NFC + casefold (`{A, a}`, on every filesystem); open with
+    O_EXCL (O_TRUNC when overwriting) and O_NOFOLLOW. One file: the path is the file; several: the path is a
+    directory.
+
+    Client volume caps (umwelt #1119 follow-up). Both clients (`uw`, the MCP
+    server) hold two twin constants: `_MAX_RESPONSE_BYTES` = 33554432 (2**25, 32 MiB,
+    the smallest power of two at or above 4 x the largest measured single
+    response, 6,693,004 bytes: 4 x that is 26,772,016, and the cap is 5.01 x
+    it) bounds the bytes ONE HTTP
+    response may deliver, and `_MAX_DOWNLOAD_FILES` = 10000 is an operational
+    ceiling (not a measurement) on the files in one download. The body is
+    bounded where it is read off the socket: an advertised Content-Length
+    above the cap is refused before any body byte is read, and an undeclared
+    or understated body is cut after cap + 1 bytes. The bound applies to the
+    error branch too, so an oversized 4xx/5xx body is refused, never passed
+    through. The bound applies to the main request path; the login handshake
+    (`client_auth._http_post`) is not bounded here (umwelt#1127). The download plan is refused before the first write when the
+    sum of its UTF-8 bytes exceeds the byte cap or its file count exceeds the
+    ceiling. Refusal text: `response too large: read at least N bytes, cap is
+    C bytes`, `response too large: advertised N bytes, cap is C bytes`, or the
+    download forms naming bytes or files. `uw` exits 3 for it (an ordinary
+    error stays 1); an MCP tool answers one line starting `⚠️ response too
+    large:`. Neither is the unreachable-world or the world's own error text.
+
+POST /umwelt/read           {agent?, thing, file?, offset?, limit?}
+  → {name, file, files, size_class, total_lines, offset, lines, next_offset,
+     cut_lines}
+    umwelt #647: Claude Code's `Read` for a readable — one PAGE of lines of
+    one file, so a tome/library can be read without downloading it. `thing`
+    is required (400); `file` is a key of the source dict (omit it only when
+    there is exactly one file; an unknown name, an empty string, or an
+    omitted name on a multi-file thing is a 422 that lists up to 20 names,
+    then `+N more`); `offset` is the 1-BASED line to start at (default 1);
+    `limit` the most lines (default 2000). `offset`/`limit` that are not
+    integers >= 1 (a bool is not an integer) are a 422 naming the field.
+    Gates, in this order and byte-identical to `download`: auth 401 → `thing`
+    required 400 → not found 404 → the thing read gate (umwelt#982) → avatar
+    422 → `read is readable-only` 422 for a non-readable. Works on every
+    readable whatever its `size_class`. Lines are the file's text split on
+    `\n` (a trailing newline adds no empty last line; `\r\n` arrives as
+    `\n`).
+    Page budget: each line, after being cut to 2000 chars (its number is then
+    listed in `cut_lines`, absolute), is charged `len(line) + 8` against 4000;
+    the page ends at `limit` lines or when the next line would exceed the
+    budget, and ALWAYS holds at least one line (so paging progresses).
+    `next_offset` is the 1-based line after the last one returned, `null`
+    when the end of the file was reached. `offset` past the end is a 200 with
+    `lines: []`, `next_offset: null`. Read-only: NO use row is written
+    (`use_stats` keeps meaning "used").
+
+POST /umwelt/search         {agent?, thing, pattern, file?, output_mode?,
+                             "-i"?, "-A"?, "-B"?, "-C"?, head_limit?, offset?}
+  → {name, output_mode, total, entries, truncated, next_offset}
+    umwelt #647: Claude Code's `Grep` for a readable, with Grep's own argument
+    names. Matching is per line (no multiline); files are searched in sorted
+    relpath order, matches in line order. `pattern` (required: absent is a
+    400; empty, non-string, over 512 chars or not compiling is a 422, the
+    compile error carried) is a `regex`-package expression (Python `re`
+    style, NOT ripgrep's: lookarounds work). `output_mode`: `content`
+    (default) | `count` | `files_with_matches`. `-i` bool. `-A`/`-B`/`-C`
+    integers 0..10 (`-C` sets both sides, an explicit `-A`/`-B` overrides its
+    side). `head_limit` (default 50, >= 1) and `offset` (default 0, >= 0)
+    count ENTRIES (a match in content mode, a file otherwise), not lines.
+    Entries: content `{file, line, text, before: [[n, text]], after: [[n,
+    text]]}`; count `{file, count}`; files `{file}`. A context line is never
+    a match line and appears once in the result (it belongs to the earliest
+    entry whose window holds it). `total` counts all entries. The page stops
+    at `head_limit` entries or the 4000-char budget (a content entry is
+    charged `len + 8` for its match text and for each context text; texts
+    are cut at 2000 chars), always at least one entry; `truncated` /
+    `next_offset` say whether more exist and which `offset` gets them. Same
+    gate chain as `read` (`search is readable-only`), and no use row.
+    TIME GUARD: one search may spend at most 2 s matching IN TOTAL (a single
+    deadline, handed to each match call as its remaining time — not a budget
+    per line or per file). Past it the answer is 422 `pattern timed out`,
+    ALL OR NOTHING: no `entries`, no `total`. The 512-char cap is not the
+    safety bound; the deadline is. The matcher is the third-party `regex`
+    package (stdlib `re` has no timeout); when it is not installed on the
+    server the answer is 503 `search is unavailable`, never a fallback to `re`.
+    COMPILE BOMB BOUND: compiling cannot be interrupted and unrolls counted
+    repeats (`(?:(?:a{255}){255}){255}`, 24 chars, costs ~4 s and ~4.4 GB), so
+    before compiling anything the pattern is parsed with the STDLIB parser
+    and an expansion estimate is taken by counting EVERY node of the tree
+    (the compiler emits each node of a repeat's body once per unrolled
+    repetition): every node is at least 1; a repeat is 1 + COPIES x the size
+    of its body, where copies = max(1, MINIMUM count + 1 if the repeat has a
+    loop part, i.e. `+`, `{1,2}`, `{n,}` and the possessive forms, OR its body
+    contains another repeat, else the minimum): a nested chain of `+`
+    therefore doubles per level (measured: depth 16 = 53 MB, 20 = 669 MB),
+    nested exact counts cost (n+1) per level (measured: `{2}` depth 14 =
+    2002 MB, depth 15 = MemoryError), while chains of `*`, `?` and `{0,n}`
+    stay flat, a flat `a{99999}` stays 41 MB, and a ranged `{1,99999}` is
+    still a counter loop (copies 2, not 99999); a capturing group (named or
+    numbered), lookaround, atomic group, branch and conditional are 1 + their
+    contents; a non-capturing or flag-only group (`(?:`, `(?i:`, `(?i)`) is
+    free; a character class is its item count (below). Order of checks: the 512-char cap, then the
+    nesting caps, then the estimate, then compile. Above 100000 the answer is 422
+    `{"error": "pattern too complex", "limit": 100000, "estimate": N}` and
+    nothing is compiled; a pattern the stdlib parser rejects (`\p{L}`,
+    `(?V1)`, `(?<n>x)`, and any typo such as an unbalanced `(`) is 422
+    `{"error": "pattern not supported (Python re syntax only)", "detail":
+    "<stdlib parser message>"}` — `detail` is the stdlib `re.error` text
+    (e.g. `missing ), unterminated subpattern at position 0`) cut to its
+    first 200 chars, with no ellipsis and no padding; it may echo part of the
+    caller's own pattern, and nothing else (no traceback, no estimate). The
+    deadline starts BEFORE compile; if compile alone spends it the answer is
+    422 `pattern timed out`. A MemoryError from compile is a named 422
+    (`pattern too complex (compiling it ran out of memory)`) and a
+    RecursionError from compile is a named 422 of its own
+    (`pattern too complex (compiling it ran out of stack)`); both are
+    reporting backstops, not the protection. The RecursionError is reachable
+    only through plain-group and branch chains that no nesting cap counts
+    (a plain `(?:` is not a stdlib tree node); the 512-character pattern
+    limit keeps it out of reach today: `regex.compile` first raises
+    RecursionError at nesting depth 199 for both shapes (measured on regex
+    2026.5.9 and 2026.9.29), while the deepest chain that fits 512
+    characters is 127 levels for plain groups and 85 for nested
+    alternation, both far below 199. The boundary: `a{99999}` (estimate 100000) is the largest flat
+    repeat allowed; `a{100000}` (100001) is refused. KNOWN OVER-REFUSALS, by
+    design (the bound is a number, not a cost model): a flat `a{100000}` or
+    larger, `(a){99999}` (199999), an open count such as `W{2000,}` of a
+    wide character class, and a plus-chain nested deeper than 15 (depth 15 =
+    65535 is allowed, depth 16 = 131071 refused) and an exact-count chain
+    deeper than about 10 (`{2}` nested 10 deep = 68890 is allowed, 11 deep =
+    206671 refused) are harmless or rare yet refused. A pattern the parser raises on for any reason other than its own
+    `error` (a count over 2^32, nesting too deep) is `pattern too complex`
+    without an estimate; a failure while SIZING an accepted tree is a server
+    bug and is not turned into that answer.
+    Page cost: `len(file) + len(text) + 8` per rendered line (match or
+    context) in content mode, and `len(file) + 8` per row in the files and
+    count modes, against the 4000 budget.
+    A character class counts as its number of ITEMS (each literal, range and
+    category, plus 1 for a negation), because compile cost tracks the item
+    count, not a range's code-point span: `[a-zA-Z0-9_]` scores 4, `\w` scores
+    1, and `[<160 ranges>]{99999}` is refused. A flat run of consecutive
+    literals is over-counted on purpose (conservative).
+    `pattern too complex` has two bodies: with `estimate` (the number was
+    computed and is above the limit) and WITHOUT it, `{"error": "pattern too
+    complex", "limit": 100000}`, when the stdlib parser itself raised
+    something other than its own error (a repeat count over 2^32, nesting so
+    deep it overflowed the stack): such a pattern cannot be sized, so it is
+    refused, never a 500, never compiled. The estimate check runs BEFORE the
+    `regex` module is imported, so an over-complex pattern is 422 even on a
+    server where `regex` is missing. Two distinct 503s: `search is
+    unavailable: the 'regex' package is not installed` (the matcher) and
+    `search is unavailable: the pattern-size bound cannot load` (the private
+    stdlib parser the estimate needs, a Python upgrade); neither ever falls
+    back to an unbounded or stdlib-`re` search.
+    The MCP/`uw` render of a `search` page stays within about 6000 characters
+    EXCEPT for one forced entry: the engine always returns at least one entry,
+    so a single entry (for example `-C 10` over 2000-character lines, about
+    42,000 characters) may exceed it, as `read` may for one forced line.
+    NESTING CAPS (checked after the 512-char cap and BEFORE the estimate):
+    repeat nesting depth at most 4 (a repeat inside a repeat inside ...;
+    groups add no repeat depth by themselves), capturing / lookaround /
+    atomic group nesting depth at most 8, any-group nesting depth at most 32
+    (this also bounds parser recursion); depth equal to the cap is allowed,
+    one more is refused. Over a cap the answer is 422 `{"error": "pattern too
+    complex", "limit": "nesting", "max_depth": N}` where N is the CAP value
+    exceeded (first in the order repeat, special group, any group), with no
+    `estimate`, and nothing is compiled. Why: every nesting bypass found
+    while building this needed depth of 10 or more, while ordinary patterns
+    (an IP address, a date, an ATX heading, an email, a CSV quoted field, a
+    markdown link, a short phrase, semver) have repeat depth of 2 or less;
+    capped worst cases compile cheaply (4-deep `{16}`, 4-deep `{17}`, 5-deep
+    `{9}` all within 41 MB). Stated limit: the caps bound depth, NOT cost;
+    wide but shallow shapes are left to the estimate, the calibration cells
+    and #1116. Honest note on what counts as a group: a plain non-capturing
+    group `(?:...)` is not a node in the stdlib parse tree (`(?:a)` parses to
+    just the literal), so it adds to no depth and no cost; the any-group cap
+    counts only the group kinds that are tree nodes (flag-only groups such as
+    `(?i:...)`, capturing groups, lookarounds, atomic groups, conditionals).
+    Parentheses are not counted textually.
+    Compile cost is bounded by structural nesting caps and a pre-compile estimate that refuses known expansion shapes. It is not yet bounded by memory (#1116), so regex search is for our own seats until #1116 lands.
+
+    Relation to the kind layer: these routes' argument and response shapes
+    are the readable kind's `read`/`search` action contract when
+    docs/design/things-that-grow.md S2 lands, the routes then becoming alias
+    targets inside the authorized `act` path.
 
 POST /umwelt/create_thing   {agent, place, spec}
     spec = {name, description, kind, source, exec_command?, metadata?}
@@ -519,8 +789,8 @@ POST /umwelt/heartbeat   {agent, state_hint, on_loop?, activity_line?}
   → {agent, state_hint, last_beat_at, throttled}
 
 - `agent` — CALLER-DECLARED v0 identity, the SAME forgeable posture every
-  verb in this document uses (forgeable v0, same posture as every verb,
-  ob_0938) — write-scoped to the declaring agent's own row (a beat can only
+  verb in this document uses (forgeable v0, same posture as every verb)
+  — write-scoped to the declaring agent's own row (a beat can only
   write the row named by the body's `agent`; there is no separate
   row-target field), public-read via `look_at`'s `status` block above.
   This is NOT a capability-channel frame — the writer is a harness hook
@@ -596,6 +866,53 @@ POST /umwelt/update_thing   {agent, thing, patch}
     typed and untyped things alike; see "Typed things" below for the full
     rule, including the extra `status`/`kind_id` 422 that applies once the
     target already carries `metadata.kind_id`).
+
+POST /umwelt/edit           {agent, thing, file?, field?, old_string, new_string,
+                             replace_all?}
+  → {thing_id, field, file?, replaced, first_line, last_line, excerpt,
+     updated_at}
+    umwelt #1154: Claude Code's `Edit` for a thing's text, with its argument
+    names: `old_string` must match exactly once, or pass `replace_all`. The
+    gate is `update_thing`'s own (one helper serves both routes): the same
+    400 / 401 / 404 / avatar 422 / 403 / `anyone` read gate, byte for byte,
+    then the same blueprint / kinddef validation and description cap on the
+    EDITED text. A genuine change stamps `updated_at` / `updated_by` and
+    writes one `content_updates` row (`source` for a file edit, `description`
+    for a description edit). NO use row.
+    `field` (default `"source"`) is `"source"` or `"description"` — a board
+    header is a description, which the harness has no analogue for. `file`
+    is a key of the source dict: optional when there is exactly one file
+    (`read`'s rule and error), 422 when unknown, when omitted among several,
+    or given with `field: "description"`. `old_string` (non-empty) and
+    `new_string` are strings of at most 32,768 chars each; equal strings,
+    a non-bool `replace_all`, or any other `field` are 422.
+    Matching is exact and case-sensitive, on the text AS STORED (a CRLF file
+    is matched with its `\r\n`; the `read` view folds them), counted without
+    overlap. Zero matches is 409 `{matches: 0, thing, field, file?}`, with a
+    hint when the stored text has `\r` and `old_string` does not; 2+ matches
+    without `replace_all` is 409 `{matches: N, lines: [first five 1-based
+    line numbers], ...}` ("pass replace_all or widen old_string"). 409, not
+    404: 404 means "no such thing", and a stale `old_string` is a conflict
+    with the current content. The match runs INSIDE the write transaction
+    (BEGIN IMMEDIATE) on a fresh read, so the uniqueness of `old_string` is
+    the concurrency guard: two parallel edits of one unique string, exactly
+    one wins and the other is a 409 `matches: 0`. There is no caller-side
+    version stamp. (A `source_append` effect still reads and writes outside
+    that transaction: #1156.)
+    Result caps, 422: a description over 8192 chars (`update_thing`'s check
+    and message); the edited file over 4 MiB in UTF-8 bytes
+    (`_THING_CONTENT_ROW_BYTES`), a cap per file. A source tree with a file
+    that is not UTF-8 text is a 422 too, for a source edit (`edit` works on text files; replace
+    that source with `update_thing`). The request body is capped at
+    1,048,576 bytes (`_EDIT_ROW_BYTES` in `_WRITE_BODY_ROWS`): two maximal
+    32,768-char strings of astral characters are 2 x 32,768 x 12 = 786,432
+    bytes of JSON escapes, plus the fixed fields. The cap is over the two
+    strings only: the thing itself may be any size.
+    Reply: `replaced` (the count), `first_line` / `last_line` (the 1-based
+    lines the first replacement spans in the NEW text; `last_line` holds its
+    last character), `excerpt` (those lines and up to 3 either side, raw,
+    `\n`-joined, each cut at 2000 chars, the whole at most 1,500 chars).
+    Never the whole text. `file` is absent for a description edit.
 
 POST /umwelt/act            {agent, thing, action, args?}
   → {thing_id, action, by, status, log_entry}
@@ -931,14 +1248,37 @@ put source text in the response — instead:
 ```
 {outcome: {
     kind: 'readable', size_class: 'tome'|'library',
-    briefing: "'<name>' is a <size_class> — too large to open inline. "
-              "Download it to your filesystem with `download <name> "
-              "<path>` and read it there.",
+    briefing: "'<name>' is a <size_class> (<N> lines in <F> file(s)) — "
+              "too large to open whole.\n"
+              "Read part of it: read <name> --offset N --limit M · search "
+              "it: search <name> PATTERN · whole file: download <name> PATH",
     metadata: <thing's own metadata>,
     manifest: {name, description, size_class, content_length_estimate,
                author, created_at, metadata_keys},
+    toc: {files: [{file, lines, chars}],
+          headings: [{file, level, title, start_line, end_line, chars}],
+          shown, total},
 }}
 ```
+
+`toc` (umwelt #647) is derived at read time and never stored. A heading is an
+ATX markdown heading (`#`×1-6, whitespace, text) outside a fenced code block
+(``` or ~~~). Its range runs to the line before the next heading of the same
+or a higher level (an outline: a `##` range includes its `###`s), or to the
+end of its file; `chars` is that range's size (one newline counted per line);
+`title` is cut at 120 chars. At most 60 headings are returned: the deepest
+level is dropped first until the rest fit (and if even the shallowest level
+alone is more than 60, its first 60 in file order are kept); `shown` / `total`
+report it. A tome with no headings gets `headings: []` and `files` still gives
+the line counts a reader needs to page with `read`. The old keys (`kind`,
+`size_class`, `metadata`, `manifest`) are unchanged; only `briefing` and the
+new `toc` differ from before. `look_at`'s `gate_notice` is the same ONE
+template with only the parenthesised extent changed: `look_at` reads no source
+and says "(about N tokens)" from the stat-based `content_length_estimate`,
+while `use()` (which reads the source anyway) says "(N lines in F file(s))".
+`gate_notice` is set only for a `readable`: a non-readable gated thing gets
+none, because `read`/`download` refuse it and counting its lines would
+disclose access-gated source.
 
 The deep read happens outside the world's render path, as ordinary OS
 operations on the thing's on-disk `source` dir (Lei's repo-thing answer —
@@ -950,7 +1290,9 @@ bare "examine it with your own tools", no sanctioned way to actually get the
 content). It now names `download` as the egress path — see `POST
 /umwelt/download` in the Verbs section above. The gate's actual RENDER
 behavior is unchanged (still no inline source for `tome`/`library`); only
-the notice text changed, to point at the new verb.
+the notice text changed, to point at the new verb. umwelt #647 then added the
+partial-read verbs (`POST /umwelt/read`, `POST /umwelt/search`) and a table of
+contents, so the notice now names all three ways in.
 
 `forge` is **sugar over `create_thing`**, not over the shell — a convenience that
 assembles a spec from loose strings and calls `create_thing`. It is itself a
@@ -988,7 +1330,7 @@ loud 422 — a malformed kind fails right away, not silently at first
   "state_keys": ["<key_name>", ...],
   "actions": {
     "<action_name>": {
-      "callers": ["author" | "place_owner" | "anyone" | "granted" | "named:<agent>", ...],
+      "callers": ["author" | "place_owner" | "anyone" | "granted" | "package" | "named:<agent>", ...],
       "requires": ["<arg_name>", ...],
       "from": ["<status>", ...],
       "to": "<status>" | null,
@@ -1039,6 +1381,12 @@ loud 422 — a malformed kind fails right away, not silently at first
     author trusted with `can_grant` — has granted access to at RUNTIME,
     not something bakeable into a fixed caller string at kinddef-creation
     time; see `grant_caller`/`revoke_caller` below, the only write path),
+    `package` (umwelt#1043 — the instance's author starts with the reserved
+    `world:` prefix, i.e. a world package made it, AND the caller is a
+    registered resident; agent names with that prefix are refused at
+    enter/register, so no resident can be that author. It grants nothing
+    unless an action names it: the charge board's `add-entry` does, and
+    `edit-entry`, `retire-entry`, grants and `rotate-log` do not),
     or `named:<agent>` (an exact canonical-agent match — folded through the
     same `_canonical_agent` case-fold every other identity comparison uses,
     umwelt #73).
@@ -1194,6 +1542,221 @@ loud 422 — a malformed kind fails right away, not silently at first
 > documented in this JSON schema snippet or bullet list above — this
 > predates #400 and is out of #400's scope to fix.
 
+**Project owners and the work card (umwelt #1051).** Who owns a project is a
+field the engine knows, and a work card lists its subject's projects without
+anyone editing the card.
+
+- *Table* `project_owners(project_id, agent, role TEXT NOT NULL DEFAULT '',
+  added_by, added_at)`, `PRIMARY KEY (project_id, agent)`. `agent` is the
+  case-folded identity (`Sol` and `sol` are one owner). It is a new table:
+  `init_db` creates it empty on a fresh DB and on an existing one, touches no
+  existing row, and **never backfills owners** (not from `created_by`; the
+  per-project backfill is a hand-run step after rulings). `role` is a short
+  free-text label, at most 32 characters after trimming, one line. The table
+  is created by `init_db`, which the server's startup (`main`) runs on an
+  existing database; opening a database through `create_app` alone skips
+  `init_db`, so on an old database `project_owners` would not exist and
+  `GET /umwelt/projects` would fail (500) until `init_db` has run. That is
+  true of any table added to the schema, not specific to this one.
+- *Founder.* `create_project_with_board` writes the founder as the first owner
+  in the same transaction as the project, its room and its board.
+- *Effects* (members of the closed set, bound to the acting board's OWN
+  project through `thing.metadata.project_id`, like `project_set`; no key in
+  the effect row or in `args` can name another project):
+  `{"type": "project_owner_add", "agent_arg": "<arg>", "role_arg": "<arg>"}`
+  (`role_arg` optional; a re-add updates the role, absent role keeps the old
+  one) and `{"type": "project_owner_remove", "agent_arg": "<arg>"}`. The
+  agent argument must be a string with no control characters and at most 40
+  characters (it is case-folded); otherwise the call is refused. A role that
+  is not a string (a number, `null`, a list) is refused, not coerced. The
+  `project_board` kind gains the actions `add_owner` (requires `agent`,
+  optional `role`) and `remove_owner` (requires `agent`). Existing boards
+  receive them at the next boot, because the engine refreshes the
+  `project_board` kinddef itself (`_ensure_engine_kinddef`).
+- *Caller rule*, enforced inside the effect from the acting agent: the
+  project's owners and `lei` may add or remove an owner. On a project with no
+  owners (every project older than this change), `lei` or the project's
+  `created_by` may add the first owner; after that it is owners-plus-Lei. A
+  project keeps at least one owner while it is `active` or `paused` (Lei
+  included); `done` and `archived` projects are exempt. Refusals arrive in
+  `effect_failures` with a reason that names the rule. The rule is decided
+  INSIDE the write statement, not before it: `add_owner` is one guarded
+  `INSERT ... SELECT ... WHERE` (actor is Lei, or already an owner, or the
+  project has no owner rows and the actor is its `created_by`), with the role
+  update behind the same guard, and `remove_owner` is one `DELETE` that also
+  requires the actor to still be an owner (or Lei) and, while the project is
+  active or paused, another owner to remain. SQLite runs a statement under
+  its single write lock, so two racing requests cannot both pass a check
+  that only one of them could satisfy in any serial order. A lost race gets
+  the same named-rule message as a sequential refusal.
+- *Registered target, notification, self-removal.* `add_owner` requires the
+  TARGET (case-folded) to be a registered agent or a human resident (an
+  avatar exists, or the name is in the human-residents list) and otherwise
+  refuses with `'<name>' is not a registered agent or human resident`, before
+  any write; this is add-only, so an existing owner row whose name is not
+  registered can still be removed. When `add_owner` inserts a NEW owner row
+  for someone other than the actor, that person gets an ordinary addressed
+  crossing in their Post (no wake; the sender is the acting agent): one
+  sentence naming the project label, the actor and the role, and, when the
+  project has a room, the `move_to` call alone on its own line. Nothing is
+  sent for a role-only change, a no-op re-add, a self-add or a refused add. A
+  failed notification never undoes the add: the owner row stays and the
+  failure is in `effect_failures`. An owner may always remove THEMSELF (still
+  subject to keep-one). A project label shown in engine-composed text (the
+  notification, the work card, the board title) that holds a control
+  character prints as `(unprintable label)`.
+- *What this does not protect.* `added_by` records the DECLARED acting agent
+  and does not authenticate it: identity is trust-scoped until credentials
+  land. Keep-one is advisory until changes to a project's status, label and
+  description carry the same owners-plus-Lei rule (umwelt #1066): today
+  anyone can set a project's status, and keep-one only binds active and
+  paused projects.
+- *Archive and restore (umwelt #1074).* Two more effects, bound to the acting
+  board's OWN project like the owner effects (no key in the effect row or in
+  `args` can name another project; the actions take no arguments, and any
+  argument is refused as unconsumed): `{"type": "project_archive"}` and
+  `{"type": "project_restore"}`, reached by the `project_board` actions
+  `archive_project` and `restore_project` (existing boards get them at the
+  next boot). Who may call: the project's owners (rows in `project_owners`),
+  plus `lei` and `kepler`, named explicitly (there is no maintainer caller
+  class); decided inside the guarded write from the server-derived agent, not
+  at the route (`callers` stays `anyone`). Archive works from any status
+  except `archived`; in ONE transaction the status becomes `archived` and the
+  project's room is reparented straight under `place_archived`, so the room's
+  things and child rooms travel with it; no thing row is touched, and things
+  already carried out of the room stay where they are. Restore works only from
+  `archived`, refuses a project with no owner row (add an owner first), and in
+  one transaction sets the status to `active` (always `active`: not the prior status, whatever it was before
+  the archive) and returns the room to its
+  pre-archive parent when that parent still exists and the move is sound
+  (it is not the room itself or `place_archived`, and would create no cycle);
+  otherwise the room goes to the workshop and the result names the fallback
+  (`fallback` is a short code, `fallback_text` one plain sentence, and
+  `restored_to` is the new parent). The pre-archive parent is recorded by
+  archive, with no schema change, in the room's own `places.metadata` under
+  the key `archived_from_parent` (merged into the existing object; restore
+  removes it). Nothing is recorded when the room had no parent, was already
+  under `place_archived`, or its metadata is not a JSON object. Because
+  `update_place` replaces the whole metadata object, an owner who replaces the
+  room's metadata after archive removes the record, and restore then goes to
+  the workshop (`fallback` `no_record`). The caller need not be standing in
+  the room. Each refusal is its
+  own named reason in `effect_failures` and writes nothing: not an owner, lei
+  or kepler; already archived / not archived; no owner (restore); the project
+  has no room; the room row is missing; `place_archived` (or the workshop)
+  does not exist, and is never created by the engine; the room is the target
+  itself; the move would create a cycle (for restore, the target is the one
+  the room would actually go to, so a bad recorded parent falls back to the
+  workshop instead of refusing). A success is one `effect_results` entry
+  `{project, status, room, moved_to, things_in_room, child_rooms}`, plus
+  `archived_from` (the parent recorded, or null) for archive, and
+  `restored_to`, `fallback`, `fallback_text` for restore.
+  Nothing archives automatically: marking a project `done` moves no room, and
+  there is no intermediate `place_recently_done` hop. A project whose status
+  is already `archived` while its room is NOT under `place_archived` (reachable
+  only through the pre-existing `POST /umwelt/projects/<id>/update` route,
+  which sets status without moving the room) is refused by archive as
+  "already archived"; the move is finished by hand with `set_parent`, and that
+  route's missing ACL and pairing is tracked separately (issue #1066).
+- *Surfaces.* The board's rendered header gains an `owners:` line (role in
+  parentheses). `GET /umwelt/projects` and `GET /umwelt/projects/<id>` return
+  `owners: [{agent, role}]`.
+- *Work card.* `use()` on a readable whose `metadata.work_card` is `true` and
+  whose `metadata.owner` is a non-blank string with no control characters and
+  at most 40 characters (anything else: no section, no error) appends one
+  extra `content` entry, `derived at read time: projects owned`:
+  `Projects owned by <owner> (N):` (N is the total), then per project two
+  lines, `- <label> [<status>]` and, alone on its own line with a 2-space
+  indent, the runnable call `move_to {"place": "<id>"}` (a project with no
+  room is the single line `- <label> [<status>] (no room)`), ordered active,
+  paused, done, archived and then by label. At most 50 projects are listed;
+  the rest become one line `... and <M> more`. The last line is `card.md
+  last changed <date>` from the thing's own `updated_at` (`created_at` if
+  never edited). It is computed for the card's subject, not the reader, on
+  every read, and stored nowhere. Every other thing's `use()` output is
+  unchanged. Known limit: the MUD client re-wraps multi-line content as one
+  paragraph (`mud.render_use_outcome`), which can break a printed call there;
+  that is a client defect, not specific to this section.
+
+**The Project Register (umwelt #1074, slice A).** A read view of every
+project, derived on each read like the work card and stored nowhere.
+
+- *Flag.* `use()` on a readable whose `metadata.project_register` is
+  literally `true` (not `"true"`, `1` or a truthy object) appends one extra
+  `content` entry, `derived at read time: project register`. The flag is
+  ordinary metadata set at forge time through `create_thing`, exactly like
+  `work_card`; there is no privileged path. Every other readable is unchanged
+  (including the refusal `readable things take no args`: a register's `args`
+  are its filters, and no other readable accepts any). No write happens
+  beyond the usual use-telemetry row.
+- *Default view* (no args): `Project Register: N projects (A active, P
+  paused, D done, X archived)` over all projects; `Open projects by owner:`
+  with one `- <owner>: <count>` line per owner over active and paused
+  projects (a project with k owners counts once for each), most first;
+  `Open projects with no owner: K` and the labels; `Open projects (active,
+  paused):` one row each, active before paused, then by label: `- <label>
+  [<status>] owners: <a, b (role)>, updated <date> (<N>d ago), open tasks: <K>`
+  (K counts the project's tasks, subtasks included, whose status is not `done`
+  or `cancelled`, computed on read; K under 3 adds ` (<3 next steps)`),
+  followed, when the project has a room, by `move_to {"place": "<id>"}` on its
+  own line, then a third line `  look_at {"thing": "<board id>"}` when a live
+  `project_board` thing is bound to the project (by its `project_id` metadata,
+  wherever it sits); both calls are JSON-built and run as printed (a project
+  with no room ends its row with `(no room)`; the count and board line are on
+  open rows only); `Done, awaiting
+  archive:` the same rows for `done` projects, without the count or board (the age counts from the last
+  update: no done date is stored); `Archived (hidden): X. Add arg 'all' to
+  list them.`; and `Rooms with no project row:` the direct child places of the
+  place the register stands in that no project row points at, as `- <label>
+  [<place id>] (<n> things)`, or `(none)`. A room's existence, label and id are
+  public, but its thing count is its interior: for a room the viewer may not
+  enter (private, and not theirs) the line is `- <label> [<place id>]
+  (private)`, and the count is never queried (umwelt#538 rule 2; the viewer is
+  the agent `use()` resolved, none when blank).
+- *Structural rooms (umwelt #1084).* A room whose own `metadata.structural`
+  is literally `true` (not `"true"`, `1` or a truthy object) is a structural
+  room: one meant to hold things with no project by design (an archive, a
+  recently-done shelf). It leaves the `Rooms with no project row:` list and is
+  named instead on ONE line under it, `Structural (no project by design):
+  <label>, <label>`, in the same order the list uses and through the same
+  control-character guard. The line prints only when at least one such room
+  exists, carries no thing counts (a room the viewer may not enter is named
+  and never counted), and lives inside the 20000-character cap. A flag never
+  hides a room. A room that is a project's room stays a project even when
+  flagged: it keeps its row, owners and `move_to` line and is not on the
+  structural line. The flag is ordinary place metadata, set through
+  `update_place` under the same permission check as any other place setting
+  (owner-less places by any agent, owned places by their owner); there is no
+  new ACL and no schema change; `update_place` REPLACES the room's whole
+  `metadata` object, so setting `structural` through it means sending the
+  room's other keys (for example `lane_tiles`) along with it, or they are
+  lost. The line names at most 20 rooms (the gap list's limit), then ends
+  `, ... and N more` with N the number of further flagged rooms, so a world
+  with hundreds of flagged rooms still prints the line. With no unflagged loose room the section
+  still prints its header and `(none)`, then the structural line.
+- *Args* (`use()`'s list of strings; never an act, because every act writes to
+  the thing's capped action_log): `owner=<agent>` (case-folded; matches any of
+  a project's owners; may be repeated, and then the project must have every
+  one), `status=<active|paused|done|archived>`, `q=<text>` (a
+  case-insensitive substring of the label, the description or an owner name;
+  at most one) and the bare word `all` (also list archived projects;
+  `status=archived` implies it). All filters AND. A filtered view is the
+  header (still counting ALL projects), `Filter: <the args as typed>`,
+  `Matching: M`, then the matching lists, or `No projects match.`; the
+  by-owner stats and the rooms section belong to the default view. A bad
+  argument (an unknown key, a bad status, an empty `owner=` or `q=`, a second
+  `q=`, an empty argument) is never ignored and never raises: the entry is the
+  single line `register: <reason> (allowed: owner=, status=, q=, all)` and no
+  table.
+- *Bounds.* At most 60 open rows, 40 done rows and 40 archived rows (then
+  `... and K more (narrow with owner= / status= / q=)`), 10 ownerless labels,
+  30 owner lines, 20 rooms, and 20000 characters in all (cut at a line, with
+  a final `... output truncated` line). One query for the projects, one for the
+  owners, and a constant number for the rooms, however many projects exist.
+  Every label, owner name, role, room label and echoed
+  filter prints through the same guard as the work card: text holding a
+  control character prints as `(unprintable label)`.
+
 **`act()` is the one new verb** (`POST /umwelt/act`, see the Verbs section
 above for the full error map): it resolves the instance's kind chain,
 finds the action, authorizes the caller, validates required args, checks
@@ -1278,7 +1841,11 @@ content editing**, a cousin of `update_thing`/`add_link`, not the cross-agent
 
 Body: `{agent, thing, op, item?, text?}`. Author-only — same trust model as
 `update_thing`: `agent` is caller-declared (`_canonical_agent`-folded, umwelt
-#73) and compared against the thing's canonical `author`.
+#73) and compared against the thing's canonical `author`. One exception
+(umwelt#1043): on a checklist a world package made (its author starts with the
+reserved `world:` prefix), any registered resident may `check`, `uncheck` and
+`reset`; `add`, `remove` and `edit` stay author-only (403). `reset` only clears
+done marks, so it adds no power beyond `uncheck`.
 
 Ops (closed set — an unrecognized op is a loud 422, never a silent no-op):
 

@@ -64,8 +64,8 @@
 // directly on click. See openInteractMenuForAvatar/openInteractMenuForThing
 // below.
 //
-// Avatar sprites shipped 2026-07-24 (world-finishing sprint, dv_1155/
-// ob_0431) — see buildAvatarElement's sprite-vs-fallback split below.
+// Avatar sprites shipped 2026-07-24 (world-finishing sprint) — see
+// buildAvatarElement's sprite-vs-fallback split below.
 // (A general text input/say bar outside the interact-menu's own talk
 // sub-view shipped later, see the webrender-action-bar note further down
 // this file.) The crossings sidebar is unchanged from M1.
@@ -93,8 +93,8 @@
 //
 // Avatar sprites (a real sprite pipeline for avatars, as opposed to these
 // overlays — see the module-level design notes above buildFaceElement and
-// buildEmojiBubble) shipped 2026-07-24 (world-finishing sprint, dv_1155/
-// ob_0431): buildAvatarElement now renders scene.avatars[i].sprite_ref
+// buildEmojiBubble) shipped 2026-07-24 (world-finishing sprint):
+// buildAvatarElement now renders scene.avatars[i].sprite_ref
 // through the same sprite-wrap pattern buildThingElement uses, falling
 // back to the pre-mint green circle when unset.
 // (A general text input/say bar and use()/act wiring beyond `move` both
@@ -238,7 +238,7 @@
 //     by lane instead of one flat list, still built in the SAME sky ->
 //     land -> road source order render() always used.
 //   - `allNavItems`: every laneItems entry merged and sorted by each
-//     element's own `offsetLeft` (real screen-x, not source order).
+//     element's #street-frame x via streetX() (umwelt #1132; not source order).
 //     `cursorIndex` now indexes INTO allNavItems, so ArrowLeft/ArrowRight
 //     walk the street in actual screen-x order, independent of lane —
 //     "the avatar moves left/right on SCREEN, regardless of which lane
@@ -506,7 +506,7 @@ const streetRoadEl = document.getElementById("street-road");
 // still holds unchanged).
 let laneItems = { sky: [], land: [], road: [] };
 // allNavItems: every laneItems entry merged into one list and sorted by
-// each element's own on-screen `offsetLeft` (real post-layout screen-x,
+// each element's #street-frame x via streetX() (umwelt #1132; post-layout,
 // not source/append order) — built once at the end of render(), after
 // every item is already appended to the DOM (offsetLeft forces a layout
 // flush if needed, same reliance the pre-#323 updateCursorPosition already
@@ -539,10 +539,27 @@ let navColumns = [];
 // module state beyond the epsilon constant) so it's a clean drop-in target
 // for a future #274 slot-ordinal replacement (module-header "umwelt #342"
 // composability note), and independently testable.
+// umwelt #1132: streetX(el) — `el`'s left offset in #street's coordinate
+// frame, the frame updateCursorPosition writes selfCursorEl.style.left in.
+// Raw offsetLeft is relative to el.offsetParent, and that differs by band:
+// sky/land items' offsetParent is #street, but road items' is #street-road
+// (position: relative, index.html), which itself sits `padding-left` px in
+// from #street's edge. Walk offsetParent up to #street adding each
+// intermediate parent's offsetLeft (never #street's own). Bounded: an
+// element not inside #street gets its plain offsetLeft.
+function streetX(el) {
+  let x = el.offsetLeft;
+  let p = el.offsetParent;
+  while (p && p !== streetEl) {
+    x += p.offsetLeft;
+    p = p.offsetParent;
+  }
+  return p === streetEl ? x : el.offsetLeft;
+}
 function buildNavColumns(sortedItems) {
   const columns = [];
   for (const item of sortedItems) {
-    const x = item.el.offsetLeft;
+    const x = streetX(item.el);
     const last = columns[columns.length - 1];
     if (last && Math.abs(x - last.x) <= COLUMN_EPSILON_PX) {
       last.items.push(item);
@@ -682,10 +699,11 @@ function updateCursorHighlight() {
 // present in this scene) so it visually tracks the current horizontal
 // stop — "walks left/right... horizontally aligned under" whichever item
 // (in ANY lane) allNavItems[cursorIndex] points at, per umwelt #323's
-// absolute-horizontal-movement requirement. The target element and
-// `selfCursorEl` share `#street` as their offsetParent (see render()'s
-// `streetEl.appendChild(el)` for the self avatar, vs. streetSkyEl/
-// streetLandEl/streetRoadEl for everything else) — `#street` has
+// absolute-horizontal-movement requirement. `selfCursorEl` is positioned
+// in `#street`'s frame (render() appends it to streetEl), and column.x is
+// measured in that same frame by streetX() — a road item's own
+// offsetParent is `#street-road` (position: relative), so its raw
+// offsetLeft is NOT in #street's frame (umwelt #1132). `#street` has
 // `position: relative` (index.html) specifically so this coordinate math
 // holds regardless of the street's own scroll position (offsetLeft/
 // offsetTop are unaffected by scrollLeft/scrollTop on an ancestor).
@@ -1108,6 +1126,18 @@ async function logout() {
   stopInboxPolling(); // umwelt#529: belt-and-suspenders -- setGateActive(true) already does this
   inboxUnseenCount = 0;
   inboxUnseenHasWake = false;
+  // umwelt#787 part 2 follow-up: without this, a stale panel from the
+  // outgoing avatar can still be on screen after switching avatars --
+  // "Mark all read" there would write a boundary derived from THIS
+  // avatar's data under the NEXT avatar's storage key (inboxReadSeqKey()
+  // always reads the CURRENT state.identity). Reset all three so no stale
+  // data/boundary/toggle survives the switch; startInboxPolling() already
+  // re-seeds inboxReadSeq per avatar on the next login -- this just makes
+  // sure nothing stale is readable in the gap before that happens.
+  inboxLastData = null;
+  inboxReadSeq = null;
+  inboxShowAll = false;
+  if (inboxWindow) inboxWindow.close();
   renderInboxBell();
 }
 
@@ -1952,6 +1982,14 @@ function clearComposerDraft() {
 const REPLY_QUOTE_BODY_LIMIT = 80;
 
 function _truncateReplyBody(body) {
+  // umwelt #1059: the quote is ONE `> sender: ...` line, so any whitespace
+  // run (newline, tab, CR, U+2028/9, repeated spaces) collapses to a single
+  // space and the ends are trimmed -- BEFORE the length check and cut, so the
+  // 80 are counted on what is actually quoted. A body with a newline in its
+  // first 80 chars (proposal notifications, #1057) would otherwise leave a
+  // prefill line that does not start with `> `. Only the body is collapsed;
+  // the sender name is left alone by the caller.
+  body = body.replace(/\s+/g, " ").trim();
   if (body.length <= REPLY_QUOTE_BODY_LIMIT) {
     return { snippet: body, truncated: false };
   }
@@ -2675,8 +2713,8 @@ function buildAvatarElement(a) {
   }
   el.title = a.name;
 
-  // 2026-07-24 world-finishing sprint: avatar serve-path (dv_1155/
-  // ob_0431) — same sprite-vs-fallback split buildThingElement already
+  // 2026-07-24 world-finishing sprint: avatar serve-path — same
+  // sprite-vs-fallback split buildThingElement already
   // uses for things, mirrored here now that /scene actually populates
   // a.sprite_ref for a minted avatar instead of hardcoding null. No tint
   // (avatars carry no `color` field, unlike things — gateway.py's
@@ -2884,13 +2922,13 @@ function render(scene) {
   }
 
   // umwelt #323: allNavItems — every laneItems entry merged and sorted by
-  // its own on-screen offsetLeft (real screen-x, not lane/source order),
+  // its own #street-frame x via streetX() (umwelt #1132; not lane/source order),
   // built here (after every item above is already appended to the DOM) so
   // ArrowLeft/ArrowRight (moveCursor) can walk the street in actual
   // left-to-right screen position, independent of lane. See this file's
   // module-header note ("umwelt #323") for the full design.
   allNavItems = [...laneItems.sky, ...laneItems.land, ...laneItems.road]
-    .sort((a, b) => a.el.offsetLeft - b.el.offsetLeft);
+    .sort((a, b) => streetX(a.el) - streetX(b.el));
 
   // umwelt #342: navColumns — allNavItems clustered by on-screen-x
   // proximity (buildNavColumns, this file's "umwelt #342" module-header
@@ -3101,7 +3139,29 @@ let inboxTimer = null;
 let inboxCursor = null; // null = "everything" (no since sent yet)
 let inboxUnseenCount = 0;
 let inboxUnseenHasWake = false; // any unseen item carried a granted wake
+// umwelt#1064: bumped each time openInbox() APPLIES a snapshot (non-null
+// data only). A poll tick captures it before its fetch; if it moved by
+// the time the tick resolves, the open already showed (and moved the
+// cursor past) whatever that tick fetched, so the tick drops its result.
+let inboxOpenGen = 0;
 let inboxWindow = null; // lazily created ggWindow (gadgets.js), reused
+
+// umwelt#787 part 2: the unread model's own state. `inboxCursor` above is
+// NOT a read cursor -- it tracks what the badge has counted, and
+// startInboxPolling advances it on every 5s tick whether or not a human
+// ever opened the panel (see that function's own comment). Building
+// unread on top of it would make every item permanently "already read"
+// with no error and no failing test. `inboxReadSeq` is the SEPARATE
+// value: the highest crossing `seq` the human has actually seen inside an
+// OPENED panel. `inboxShowAll` is not part of the read model at all --
+// it's a pure display toggle, deliberately not persisted (see below).
+let inboxReadSeq = null; // null = "everything is unread" (no open yet)
+let inboxShowAll = false; // module-level, NOT persisted -- resets to
+// unread-only on every page load, same as every other in-memory-only UI
+// toggle in this file (no localStorage key for it, unlike inboxReadSeq).
+let inboxLastData = null; // umwelt#787 part 2: cache of the last fetched
+// /inbox response, so "Mark all read" and the Show all/unread-only toggle
+// can re-render from already-fetched data without a refetch.
 
 // umwelt#529 (Zephyr's design, inherited): the cursor is caller-tracked
 // (localStorage), keyed by avatar -- there is no server-side per-human
@@ -3123,6 +3183,29 @@ function loadInboxCursor() {
 function saveInboxCursor(position) {
   if (state.identity === "spectator" || position === null || position === undefined) return;
   window.localStorage.setItem(inboxCursorKey(), String(position));
+}
+
+// umwelt#787 part 2: `inboxReadSeq`'s own persistence -- same
+// spectator guard, same Number.isFinite parse guard, same
+// never-persist-for-spectator rule as inboxCursor's pair above, keyed by
+// avatar the same way. This is deliberately a SEPARATE localStorage key
+// from inboxCursorKey() -- the two values track different things (see
+// the state comment above) and must never share a key or a variable.
+function inboxReadSeqKey() {
+  return `umwelt_inbox_read_${state.identity}`;
+}
+
+function loadInboxReadSeq() {
+  if (state.identity === "spectator") return null;
+  const raw = window.localStorage.getItem(inboxReadSeqKey());
+  if (raw === null) return null;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+function saveInboxReadSeq(position) {
+  if (state.identity === "spectator" || position === null || position === undefined) return;
+  window.localStorage.setItem(inboxReadSeqKey(), String(position));
 }
 
 async function fetchInbox(since) {
@@ -3158,9 +3241,88 @@ function renderInboxBell() {
   }
 }
 
-function renderInboxCrossingItem(c) {
+// umwelt#787 part 2: combines the two /inbox buckets (`to_agent` and
+// `mentions`) into ONE seq-ordered list. This is the actual fix for Lei's
+// bug -- the two buckets used to render as stacked sections ("Direct to
+// you" then "Mentioned you"), so a mention could only ever appear BELOW
+// every direct row, however recent it was. Tagging `kind` here (rather
+// than re-deriving which bucket an item came from later) is what lets the
+// per-row chip and the divider/unread logic below stay bucket-agnostic.
+function mergeInboxItems(data) {
+  const toAgent = ((data && data.to_agent) || []).map((c) => ({ ...c, kind: "direct" }));
+  const mentions = ((data && data.mentions) || []).map((c) => ({ ...c, kind: "mention" }));
+  const merged = [...toAgent, ...mentions];
+  merged.sort((a, b) => {
+    // Missing/non-finite seq sorts LAST and must not poison the
+    // comparator with NaN (spec: do not rely on `-` on undefined).
+    const aFinite = Number.isFinite(a.seq);
+    const bFinite = Number.isFinite(b.seq);
+    if (aFinite && bFinite) return b.seq - a.seq; // DESC, newest first
+    if (aFinite) return -1;
+    if (bFinite) return 1;
+    return 0;
+  });
+  return merged;
+}
+
+// umwelt#787 part 2: `boundary` is `inboxReadSeq` (the OPEN-boundary),
+// never `inboxCursor` (the POLL cursor) -- see the state comment above
+// this block for why conflating the two silently breaks the whole
+// feature. `boundary === null` means "no open yet", i.e. everything is
+// unread.
+function isInboxItemUnread(item, boundary) {
+  return boundary === null || item.seq > boundary;
+}
+
+// Highest finite seq across `items`, or null for an empty/all-non-finite
+// list -- used both to advance `inboxReadSeq` on open and by "Mark all
+// read".
+function inboxMaxSeq(items) {
+  let max = null;
+  for (const item of items) {
+    if (Number.isFinite(item.seq) && (max === null || item.seq > max)) {
+      max = item.seq;
+    }
+  }
+  return max;
+}
+
+// umwelt#787 part 2: pure planning step (deliberately DOM-free) -- decides
+// which rows renderInboxContent should draw and where the "New since you
+// last looked" divider goes, if anywhere. Kept separate from DOM
+// construction so this logic is real-execution-testable under Node (this
+// suite has no headless-browser/DOM harness -- same no-headless-browser
+// limitation documented elsewhere in this file's own tests).
+function planInboxRows(merged, boundary, showAll) {
+  const unreadItems = merged.filter((item) => isInboxItemUnread(item, boundary));
+  const unreadCount = unreadItems.length;
+  let rows;
+  let showNothingNewNote = false;
+  if (showAll) {
+    rows = merged;
+  } else if (unreadCount > 0) {
+    rows = unreadItems;
+  } else if (merged.length > 0) {
+    // Unread-empty must not render a blank panel -- fall back to the
+    // most recent 20 items with a "Nothing new" note.
+    rows = merged.slice(0, 20);
+    showNothingNewNote = true;
+  } else {
+    rows = [];
+  }
+  // The divider sits between the last unread and first read row, and only
+  // when BOTH groups are non-empty. `merged` is seq-DESC and unread items
+  // always sort before read items (see mergeInboxItems/isInboxItemUnread),
+  // so in "show all" mode the split is exactly at index `unreadCount`.
+  const dividerIndex = (showAll && unreadCount > 0 && unreadCount < rows.length)
+    ? unreadCount : -1;
+  return { rows, unreadCount, dividerIndex, showNothingNewNote };
+}
+
+function renderInboxCrossingItem(c, opts) {
+  const unread = Boolean(opts && opts.unread);
   const item = document.createElement("div");
-  item.className = "inbox-item";
+  item.className = unread ? "inbox-item inbox-item-unread" : "inbox-item";
 
   const header = document.createElement("div");
   header.className = "inbox-item-header";
@@ -3168,6 +3330,10 @@ function renderInboxCrossingItem(c) {
   sender.className = "inbox-item-sender";
   sender.textContent = c.sender || "";
   header.appendChild(sender);
+  const kindChip = document.createElement("span");
+  kindChip.className = "inbox-item-kind-chip";
+  kindChip.textContent = c.kind === "mention" ? "@mention" : "direct";
+  header.appendChild(kindChip);
   const crossingTime = formatCrossingTime(c);
   if (crossingTime) {
     const time = document.createElement("span");
@@ -3192,15 +3358,39 @@ function renderInboxCrossingItem(c) {
   return item;
 }
 
-// Renders BOTH buckets, newest-first (the API returns ascending seq, same
-// order every other crossings feed uses -- reversed here for display, same
-// as renderCrossing's own list already does for the always-visible panel).
-function renderInboxContent(data) {
-  const frag = document.createDocumentFragment();
-  const toAgent = (data && data.to_agent) || [];
-  const mentions = (data && data.mentions) || [];
+// umwelt#787 part 2: `opts` is `{ boundary, showAll }`. One merged list,
+// newest first, unread rows visually distinguished, with a header row
+// (unread count / Mark all read / Show all toggle) above it. Replaces the
+// old two-stacked-sections layout, which was Lei's actual bug -- a
+// mention newer than all 41 of his direct rows still rendered BELOW every
+// one of them.
+function renderInboxContent(data, opts) {
+  const boundary = opts && opts.boundary !== undefined ? opts.boundary : null;
+  const showAll = Boolean(opts && opts.showAll);
+  const merged = mergeInboxItems(data);
+  const plan = planInboxRows(merged, boundary, showAll);
 
-  if (toAgent.length === 0 && mentions.length === 0) {
+  const frag = document.createDocumentFragment();
+
+  const header = document.createElement("div");
+  header.className = "inbox-header";
+  const countEl = document.createElement("span");
+  countEl.className = "inbox-header-count";
+  countEl.textContent = plan.unreadCount === 1 ? "1 unread" : `${plan.unreadCount} unread`;
+  header.appendChild(countEl);
+  const markAllBtn = document.createElement("button");
+  markAllBtn.className = "inbox-mark-all-read-btn";
+  markAllBtn.textContent = "Mark all read";
+  markAllBtn.addEventListener("click", markAllInboxRead);
+  header.appendChild(markAllBtn);
+  const toggleBtn = document.createElement("button");
+  toggleBtn.className = "inbox-toggle-showall-btn";
+  toggleBtn.textContent = showAll ? "Show unread only" : "Show all";
+  toggleBtn.addEventListener("click", toggleInboxShowAll);
+  header.appendChild(toggleBtn);
+  frag.appendChild(header);
+
+  if (plan.rows.length === 0) {
     const empty = document.createElement("div");
     empty.className = "inbox-empty";
     empty.textContent = "Nothing addressed to you yet.";
@@ -3208,20 +3398,23 @@ function renderInboxContent(data) {
     return frag;
   }
 
-  if (toAgent.length) {
-    const label = document.createElement("div");
-    label.className = "inbox-section-label";
-    label.textContent = "Direct to you";
-    frag.appendChild(label);
-    for (const c of [...toAgent].reverse()) frag.appendChild(renderInboxCrossingItem(c));
+  if (plan.showNothingNewNote) {
+    const note = document.createElement("div");
+    note.className = "inbox-empty inbox-nothing-new";
+    note.textContent = "Nothing new.";
+    frag.appendChild(note);
   }
-  if (mentions.length) {
-    const label = document.createElement("div");
-    label.className = "inbox-section-label";
-    label.textContent = "Mentioned you";
-    frag.appendChild(label);
-    for (const c of [...mentions].reverse()) frag.appendChild(renderInboxCrossingItem(c));
-  }
+
+  plan.rows.forEach((item, i) => {
+    if (i === plan.dividerIndex) {
+      const divider = document.createElement("div");
+      divider.className = "inbox-divider";
+      divider.textContent = "New since you last looked";
+      frag.appendChild(divider);
+    }
+    frag.appendChild(renderInboxCrossingItem(item, { unread: isInboxItemUnread(item, boundary) }));
+  });
+
   return frag;
 }
 
@@ -3237,23 +3430,81 @@ function getInboxWindow() {
   return inboxWindow;
 }
 
-// Opening the panel is also how it's marked read: umwelt#529 has no
-// server-side read-cursor to advance (see /inbox's docstring), so "seen"
-// is purely local -- clearing the badge here is the whole mechanism, not
-// a display nicety layered on top of a real one.
+// umwelt#787 part 2: re-renders the panel from the already-fetched
+// `inboxLastData` -- no refetch. Shared by the toggle and "Mark all read"
+// handlers below.
+function rerenderInboxPanel() {
+  const win = getInboxWindow();
+  win.update({
+    content: inboxLastData
+      ? renderInboxContent(inboxLastData, { boundary: inboxReadSeq, showAll: inboxShowAll })
+      : "Could not load inbox.",
+  });
+}
+
+function toggleInboxShowAll() {
+  inboxShowAll = !inboxShowAll;
+  rerenderInboxPanel();
+}
+
+function markAllInboxRead() {
+  if (!inboxLastData) return;
+  inboxReadSeq = inboxMaxSeq(mergeInboxItems(inboxLastData));
+  saveInboxReadSeq(inboxReadSeq);
+  // umwelt#800 round 5 (Borges): deliberately NOT zeroing inboxUnseenCount /
+  // inboxUnseenHasWake here. Both are only ever bumped by poll ticks, and
+  // openInbox() resets them to 0 at the same moment it takes the
+  // `inboxLastData` snapshot -- so whatever they hold now was delivered
+  // AFTER that snapshot, i.e. is newer than the boundary just set, and was
+  // never displayed. Zeroing would drop the one prompt to reopen.
+  renderInboxBell();
+  rerenderInboxPanel();
+}
+
+// Opening the panel is also how the BADGE is marked read: umwelt#529 has
+// no server-side read-cursor to advance (see /inbox's docstring), so
+// "seen" (for the badge/inboxCursor) is purely local -- clearing the
+// badge here is the whole mechanism, not a display nicety layered on top
+// of a real one. umwelt#787 part 2 adds a SECOND, independent read
+// boundary (`inboxReadSeq`) for the unread-model divider/filtering above
+// -- capture-then-swap: `boundary` is captured BEFORE this open's own
+// advance, so this open renders "new since the PREVIOUS open", not
+// against a line this same open is about to draw.
 async function openInbox() {
   const win = getInboxWindow();
+  const identityAtRequest = state.identity;
   const data = await fetchInbox(null); // full inbox, not just the unseen delta
-  win.update({ content: data ? renderInboxContent(data) : "Could not load inbox." });
+  // umwelt#800 delta-round (reviewer, round 3): the human can log out --
+  // or switch avatars -- while this fetch is in flight. Nothing else in
+  // this function re-checks identity after an await, so an unguarded
+  // continuation would paint a stale avatar's inbox on top of a login
+  // gate that has since gone back up (inboxWindow anchors to
+  // document.body, not inside the gate-hidden #street -- it paints OVER
+  // the gate, not behind it), and/or persist that avatar's read boundary
+  // under the new identity's storage key. Bail out of BOTH halves below
+  // -- no win.update()/win.open() and no state writes -- the moment
+  // identity has moved out from under this request.
+  if (state.identity !== identityAtRequest || state.identity === "spectator") return;
+  const boundary = inboxReadSeq;
+  win.update({
+    content: data
+      ? renderInboxContent(data, { boundary, showAll: inboxShowAll })
+      : "Could not load inbox.",
+  });
   win.open();
   // Reviewer-fairy catch (umwelt#546): only clear the badge on a genuine
   // load -- a null `data` (network/session hiccup) must not read as "seen"
   // when the user never actually saw anything. The cursor is already
-  // correctly gated the same way below; this mirrors it.
+  // correctly gated the same way below; this mirrors it, and so does the
+  // new `inboxReadSeq` write.
   if (data) {
+    inboxOpenGen++; // umwelt#1064: invalidate any poll tick still in flight
+    inboxLastData = data;
     inboxUnseenCount = 0;
     inboxUnseenHasWake = false;
     renderInboxBell();
+    inboxReadSeq = inboxMaxSeq(mergeInboxItems(data));
+    saveInboxReadSeq(inboxReadSeq);
     if (data.to_position !== null && data.to_position !== undefined) {
       inboxCursor = data.to_position;
       saveInboxCursor(inboxCursor);
@@ -3275,9 +3526,25 @@ function stopInboxPolling() {
 function startInboxPolling() {
   stopInboxPolling(); // same belt-and-suspenders guard as crossings' own
   inboxCursor = loadInboxCursor();
+  inboxReadSeq = loadInboxReadSeq(); // umwelt#787 part 2: (re-)seed the read boundary the same way, per avatar
   inboxTimer = setInterval(async () => {
+    const identityAtRequest = state.identity;
+    const openGenAtRequest = inboxOpenGen; // umwelt#1064
     const data = await fetchInbox(inboxCursor);
-    if (!data) return;
+    // umwelt#800 delta-round (reviewer, round 3): clearInterval
+    // (stopInboxPolling) only stops FUTURE ticks -- it cannot cancel a
+    // tick that already started and is sitting on this await when
+    // logout()/an avatar switch fires mid-flight. Same bail as
+    // openInbox(): skip every state write below if identity moved out
+    // from under this tick.
+    // umwelt#1064: same shape of race against openInbox() -- if an open
+    // applied its snapshot while this tick was in flight, the open already
+    // shows these items and moved inboxCursor to its own (possibly newer)
+    // to_position. Writing this tick's result would re-badge them and could
+    // rewind the cursor. Drop it: nothing is lost, the NEXT tick fetches
+    // from the open's cursor.
+    if (!data || state.identity !== identityAtRequest || state.identity === "spectator"
+        || inboxOpenGen !== openGenAtRequest) return;
     const fresh = [...(data.to_agent || []), ...(data.mentions || [])];
     if (fresh.length) {
       inboxUnseenCount += fresh.length;
@@ -3638,6 +3905,33 @@ const _GG_EDITOR_FIELD_NAMES = new Set([
   "text", "body", "content", "ask", "why", "summary", "description", "notes",
 ]);
 
+// umwelt #1050: the ONE editor-vs-input decision for an act()-params field,
+// shared by openActParamsSubView and _openViewerActParams (both call it, so
+// they cannot drift). `comment` (any case) gets a multi-line editor WITHOUT
+// the markdown toolbar: the viewer shows a stored comment as plain text, so
+// the toolbar's ** / ## insertions would read as literal noise. It is
+// deliberately NOT added to _GG_EDITOR_FIELD_NAMES (that set is the
+// toolbar-editor set). Every other name keeps its pre-#1050 choice: toolbar
+// editor for the set, a plain one-line <input> otherwise. Returns the element
+// (ggEditor's `el` is a drop-in for <input>: live `.value`, `.focus()`), so
+// each submit handler's `input.value.trim()` works unchanged. Enter in the
+// textarea inserts a newline; no keydown handler captures it (the document-
+// level Enter handler returns early for any TEXTAREA).
+function _actFieldInput(fieldName) {
+  const key = String(fieldName).toLowerCase();
+  const placeholder = `Enter ${_titleCaseFieldName(fieldName)}…`;
+  if (key === "comment") {
+    return ggEditor({ rows: 6, toolbar: false, placeholder }).el;
+  }
+  if (_GG_EDITOR_FIELD_NAMES.has(key)) {
+    return ggEditor({ placeholder }).el;
+  }
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "params-form-input";
+  return input;
+}
+
 // ---------------------------------------------------------------------
 // umwelt #522: the interact-menu's ACTION-PARAMS sub-view — for a typed
 // action whose `requires` is non-empty (gateway.py's
@@ -3750,18 +4044,9 @@ function openActParamsSubView(thingId, actionVerb, requires, displayName) {
     label.className = "params-form-label";
     label.textContent = _titleCaseFieldName(fieldName);
     row.appendChild(label);
-    let input;
-    if (_GG_EDITOR_FIELD_NAMES.has(String(fieldName).toLowerCase())) {
-      // ggEditor's `el` is a drop-in replacement for the plain <input>
-      // below (live `.value` getter, `.classList`, `.focus()` — see
-      // gadgets.js's ggEditor docstring) -- the submit handler's
-      // `input.value.trim()` a few lines down works unchanged.
-      input = ggEditor({ placeholder: `Enter ${_titleCaseFieldName(fieldName)}…` }).el;
-    } else {
-      input = document.createElement("input");
-      input.type = "text";
-      input.className = "params-form-input";
-    }
+    // editor-vs-input decision lives in _actFieldInput (umwelt #1050); the
+    // submit handler's `input.value.trim()` below works on either element.
+    const input = _actFieldInput(fieldName);
     row.appendChild(input);
     interactMenuActParamsFieldsEl.appendChild(row);
     inputsByField[fieldName] = input;
@@ -5282,6 +5567,386 @@ function _renderThingViewerContent() {
   });
 }
 
+// ---------------------------------------------------------------------
+// umwelt #1049 (slice A): inline comments on a proposal, sent as ONE review.
+// The reviewer selects text in the viewer body, comments on it, collects
+// several drafts in a pending list, then sends them ALL in one existing
+// verdict action (approve / request_changes / comment) as one composed text.
+// Web UI only: no server or kinddef change, every action stays an existing act
+// through _viewerAct. Drafts persist in localStorage per thing id so a closed
+// window (Escape / outside click, #1058) or a reload does not lose them; every
+// storage access is guarded and the list falls back to memory.
+// ---------------------------------------------------------------------
+const _REVIEW_QUOTE_CAP = 160;        // code points kept from a quote
+const _REVIEW_SEND_LIMIT = 100000;    // characters; the server has no cap, its request body cap is 262144 bytes
+const _REVIEW_DRAFTS_KEY = "umwelt.review.drafts.";
+const _REVIEW_DRAFTS_MEM = new Map();
+const _REVIEW_DRAFTS_FAILED = new Set();   // thing ids whose last save did not reach storage
+
+// WIRE FORMAT -- defined ONCE, here. A later slice (#1049 slice B) PARSES this
+// text back out of the action log, and the first ~175 characters are what the
+// author's bell line shows, so the count leads. It must not change silently:
+// change it only together with that parser and docs/web-render/GADGETS.md.
+//
+//   Inline review: N comment.          (N === 1; "comments." otherwise)
+//   <overall text, if any, verbatim>   (trimmed; internal newlines kept)
+//   <blank line>
+//   1. > QUOTE
+//      the comment, every non-empty line indented exactly 3 spaces
+//   2. > QUOTE
+//      ...
+//
+// Items are separated by a single newline; blank comment lines stay truly
+// empty; no trailing newline or space. With N === 0 the result is just the
+// trimmed overall, so a form with no drafts behaves as before.
+function composeReview(overall, drafts) {
+  // CRLF and a lone CR become LF first, so no carriage return reaches the wire.
+  const nl = (v) => String(v == null ? "" : v).replace(/\r\n?/g, "\n");
+  const text = nl(overall).trim();
+  const list = Array.isArray(drafts) ? drafts : [];
+  const n = list.length;
+  if (!n) return text;
+  const lines = [`Inline review: ${n} ${n === 1 ? "comment" : "comments"}.`];
+  if (text) lines.push(text);
+  lines.push("");
+  list.forEach((d, i) => {
+    lines.push(`${i + 1}. > ${d.quote}`);
+    for (const l of nl(d.comment).trim().split("\n")) {
+      lines.push(l.trim() ? `   ${l}` : "");
+    }
+  });
+  return lines.join("\n");
+}
+
+// The quote step: whitespace runs collapse to one space, trim, empty -> null,
+// and a long quote keeps its first 160 CODE POINTS (Array.from, never UTF-16
+// units, so an astral character is not split) plus one "…".
+function _reviewQuote(raw) {
+  const s = String(raw == null ? "" : raw).replace(/\s+/g, " ").trim();
+  if (!s) return null;
+  const cps = Array.from(s);
+  return cps.length > _REVIEW_QUOTE_CAP
+    ? cps.slice(0, _REVIEW_QUOTE_CAP).join("") + "…"
+    : s;
+}
+
+// A stable id per draft, so Edit / Delete / clear-after-send act on THE draft
+// and not on a list position another tab may have moved.
+function _reviewNewId() {
+  return "d" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+}
+
+// Keeps only {id, quote: string, comment: string} items; anything else
+// (corrupt storage, a non-array) is dropped, never thrown on. An item stored
+// without an id (written before ids existed) gets one; `stats.assigned`
+// counts those so the caller can persist them.
+function _reviewDraftsClean(v, stats) {
+  if (!Array.isArray(v)) return [];
+  const seen = new Set();
+  return v
+    .filter((d) => d && typeof d.quote === "string" && typeof d.comment === "string")
+    .map((d) => {
+      let id = d.id;
+      // missing, or a duplicate of an earlier draft's id (crafted / merged
+      // storage): a fresh id, so Delete on one row can never hit another.
+      if (typeof id !== "string" || !id || seen.has(id)) {
+        id = _reviewNewId();
+        if (stats) stats.assigned += 1;
+      }
+      seen.add(id);
+      return { id, quote: d.quote, comment: d.comment };
+    });
+}
+
+// Load: storage first; if storage is absent or throws, the in-memory list for
+// that thing id (so a disabled localStorage still works for the session). While the last save for this thing did NOT reach storage
+// (full / disabled), memory is authoritative: storage may still hold an older
+// array and must not win. A getItem that SUCCEEDS is the truth, even when it
+// answers "no entry": another tab deleted the last draft or sent the review,
+// and the stale memory copy must not bring it back (it is dropped). Keyed by
+// thing id, so two things never mix.
+function _reviewDraftsLoad(thingId) {
+  if (_REVIEW_DRAFTS_FAILED.has(thingId)) {
+    return _reviewDraftsClean(_REVIEW_DRAFTS_MEM.get(thingId));
+  }
+  let raw = null;
+  try {
+    raw = localStorage.getItem(_REVIEW_DRAFTS_KEY + thingId);
+  } catch (e) {
+    // storage unreadable (absent / denied): the memory list is all there is
+    return _reviewDraftsClean(_REVIEW_DRAFTS_MEM.get(thingId));
+  }
+  if (raw === null || raw === undefined) {
+    _REVIEW_DRAFTS_MEM.delete(thingId);
+    return [];
+  }
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    parsed = null;
+  }
+  const stats = { assigned: 0 };
+  const list = _reviewDraftsClean(parsed, stats);
+  if (list.length) _REVIEW_DRAFTS_MEM.set(thingId, list); else _REVIEW_DRAFTS_MEM.delete(thingId);
+  if (stats.assigned) _reviewDraftsSave(thingId, list);   // persist the ids just assigned
+  return _reviewDraftsClean(list);
+}
+
+// Saves the list. Returns {list, stored}: `stored` is false when the write did
+// not reach storage (private mode, quota); the thing is then marked failed and
+// memory stays authoritative until a save works again.
+function _reviewDraftsSave(thingId, drafts) {
+  const list = _reviewDraftsClean(drafts);
+  if (list.length) _REVIEW_DRAFTS_MEM.set(thingId, list); else _REVIEW_DRAFTS_MEM.delete(thingId);
+  let stored = true;
+  try {
+    if (list.length) {
+      localStorage.setItem(_REVIEW_DRAFTS_KEY + thingId, JSON.stringify(list));
+    } else {
+      localStorage.removeItem(_REVIEW_DRAFTS_KEY + thingId);
+    }
+  } catch (e) {
+    stored = false;   // the in-memory list above still works
+  }
+  if (stored) _REVIEW_DRAFTS_FAILED.delete(thingId); else _REVIEW_DRAFTS_FAILED.add(thingId);
+  return { list, stored };
+}
+
+function _reviewDraftsAdd(thingId, draft) {
+  const list = _reviewDraftsLoad(thingId);
+  list.push({ id: _reviewNewId(), quote: draft.quote, comment: draft.comment });
+  return _reviewDraftsSave(thingId, list);
+}
+
+// Edit replaces the comment of the draft with this id IN PLACE (same position,
+// same quote). An id that is no longer there (deleted in another tab) is a
+// no-op: it never lands on a different draft.
+function _reviewDraftsEdit(thingId, id, comment) {
+  const list = _reviewDraftsLoad(thingId);
+  const i = list.findIndex((d) => d.id === id);
+  if (i < 0) return { list, stored: true };
+  list[i] = { id: list[i].id, quote: list[i].quote, comment };
+  return _reviewDraftsSave(thingId, list);
+}
+
+function _reviewDraftsDelete(thingId, id) {
+  const list = _reviewDraftsLoad(thingId);
+  const i = list.findIndex((d) => d.id === id);
+  if (i < 0) return { list, stored: true };
+  list.splice(i, 1);
+  return _reviewDraftsSave(thingId, list);
+}
+
+// With `sent` (a list of {id, comment}: what was composed into a sent text),
+// removes only the drafts whose id AND comment both match, so a draft another
+// tab added meanwhile, or edited after the click (that text was never sent),
+// survives; without it, empties the thing.
+function _reviewDraftsClear(thingId, sent) {
+  if (!Array.isArray(sent)) return _reviewDraftsSave(thingId, []);
+  const was = new Map(sent.map((d) => [d.id, d.comment]));
+  return _reviewDraftsSave(thingId, _reviewDraftsLoad(thingId)
+    .filter((d) => !(was.has(d.id) && was.get(d.id) === d.comment)));
+}
+
+// The cleaned quote of the CURRENT selection if it is non-collapsed and STARTS
+// inside `bodyEl`, else null. Wherever it ENDS, the end is clamped to the body:
+// a triple-click on the last line ends at (the node after the body, 0), and a
+// drag that overshoots below the body ends in the control's own label or
+// further away; both still quote the body part. The quote is taken from the
+// clamped range, never from the browser's own selection string, so no outside
+// text can ride along. A start outside the body (the title) stays rejected.
+// Read at call time, never cached.
+function _reviewSelectionQuote(bodyEl) {
+  let sel = null;
+  try {
+    sel = window.getSelection();
+  } catch (e) {
+    return null;
+  }
+  if (!sel || sel.rangeCount < 1 || sel.isCollapsed) return null;
+  const range = sel.getRangeAt(0);
+  if (!range.startContainer || !bodyEl.contains(range.startContainer)) return null;
+  let clamped = range;
+  if (!bodyEl.contains(range.endContainer)) {
+    clamped = range.cloneRange();
+    clamped.setEnd(bodyEl, bodyEl.childNodes.length);
+  }
+  return _reviewQuote(clamped.toString());
+}
+
+// True when the quote (whitespace ignored, a trailing "…" from the 160-cap
+// removed) is no longer a substring of the body's text, given ONCE per list
+// render as `squashedBody` (the body's textContent with all whitespace removed;
+// a big body is slow to squash per draft): the draft then gets a
+// "not in current text" mark. Whitespace is dropped on both sides, not just
+// collapsed, because textContent has no space at block boundaries where a
+// selection's text has a newline. The quote itself is never changed.
+function _reviewIsStale(quote, squashedBody) {
+  const q = String(quote).replace(/…$/, "").replace(/\s+/g, "");
+  if (!q) return false;
+  return !squashedBody.includes(q);
+}
+
+// Opens the no-toolbar editor (#1050) in `host` for one draft: the quote (plain
+// text), the editor, and a confirm + Cancel row. A blank (after trim) comment
+// is ignored and leaves the editor open.
+function _reviewOpenEditor(host, quote, value, confirmLabel, onSave) {
+  host.replaceChildren();
+  const q = document.createElement("div");
+  q.className = "gg-review-editor-quote";
+  q.textContent = quote;
+  const ed = ggEditor({
+    rows: 4, toolbar: false, value, placeholder: "Your comment on this passage…",
+  });
+  const row = document.createElement("div");
+  row.className = "params-form-run-row";
+  const ok = document.createElement("button");
+  ok.type = "button";
+  ok.className = "gg-btn";
+  ok.textContent = confirmLabel;
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "gg-btn";
+  cancel.textContent = "Cancel";
+  ok.addEventListener("click", () => {
+    const v = ed.el.value.trim();
+    if (!v) return;
+    onSave(v);
+    host.replaceChildren();
+  });
+  cancel.addEventListener("click", () => host.replaceChildren());
+  row.appendChild(ok);
+  row.appendChild(cancel);
+  host.appendChild(q);
+  host.appendChild(ed.el);
+  host.appendChild(row);
+  ed.el.focus();
+}
+
+// Re-renders the pending list in place (so the body's scroll and selection are
+// untouched). Quote and comment are textContent only. Hidden when empty.
+function _reviewRenderList(listEl, thingId, host, bodyEl) {
+  const drafts = _reviewDraftsLoad(thingId);
+  listEl.replaceChildren();
+  listEl.style.display = drafts.length ? "" : "none";
+  if (!drafts.length) return;
+  const squashedBody = String(bodyEl.textContent).replace(/\s+/g, "");
+  const head = document.createElement("div");
+  head.className = "gg-review-list-header";
+  head.textContent = `Pending inline comments (${drafts.length})`;
+  listEl.appendChild(head);
+  if (_REVIEW_DRAFTS_FAILED.has(thingId)) {
+    const warn = document.createElement("div");
+    warn.className = "gg-review-warning";
+    warn.textContent = "could not save drafts in this browser (storage full or disabled); " +
+      "changes, including deletes, will be lost if you close or reload this page";
+    listEl.appendChild(warn);
+  }
+  drafts.forEach((d) => {
+    const row = document.createElement("div");
+    row.className = "gg-review-draft";
+    const quote = document.createElement("div");
+    quote.className = "gg-review-draft-quote";
+    quote.textContent = d.quote;
+    row.appendChild(quote);
+    if (_reviewIsStale(d.quote, squashedBody)) {
+      const stale = document.createElement("div");
+      stale.className = "gg-review-draft-stale";
+      stale.textContent = "not in current text";
+      row.appendChild(stale);
+    }
+    const comment = document.createElement("div");
+    comment.className = "gg-review-draft-comment";
+    comment.textContent = d.comment;
+    const actions = document.createElement("div");
+    actions.className = "gg-review-draft-actions";
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "gg-btn";
+    edit.textContent = "Edit";
+    edit.addEventListener("click", () => {
+      _reviewOpenEditor(host, d.quote, d.comment, "Save", (v) => {
+        _reviewDraftsEdit(thingId, d.id, v);
+        _reviewRenderList(listEl, thingId, host, bodyEl);
+      });
+    });
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "gg-btn";
+    del.textContent = "Delete";
+    del.addEventListener("click", () => {
+      _reviewDraftsDelete(thingId, d.id);
+      _reviewRenderList(listEl, thingId, host, bodyEl);
+    });
+    actions.appendChild(edit);
+    actions.appendChild(del);
+    row.appendChild(comment);
+    row.appendChild(actions);
+    listEl.appendChild(row);
+  });
+}
+
+// True when at least one typed action takes a `comment` (any case, as the form
+// does) and is not explicitly forbidden: only then can a draft ever be sent.
+function _reviewHasCommentAction(actions) {
+  return (Array.isArray(actions) ? actions : []).some((a) =>
+    a && a.permitted !== false && Array.isArray(a.requires) &&
+    a.requires.some((f) => String(f).toLowerCase() === "comment"));
+}
+
+// The review section under the viewer body: the "Comment on selected text"
+// control, the editor host, and the pending list. The control is enabled only
+// while a valid selection exists (selectionchange); mousedown is cancelled so
+// clicking it does not clear the selection; the quote is read AT CLICK TIME.
+function _reviewDraftsSection(thingId, bodyEl) {
+  const sec = document.createElement("div");
+  sec.className = "gg-review";
+  const ctl = document.createElement("button");
+  ctl.type = "button";
+  ctl.className = "gg-btn gg-review-comment-btn";
+  ctl.textContent = "Comment on selected text";
+  ctl.disabled = true;
+  const host = document.createElement("div");
+  host.className = "gg-review-editor-host";
+  const listEl = document.createElement("div");
+  listEl.className = "gg-review-list";
+  ctl.addEventListener("mousedown", (ev) => ev.preventDefault());
+  ctl.addEventListener("click", () => {
+    const quote = _reviewSelectionQuote(bodyEl);
+    if (quote === null) return;
+    _reviewOpenEditor(host, quote, "", "Add", (v) => {
+      _reviewDraftsAdd(thingId, { quote, comment: v });
+      _reviewRenderList(listEl, thingId, host, bodyEl);
+      try {
+        const s = window.getSelection();
+        if (s) s.removeAllRanges();
+      } catch (e) {
+        // best effort: the selection UI is cosmetic
+      }
+      ctl.disabled = true;
+    });
+  });
+  // One listener per section; it removes itself once the section has been
+  // mounted and then detached (the viewer re-renders its content).
+  let seen = false;
+  const onSelectionChange = () => {
+    if (sec.isConnected) {
+      seen = true;
+    } else if (seen) {
+      document.removeEventListener("selectionchange", onSelectionChange);
+      return;
+    }
+    ctl.disabled = _reviewSelectionQuote(bodyEl) === null;
+  };
+  document.addEventListener("selectionchange", onSelectionChange);
+  sec.appendChild(ctl);
+  sec.appendChild(host);
+  sec.appendChild(listEl);
+  _reviewRenderList(listEl, thingId, host, bodyEl);
+  return sec;
+}
+
 // Builds the full viewer content DOM. Every public/attacker-influenceable
 // field is .textContent-only — never string-concatenated into markup.
 function _thingViewerContent(inspectData, useData, thingId, displayName) {
@@ -5323,6 +5988,13 @@ function _thingViewerContent(inspectData, useData, thingId, displayName) {
   header.appendChild(metaRow);
   wrap.appendChild(header);
 
+  // The typed actions (see the action bar below, which reads this same list).
+  // umwelt #936: /inspect's `actions` now also carries the kind's built-ins
+  // (use/read/edit/look_in/look_at, which never carry a `permitted` key); this
+  // bar dispatches only typed actions through act(), so keep just those.
+  const actions = (Array.isArray(inspectData.actions) ? inspectData.actions : [])
+    .filter((a) => a && "permitted" in a);
+
   // Body: reuse the outcome window's readable renderer. Only when use()
   // returned a real `outcome` (a readable's content). A params_spec
   // response (params-declaring thing) or a failed/empty use omits the body
@@ -5333,6 +6005,11 @@ function _thingViewerContent(inspectData, useData, thingId, displayName) {
     bodyWrap.className = "gg-thing-viewer-body";
     bodyWrap.appendChild(_outcomeWindowContent(useData.outcome));
     wrap.appendChild(bodyWrap);
+    // umwelt #1049: select text in the body, comment on it, collect drafts.
+    // Only where a draft can be SENT: a permitted comment-bearing typed action.
+    if (_reviewHasCommentAction(actions)) {
+      wrap.appendChild(_reviewDraftsSection(thingId, bodyWrap));
+    }
   }
 
   // Decision log: `metadata.action_log` — list of {action, by, at, args}.
@@ -5373,11 +6050,7 @@ function _thingViewerContent(inspectData, useData, thingId, displayName) {
   // permitted === false -> disabled (flag, don't filter — the server is the
   // authority, /act is the real gate); click -> required-args form if
   // `requires` non-empty, else actAct directly. `.gg-btn` for the buttons.
-  // umwelt #936: /inspect's `actions` now also carries the kind's built-ins
-  // (use/read/edit/look_in/look_at, which never carry a `permitted` key); this
-  // bar dispatches only typed actions through act(), so keep just those.
-  const actions = (Array.isArray(inspectData.actions) ? inspectData.actions : [])
-    .filter((a) => a && "permitted" in a);
+  // `actions` is the typed-action list built above (before the body).
   if (actions.length) {
     const bar = document.createElement("div");
     bar.className = "gg-thing-viewer-actions";
@@ -5414,7 +6087,7 @@ function _thingViewerContent(inspectData, useData, thingId, displayName) {
 // The viewer's required-args form for a typed action whose `requires` is
 // non-empty (e.g. approve/request_changes/comment all `requires:["comment"]`).
 // Mirrors openActParamsSubView's field loop + submit exactly (same
-// `_GG_EDITOR_FIELD_NAMES` -> ggEditor vs plain <input> decision, same
+// `_actFieldInput` editor-vs-<input> decision, same
 // "blank field omitted, not sent empty" submit posture, same
 // params-form-* CSS classes) but renders INLINE in the viewer window
 // instead of the interact-menu sub-view DOM — a separate anchored element
@@ -5428,6 +6101,19 @@ function _openViewerActParams(thingId, actionVerb, requires, displayName) {
   header.textContent = `${_titleCaseFieldName(actionVerb)} — ${displayName || thingId}`;
   wrap.appendChild(header);
 
+  // umwelt #1049: the comment field of a verdict form carries the pending
+  // inline comments (if any) for this thing. With none, nothing below
+  // differs from the pre-#1049 form.
+  const commentField = requires.find((f) => String(f).toLowerCase() === "comment");
+  const draftCount = commentField === undefined ? 0 : _reviewDraftsLoad(thingId).length;
+  let draftNote = null;
+  if (draftCount) {
+    draftNote = document.createElement("div");
+    draftNote.className = "gg-thing-viewer-actparams-note";
+    draftNote.textContent = `${draftCount} inline comment${draftCount === 1 ? "" : "s"} will be added`;
+    wrap.appendChild(draftNote);
+  }
+
   const fieldsEl = document.createElement("div");
   const inputsByField = {};
   for (const fieldName of requires) {
@@ -5437,19 +6123,8 @@ function _openViewerActParams(thingId, actionVerb, requires, displayName) {
     label.className = "params-form-label";
     label.textContent = _titleCaseFieldName(fieldName);
     row.appendChild(label);
-    let input;
-    if (_GG_EDITOR_FIELD_NAMES.has(String(fieldName).toLowerCase())) {
-      // ggEditor's `el` is a drop-in for a plain <input> (live .value,
-      // see gadgets.js's ggEditor docstring) — the submit handler's
-      // `input.value.trim()` below works unchanged.
-      input = ggEditor({
-        placeholder: `Enter ${_titleCaseFieldName(fieldName)}…`,
-      }).el;
-    } else {
-      input = document.createElement("input");
-      input.type = "text";
-      input.className = "params-form-input";
-    }
+    // Same decision as openActParamsSubView, via the shared helper (#1050).
+    const input = _actFieldInput(fieldName);
     row.appendChild(input);
     fieldsEl.appendChild(row);
     inputsByField[fieldName] = input;
@@ -5467,6 +6142,7 @@ function _openViewerActParams(thingId, actionVerb, requires, displayName) {
   cancelBtn.className = "gg-btn";
   cancelBtn.textContent = "Cancel";
   cancelBtn.addEventListener("click", _renderThingViewerContent);
+  let submitPending = false;
   submitBtn.addEventListener("click", () => {
     // Same as openActParamsSubView: a blank field is omitted, not sent as
     // "", so the server's required-arg gate reports the SAME field name
@@ -5477,7 +6153,58 @@ function _openViewerActParams(thingId, actionVerb, requires, displayName) {
       const v = input.value.trim();
       if (v) formValues[fieldName] = v;
     }
-    _viewerAct(thingId, actionVerb, formValues, displayName);
+    // umwelt #1049: pending inline comments ride in the comment field as ONE
+    // composed text (composeReview); the reviewer's typed text is the overall.
+    const drafts = commentField === undefined ? [] : _reviewDraftsLoad(thingId);
+    let onSuccess;
+    if (drafts.length) {
+      const composed = composeReview(formValues[commentField] || "", drafts);
+      if (composed.length > _REVIEW_SEND_LIMIT) {
+        _showThingViewerRefusal(
+          `too long to send: ${composed.length} characters, limit ${_REVIEW_SEND_LIMIT} ` +
+          "(the server accepts about 256 KB per request)");
+        return;
+      }
+      formValues[commentField] = composed;
+      // Cleared once the act is accepted (a refusal keeps the drafts), and only
+      // the drafts (id AND text) that were composed into the sent text: one
+      // another tab added or edited meanwhile stays.
+      const sent = drafts.map((d) => ({ id: d.id, comment: d.comment }));
+      onSuccess = () => _reviewDraftsClear(thingId, sent);
+    }
+    // Single-shot: Submit is disabled from here and re-enabled ONLY when the act
+    // comes back refused / failed. After an accepted act it stays disabled (the
+    // re-render replaces the form), so a second click in the window before that
+    // cannot send again (it used to re-send the bare overall text as a second
+    // comment). The handler is shared with plain comments, which double-sent
+    // before this too; that is fixed here for both.
+    if (submitPending) return;
+    submitPending = true;
+    submitBtn.disabled = true;
+    let request;
+    try {
+      request = Promise.resolve(_viewerAct(thingId, actionVerb, formValues, displayName, onSuccess));
+    } catch (e) {
+      request = Promise.reject(e);
+    }
+    request
+      .then((accepted) => {
+        if (!accepted) {
+          submitPending = false;
+          submitBtn.disabled = false;
+        } else if (draftNote &&
+            _thingViewerWindow.el.querySelector(".gg-thing-viewer-actparams-note") === draftNote) {
+          // Accepted, but the form is still up (the refresh failed): the drafts
+          // are gone now, so the note must not keep promising them.
+          draftNote.textContent = "review recorded, view could not refresh";
+        }
+      })
+      .catch((err) => {
+        // The request itself failed (it threw / rejected): not stuck, not silent.
+        submitPending = false;
+        submitBtn.disabled = false;
+        _showThingViewerRefusal(`request failed: ${err && err.message ? err.message : err}`);
+      });
   });
   btnRow.appendChild(submitBtn);
   btnRow.appendChild(cancelBtn);
@@ -5511,7 +6238,7 @@ function _showThingViewerRefusal(message) {
 // use() is NOT re-called (it would double-count a read; the body doesn't
 // change on an act). The actAct outcome summary still surfaces via the
 // existing outcome window; this refresh is the in-view confirmation.
-async function _viewerAct(thingId, actionVerb, actionArgs, displayName) {
+async function _viewerAct(thingId, actionVerb, actionArgs, displayName, onSuccess) {
   const outcome = await actAct(thingId, actionVerb, actionArgs, displayName);
   // umwelt #945: the viewer may have been re-opened on another thing while
   // the act was in flight; never write this act's result into that other
@@ -5525,14 +6252,36 @@ async function _viewerAct(thingId, actionVerb, actionArgs, displayName) {
     // (and the say composer) can cover; repeat it verbatim inside the viewer
     // and leave the form up so the typed comment is not lost.
     if (stillShowing()) _showThingViewerRefusal(errorEl.textContent || `${actionVerb} failed`);
-    return;
+    return false;
   }
   // A 2xx can still carry a refused effect (actAct's own `failed` case);
   // that is a refusal too, and the human must see it in the viewer.
   const fails = Array.isArray(outcome.effect_failures) ? outcome.effect_failures : [];
-  const refusal = fails.length
-    ? `${actionVerb} — effect refused: ${fails[0].reason || "unknown reason"}`
-    : null;
+  // umwelt #1049: an accepted act that carried effect_failures was still
+  // RECORDED (measured: the action log has the entry; only an effect such as
+  // notifying the author failed), so for a review send the message says that
+  // plainly, worded by the failure's `type` ({type, index, reason}), with a
+  // leading "failed: " of the server's reason stripped so it does not read
+  // "failed: failed:". Any other act keeps its wording byte for byte.
+  // `onSuccess` runs for any accepted act (2xx) FIRST, before the message is
+  // built and before the re-render below: the refreshed viewer shows no stale
+  // drafts, a resend cannot duplicate the recorded review, and nothing that
+  // goes wrong while building the text can skip the clear of an accepted act.
+  // A falsy outcome (above) keeps them.
+  if (typeof onSuccess === "function") onSuccess();
+  // A non-object entry (not server-shaped) counts as {} rather than throwing.
+  const first = fails[0] && typeof fails[0] === "object" ? fails[0] : {};
+  let refusal = null;
+  if (fails.length) {
+    if (typeof onSuccess === "function") {
+      const why = String(first.reason || "unknown reason").replace(/^failed:\s*/i, "");
+      refusal = first.type === "notify_author"
+        ? `review recorded, but notifying the author failed: ${why}`
+        : `review recorded, but an effect failed (${first.type || "unknown"}): ${why}`;
+    } else {
+      refusal = `${actionVerb} — effect refused: ${first.reason || "unknown reason"}`;
+    }
+  }
   try {
     const resp = await fetch(`/inspect?thing=${encodeURIComponent(thingId)}`);
     if (resp.ok) {
@@ -5548,6 +6297,7 @@ async function _viewerAct(thingId, actionVerb, actionArgs, displayName) {
     // the viewer at its pre-action state.
   }
   if (refusal && stillShowing()) _showThingViewerRefusal(refusal);
+  return true;
 }
 
 // `take` — POST /act {intent:"take", args:{thing}}. umwelt #267 "RPG action

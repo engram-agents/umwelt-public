@@ -49,6 +49,7 @@ function ggMarkGadgetOpen(handle) {
 function ggMarkGadgetClosed(handle) {
   const idx = _ggOpenStack.indexOf(handle);
   if (idx !== -1) _ggOpenStack.splice(idx, 1);
+  if (handle.el && handle.el.querySelectorAll) ggForgetEdits(handle.el);
 }
 
 // umwelt #945: test the click's DISPATCH-TIME path, not the live tree. A
@@ -56,17 +57,89 @@ function ggMarkGadgetClosed(handle) {
 // action buttons, its Submit/Cancel) detaches its target before the click
 // reaches this listener; `contains()` then reads it as an outside click and
 // closes the window it happened in. `composedPath()` is fixed at dispatch.
+//
+// umwelt #1058: neither gesture may discard a typed draft. Closing only hides
+// the window and the next open replaces its content, so a reviewer who typed a
+// multi-line comment and pressed Escape (or clicked away) lost it silently.
+// The guard reads the window's field VALUES, not focus: the user may have
+// clicked elsewhere before the dismissing gesture, and the draft is still
+// theirs. Whitespace-only counts as empty (the submit handlers `.trim()` too).
+// Only the explicit close control (the title-bar x, `handle.close()`) and
+// programmatic closes are unguarded: those are user intent / app intent.
+const _GG_NON_TEXT_INPUT_TYPES = new Set([
+  "button", "checkbox", "color", "file", "hidden", "image", "radio", "range",
+  "reset", "submit",
+]);
+
+// A draft is text the USER typed, not text the APP pre-filled (the params
+// form's defaults, a reply quote): those are set by `.value = ...`, which
+// fires no `input` event, while typing, paste, IME, cut and drop all do. So
+// one document-level CAPTURE-phase `input` listener (capture: a field that
+// stops propagation still counts) records the field in a WeakSet, keyed on the
+// FIELD, not the window. Registered once at load; costs one Set insert per
+// keystroke and nothing else. A later edit that empties the field leaves it
+// marked but empty, which the value check below reads as no draft.
+const _ggUserEdited = new WeakSet();
+
+document.addEventListener("input", (ev) => {
+  const t = ev.target;
+  if (t && typeof t === "object") _ggUserEdited.add(t);
+}, true);
+
+function ggHoldsDraft(rootEl) {
+  for (const f of rootEl.querySelectorAll("textarea, input")) {
+    if (_GG_NON_TEXT_INPUT_TYPES.has(f.type)) continue;
+    if (!_ggUserEdited.has(f)) continue;
+    if (typeof f.value === "string" && f.value.trim() !== "") return true;
+  }
+  return false;
+}
+
+// When a window closes, the edits made in it belong to the session that just
+// ended: the app may reuse the same field element with a fresh pre-fill on the
+// next open, and that must not inherit the old mark. Latent contract: a window reopened WITHOUT replacing its content keeps the user's old text but the mark was forgotten at close, so Escape would then discard it; no current window does this (the params form and the viewer rebuild their content).
+function ggForgetEdits(rootEl) {
+  for (const f of rootEl.querySelectorAll("textarea, input")) {
+    _ggUserEdited.delete(f);
+  }
+}
+
+// umwelt #1078: a held gesture used to be silent. The registry now tells the
+// TOP handle it was held, through an OPTIONAL `heldDraft()` method on the
+// handle: a generic `{el, close()}` registrant (the migrated console) has none
+// and simply gets no hint. English only: the web render has no string tables.
+const GG_DRAFT_HINT_TEXT = "Draft kept. Press × to discard it.";
+
+function ggNoteHeldDraft(handle) {
+  if (handle && typeof handle.heldDraft === "function") handle.heldDraft();
+}
+
+// True once a window no longer holds a draft (a ggWindow asks this on `input`
+// to retire its hint; kept here so the draft rule stays in this one section).
+function ggDraftGone(rootEl) {
+  return !ggHoldsDraft(rootEl);
+}
+
 document.addEventListener("click", (ev) => {
   if (!_ggOpenStack.length) return;
   const top = _ggOpenStack[_ggOpenStack.length - 1];
   if (!ev.composedPath().includes(top.el)) {
-    top.close();
+    if (ggHoldsDraft(top.el)) {
+      ggNoteHeldDraft(top);
+    } else {
+      top.close();
+    }
   }
 });
 
 document.addEventListener("keydown", (ev) => {
   if (ev.key !== "Escape" || !_ggOpenStack.length) return;
-  _ggOpenStack[_ggOpenStack.length - 1].close();
+  const top = _ggOpenStack[_ggOpenStack.length - 1];
+  if (ggHoldsDraft(top.el)) {
+    ggNoteHeldDraft(top);
+    return;
+  }
+  top.close();
 });
 
 // ---------------------------------------------------------------------
@@ -233,7 +306,36 @@ function ggWindow(opts) {
   contentEl.className = "gg-window-content";
   el.appendChild(contentEl);
 
+  // umwelt #1078: the "draft kept" hint. A direct child of the window element,
+  // between the title bar and the content region, so it does not scroll with
+  // the content and a content swap cannot host it. Created on demand and
+  // removed (never hidden) so it is at most ONE element however often the
+  // gesture repeats. It is a plain div: never a text field, so the draft check
+  // cannot count it. It never touches focus, the caret or the draft.
+  let hintEl = null;
+  function showDraftHint() {
+    if (hintEl && hintEl.parentNode === el) return;
+    hintEl = document.createElement("div");
+    hintEl.className = "gg-window-hint";
+    hintEl.setAttribute("role", "status");
+    hintEl.setAttribute("aria-live", "polite");
+    hintEl.textContent = GG_DRAFT_HINT_TEXT;
+    el.insertBefore(hintEl, contentEl);
+  }
+  function clearDraftHint() {
+    if (!hintEl) return;
+    hintEl.remove();
+    hintEl = null;
+  }
+  // `input` bubbles from any field in the window. The registry's capture-phase
+  // listener has already recorded the edit, so by now the draft check reads the
+  // new value: once the draft is emptied the hint has nothing left to say.
+  el.addEventListener("input", () => {
+    if (hintEl && ggDraftGone(el)) clearDraftHint();
+  });
+
   function setContent(content) {
+    clearDraftHint(); // the fields the notice talked about are being replaced
     contentEl.replaceChildren();
     if (content === undefined || content === null) return;
     if (typeof content === "string") {
@@ -305,8 +407,14 @@ function ggWindow(opts) {
       ggMarkGadgetOpen(handle);
       ggLog(_cls, _id, "debug", "open");
     },
+    // Optional registry method (see ggNoteHeldDraft): the top window's
+    // Escape / outside click was held back by a typed draft.
+    heldDraft() {
+      showDraftHint();
+    },
     close() {
       el.classList.add("gg-hidden");
+      clearDraftHint();
       ggMarkGadgetClosed(handle);
       ggLog(_cls, _id, "debug", "close");
     },
@@ -322,6 +430,7 @@ function ggWindow(opts) {
             { title: data.title, hasContent: data.content !== undefined });
     },
     destroy() {
+      clearDraftHint();
       ggMarkGadgetClosed(handle);
       const idx = _ggStreetGadgets.indexOf(handle);
       if (idx !== -1) _ggStreetGadgets.splice(idx, 1);
@@ -358,6 +467,9 @@ function ggWindow(opts) {
 //   value (str, optional): initial textarea content.
 //   placeholder (str, optional): textarea placeholder.
 //   rows (number, default 8): textarea rows.
+//   toolbar (bool, default true): `false` builds no toolbar element and no
+//     toolbar buttons at all (umwelt #1050: the viewer's plain-text review
+//     comment, where markdown insertions would show as literal ** / ##).
 //   onInput ((value:string) => void, optional): called after any toolbar
 //     insertion (mirroring a native `input` event) with the textarea's
 //     current value.
@@ -528,9 +640,16 @@ function ggEditor(opts) {
   const el = document.createElement("div");
   el.className = "gg-editor";
 
-  const toolbar = document.createElement("div");
-  toolbar.className = "gg-editor-toolbar";
-  el.appendChild(toolbar);
+  // umwelt #1050: `toolbar: false` builds NO toolbar element and no buttons
+  // (not merely hidden) for fields whose stored text is shown as plain text.
+  // Absent / true keeps today's toolbar for every existing caller.
+  const withToolbar = opts.toolbar !== false;
+  let toolbar = null;
+  if (withToolbar) {
+    toolbar = document.createElement("div");
+    toolbar.className = "gg-editor-toolbar";
+    el.appendChild(toolbar);
+  }
 
   const textarea = document.createElement("textarea");
   textarea.className = "gg-editor-textarea";
@@ -544,7 +663,7 @@ function ggEditor(opts) {
   }
   textarea.addEventListener("input", fireInput);
 
-  for (const def of _GG_EDITOR_TOOLBAR_BUTTONS) {
+  if (toolbar) for (const def of _GG_EDITOR_TOOLBAR_BUTTONS) {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "gg-btn gg-editor-toolbar-btn";

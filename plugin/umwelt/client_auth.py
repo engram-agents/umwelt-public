@@ -132,6 +132,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from ._ids import DEFAULT_IDENTITY_KEY_PATH, canonical_agent
+from .engine_api import CLIENT_HEADER, client_headers, render_mismatch
 
 # umwelt#678, part of #583 (authenticated transport): the single
 # world-URL resolution chokepoint. Before this, 45 hardcoded
@@ -686,6 +687,34 @@ def _connect_within(host: str, port: int, deadline: float) -> socket.socket:
     raise last_exc
 
 
+class BodyTooLarge(Exception):
+    """A response body went past the caller's ``max_bytes`` (umwelt#1119
+    follow-up). ``advertised`` is the Content-Length the world announced
+    (refused before any body byte is read); ``read`` is how many bytes had
+    arrived when the read bound cut the body off (``max_bytes + 1``: the
+    first byte past the cap). Exactly one of the two is set."""
+
+    def __init__(self, advertised: int | None = None, read: int | None = None):
+        super().__init__("response body too large")
+        self.advertised = advertised
+        self.read = read
+
+
+class BoundedRequest(urllib.request.Request):
+    """A ``Request`` that carries the response-size cap for the transport.
+
+    The cap rides ON the request, not in a new keyword of
+    ``urlopen_with_cert_fallback``: that function is a seam the callers' unit
+    tests substitute with ``(req, timeout)`` fakes, and a new argument would
+    break every one of them. ``max_bytes=None`` is an ordinary unbounded
+    request. The bound applies to the main request path; the login handshake
+    in ``_http_post`` is not bounded here (umwelt#1127)."""
+
+    def __init__(self, *args, max_bytes: int | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.max_bytes = max_bytes
+
+
 def _open_once(req: urllib.request.Request, deadline: float, context=None):
     """ONE request attempt against an absolute ``time.monotonic()`` deadline.
 
@@ -696,6 +725,15 @@ def _open_once(req: urllib.request.Request, deadline: float, context=None):
     ``urllib.error.URLError`` for a connection-level failure or a blown
     deadline. The whole body is read INSIDE the deadline, so the returned
     object's ``read()`` can never block.
+
+    A ``BoundedRequest`` with ``max_bytes`` set (any other request is
+    unbounded, what every existing caller gets) bounds the body at the point
+    it is read from the socket, on the 2xx AND the HTTP-error branch alike: an advertised Content-Length above it is
+    refused before any body byte is read, and an undeclared or lying body is
+    cut after ``max_bytes + 1`` bytes. Either raises ``BodyTooLarge`` and the
+    connection is closed, so a body past the cap is never buffered or
+    passed through. A client-side ``read(cap + 1)`` on the returned object
+    bounds nothing: by then this function has already buffered everything.
 
     This is also the single seam the unit tests substitute to exercise the
     cert-retry logic in ``urlopen_with_cert_fallback``.
@@ -710,6 +748,12 @@ def _open_once(req: urllib.request.Request, deadline: float, context=None):
     # capitalises ("Content-type"), and urllib's do_open title-cases on send
     # ("Content-Type"), so do the same here.
     headers = {k.title(): v for k, v in req.header_items()}
+    # umwelt#1105: the one exception to title-casing. The engine-API header is
+    # put on the Request by the CALLER (never added here: this transport stays
+    # byte-faithful to urlopen for any request); it goes out under its
+    # documented spelling, `X-Umwelt-Client-API`, not `X-Umwelt-Client-Api`.
+    headers = {(CLIENT_HEADER if k.lower() == CLIENT_HEADER.lower() else k): v
+               for k, v in headers.items()}
     lowered = {k.lower() for k in headers}
     # The defaults urlopen added, so a server or proxy that keys on them sees
     # no change.
@@ -768,7 +812,22 @@ def _open_once(req: urllib.request.Request, deadline: float, context=None):
             phase = "read-headers"
             resp = conn.getresponse()
             phase = "read-body"
-            body = resp.read()
+            max_bytes = getattr(req, "max_bytes", None)
+            if max_bytes is None:
+                body = resp.read()
+            else:
+                # An unusable header (non-ASCII digits such as U+00B2, which
+                # pass str.isdigit() but not int(); empty; negative; junk) is
+                # UNDECLARED: the read bound below then applies.
+                try:
+                    declared = int((resp.getheader("Content-Length") or "").strip().encode("ascii"))
+                except (ValueError, UnicodeError):
+                    declared = -1
+                if declared > max_bytes:
+                    raise BodyTooLarge(advertised=declared)
+                body = resp.read(max_bytes + 1)
+                if len(body) > max_bytes:
+                    raise BodyTooLarge(read=len(body))
         except _TIMEOUT_ERRORS as exc:
             raise blown(phase) from exc
         finally:
@@ -835,6 +894,10 @@ def urlopen_with_cert_fallback(req: urllib.request.Request, timeout: int):
     re-raises the original error for every other failure shape, including a
     missing ``certifi``.
 
+    A ``BoundedRequest`` (``max_bytes`` set) bounds the body on the wire,
+    success and error status alike; a body past it raises ``BodyTooLarge``
+    instead of returning (see ``_open_once``).
+
     Caller owns ``HTTPError`` / other ``URLError`` handling; this only adds
     the one extra branch.
     """
@@ -863,7 +926,8 @@ def _http_post(url: str, payload: dict, timeout: int = 15) -> dict:
     """
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
-        url, data=data, method="POST", headers={"Content-Type": "application/json"}
+        url, data=data, method="POST",
+        headers={"Content-Type": "application/json", **client_headers()},
     )
     try:
         with urlopen_with_cert_fallback(req, timeout) as r:
@@ -922,6 +986,11 @@ def _acquire_token_raw(
     login_status = resp.get("_status")
     if login_status != 200:
         return None, login_status
+    # umwelt#1105: a successful login on an engine-API mismatch carries a
+    # notice. It informs (login still proceeds); surface it as one stderr line.
+    notice = resp.get("engine_api_notice")
+    if isinstance(notice, dict):
+        print(render_mismatch(notice), file=sys.stderr)
     token = resp.get("token")
     if not token:
         return None, login_status

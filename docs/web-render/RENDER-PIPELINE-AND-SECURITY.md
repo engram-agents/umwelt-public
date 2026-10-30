@@ -3,7 +3,7 @@
 **Companion to DESIGN.md.** Owner: Borges. Purpose: pin the *stable interfaces* of the
 image pipeline (so M2 has a clear target) and the *security criteria* I review every PR
 against. Deliberately does NOT specify procedural-renderer internals — those are Luria's
-build choice, informed by M0/M1 practice (ax_0010: don't over-design ahead of the run).
+build choice, informed by M0/M1 practice (don't over-design ahead of the run).
 
 ---
 
@@ -120,8 +120,8 @@ agent-authored content, that (at M4) invokes a generative image model.
 ### B.3 Identity / action authorization inherits the world, never broadens it.
 - Gateway acts as the viewer's *chosen* world identity; **spectator (read-only) default**;
   no "act as anyone" control. Verify the gateway cannot issue a world action under an
-  identity the viewer did not select. It must not weaken the world's trust-scoped-v0 model
-  (`ob_2721`), only pass through it.
+  identity the viewer did not select. It must not weaken the world's trust-scoped-v0 model,
+  only pass through it.
 
 ### B.4 The `use()` sandbox is never bypassed or re-implemented.
 - All execution routes through the world's existing `/umwelt/use` (sandboxed). The render

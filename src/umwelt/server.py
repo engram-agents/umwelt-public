@@ -9,10 +9,19 @@ Verbs (see PROTOCOL.md):
   POST /umwelt/use            execute a thing in the sandbox → outcome briefing
   POST /umwelt/download       readable-only (v1): full source dict egress —
                                the tome/library gate's sanctioned redirect (#122)
+  POST /umwelt/read           readable-only: one page of lines of one file,
+                               paged by next_offset (Claude Code's Read, #647)
+  POST /umwelt/search         readable-only: regex search of a thing's files,
+                               per-search time deadline (Claude Code's Grep, #647)
   POST /umwelt/create_thing   the raw build primitive (forge is sugar over this)
   POST /umwelt/update_thing   author-only: patch a thing's mutable fields
+  POST /umwelt/edit           same gate: replace old_string by new_string in a
+                              thing's source file or description (#1154)
   POST /umwelt/checklist      author-only: check/uncheck/reset/add/remove/edit
-                               a thing's metadata.checklist items (#182)
+                               a thing's metadata.checklist items (#182);
+                               check/uncheck/reset are also open to any
+                               registered resident on a world-package-made
+                               checklist (the `package` caller class)
   POST /umwelt/act            run a kind-declared action on a typed thing
   POST /umwelt/trash_thing    author-only: live -> binned (recoverable)
   POST /umwelt/restore_thing  author-only: binned|landfilled -> live
@@ -106,7 +115,9 @@ Size classes + examine gating (umwelt #88 slice 4): every thing exposes a
 from its FULL `source` content — the "this is large, be mindful" expectation
 BEFORE any read. `use()`'s readable branch is the render site for full
 content; scroll/book still render `content` in full, but tome/library
-render metadata + a manifest instead and NEVER put source text on the wire.
+render metadata + a manifest + a table of contents instead and NEVER put
+source text on the wire; `read` / `search` page through a readable and
+`download` hands it over whole (umwelt #647).
 
 Carry is pure total-load (umwelt #151, follows #147): carry capacity is a
 per-agent config (avatar.metadata.carry_capacity, falling back to env
@@ -152,11 +163,17 @@ from flask import Flask, Response, g, jsonify, request
 
 from . import cas
 from . import db
+from . import engine_api as _engine_api
+from . import kind_ids
 from . import sandbox
 from . import tier_config
 from . import visibility
 from ._ids import PLACE_ID_MAX_LEN
+from .agent_names import RESERVED_AGENT_PREFIX
+from .agent_names import has_reserved_agent_prefix as _has_reserved_agent_prefix
 from ._ids import canonical_agent as _canonical_agent_fold
+from ._ids import project_archive_admins as _project_archive_admins
+from ._ids import project_owner_admins as _project_owner_admins
 from .ghref import normalize_gh_ref
 from .ingress import BodyRow, bound_write_bodies
 from .tls_context import check_tls_args, resolve_tls_context, serve_dual_listener
@@ -273,7 +290,7 @@ _PROJECT_REGISTRAR_THING_ID = "thing_project_registrar"
 # metadata.kind_id = _CHARGE_BOARD_KIND_ID — same "many instances, one
 # kind" posture _PROJECT_BOARD_KIND_ID itself uses (each project's board
 # instance is minted separately, not a singleton).
-_CHARGE_BOARD_KIND_ID = "kind_charge_board"
+_CHARGE_BOARD_KIND_ID = kind_ids.CHARGE_BOARD_KIND_ID
 
 # use()'s `args` limits (umwelt #57) — loud 422 when exceeded, never silently
 # truncated or dropped. Conservative on purpose: this widens the exec surface
@@ -308,7 +325,7 @@ _CROSSING_EMOTION_DEFAULT = db.CROSSING_EMOTION_DEFAULT
 
 # umwelt #147: two guards against a description-flood — a giant self-enumerating
 # thing description dominating a place-view and flooding a connecting client's
-# context window (a cs_0047 attention-management violation; hit independently by
+# context window (an attention-management violation; hit independently by
 # 3 agents in the 2026-07-12 MCP dogfood). The two layers are complementary:
 #  (1) creation HARD CAP — a disastrously-large description is refused at forge
 #      / update time (loud 422, same posture as the args/emotion caps above), so
@@ -390,6 +407,24 @@ class _FieldTypeRefusal(Exception):
     `except` in a route may swallow it."""
 
 
+class _PreparedPatch:
+    """A validated thing patch (umwelt#1154): the patch as written to the
+    thing (`patch`, source included) and the DB-column patch (`db_patch`)."""
+    __slots__ = ("patch", "db_patch")
+
+    def __init__(self, patch, db_patch):
+        self.patch, self.db_patch = patch, db_patch
+
+
+class _ThingWriteRefusal(Exception):
+    """Raised inside the thing-write transaction to roll it back and answer
+    `response` (a response / (response, status) tuple). umwelt#1154."""
+
+    def __init__(self, response):
+        super().__init__("thing write refused")
+        self.response = response
+
+
 def _require_str(value, field: str) -> None:
     """Raise `_FieldTypeRefusal` unless `value` is a `str` or `None` (`null`
     keeps each site's existing meaning; callers that must refuse `null` too
@@ -467,19 +502,351 @@ def _container_capacity(container: dict) -> int:
         return CONTAINER_CAPACITY_DEFAULT
 
 
-# umwelt #88 slice 4 / #122: the fixed pointer line rendered instead of a
+# umwelt #88 slice 4 / #122 / #647: the briefing rendered instead of a
 # tome/library's source — verbatim per spec, so tests can assert on it
 # exactly rather than a paraphrase. #122 turned the gate from a dead-end
-# into a refuse-and-REDIRECT: it now names `download` as the sanctioned
-# egress path instead of just refusing inline render.
+# into a refuse-and-REDIRECT; #647 replaced the single download pointer with
+# the three ways to read a big thing (a page, a search, the whole file) and
+# the line/file counts a reader needs to choose. The ONE template: use()'s
+# gated branch and look_at's gate_notice both render it through
+# `_tome_briefing`, so the two cannot drift.
 _TOME_POINTER_TEMPLATE = (
-    "'{name}' is a {size_class} — too large to open inline. Download it to "
-    "your filesystem with `download {name} <path>` and read it there."
+    "'{name}' is a {size_class} ({extent}) "
+    "— too large to open whole.\n"
+    "Read part of it: read {name} --offset N --limit M · "
+    "search it: search {name} PATTERN · whole file: download {name} PATH"
 )
 # Classes whose full source is NEVER put on the wire (examine gating) —
 # metadata + a manifest render instead. scroll/book keep rendering full
 # content, same as before slice 4.
 _GATED_SIZE_CLASSES = ("tome", "library")
+
+# umwelt #647: long-read verbs (`read`, `search`) and the tome table of
+# contents. The numbers are Ariadne's design (Lei confirmed the ~4 KB page on
+# 2026-08-22, docs/design/things-that-grow.md section 8; it is also
+# _OPEN_PAGE_MAX, so one page is one size across the world).
+_READ_PAGE_MAX_CHARS = 4000     # budget of one `read` page / `search` page
+_READ_LINE_MAX_CHARS = 2000     # a single line is cut to this (Claude Code's cut)
+# umwelt #1154 (edit): each of old_string / new_string is capped at this many
+# characters, and the reply's excerpt at this many in all. The THING is not
+# capped by this -- a tome-sized thing is exactly the target.
+_EDIT_STRING_MAX_CHARS = 32768
+_EDIT_EXCERPT_MAX_CHARS = 1500
+# Each line is charged len(line) + this against the page budget: the allowance
+# for the `cat -n` prefix a client prints (an MCP page of 4-digit line numbers
+# plus the tab stays under 6000 chars; short lines cannot blow it up).
+_READ_LINE_OVERHEAD_CHARS = 8
+_READ_DEFAULT_LIMIT = 2000      # `read`'s default `limit` (lines)
+_READ_FILE_LIST_MAX = 20        # file names listed in a "which file?" error
+# `search` may spend at most this long matching, in total, per request. This
+# deadline (taken ONCE per search, then handed to every match call as the
+# remaining time) is what makes a hostile pattern safe; the 512-char cap on
+# the pattern below is NOT the safety bound (a 30-char pattern is enough for a
+# bomb). Stdlib `re` has no timeout, so search uses the third-party `regex`
+# package, resolved by NAME at request time (a test swaps the name) and never
+# replaced by `re` when it is missing: a missing package answers 503.
+_SEARCH_DEADLINE_S = 2.0
+_SEARCH_REGEX_MODULE_NAME = "regex"
+_SEARCH_PATTERN_MAX_CHARS = 512
+_SEARCH_CONTEXT_MAX = 10        # -A / -B / -C ceiling
+_SEARCH_HEAD_LIMIT_DEFAULT = 50
+_SEARCH_OUTPUT_MODES = ("content", "count", "files_with_matches")
+_TOC_MAX_HEADINGS = 60
+_TOC_TITLE_MAX_CHARS = 120
+_TOC_HEADING_RE = re.compile(r"^(#{1,6})\s+\S")
+_TOC_FENCE_RE = re.compile(r"^(`{3,}|~{3,})")
+
+
+def _source_lines(text: str) -> list[str]:
+    """A source file as lines: `split("\n")` minus the one empty string a
+    trailing newline leaves (so "a\n" is one line, "a\n\n" is two, "" is
+    none). `_read_source` already folds `\r\n` to `\n`."""
+    if not text:
+        return []
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _tome_briefing(name: str, size_class: str, extent: str) -> str:
+    """The gated-readable briefing / look_at gate_notice (one template). The
+    `{extent}` slot is how big it is: use() reads the source anyway and says
+    "N lines in F file(s)" (`_source_extent`); look_at reads NO source and
+    says "about N tokens" from the stat-based estimate."""
+    return _TOME_POINTER_TEMPLATE.format(
+        name=name, size_class=size_class, extent=extent)
+
+
+def _source_extent(source: dict[str, str]) -> str:
+    """use()'s extent: "N lines in F file(s)"."""
+    return (f"{sum(len(_source_lines(t)) for t in source.values())} lines "
+            f"in {len(source)} file(s)")
+
+
+# umwelt #647 round C: the COMPILE bomb. `regex.compile` takes no timeout and
+# unrolls counted repeats: `(?:(?:a{255}){255}){255}` (24 chars) costs ~4 s and
+# ~4.4 GB to compile, before the search deadline could ever start. The bound
+# is an estimate computed from the STDLIB parser (it parses, never expands)
+# and refused above this limit. COST MODEL (M3, measured): the compiler emits
+# every node of a repeat's body once per unrolled copy, so EVERY node counts:
+# a repeat is 1 + COPIES x the size of its body, where copies = the MINIMUM
+# count, plus ONE extra copy when the repeat has a loop part (high > low:
+# `+`, `{1,2}`, `{n,}`, possessive forms) OR its body contains another repeat
+# (measured: nested exact counts cost (n+1) per level: `{2}` depth 14 =
+# 2002 MB, depth 15 = MemoryError). Nested plus-chains double per level
+# (depth 16 = 53 MB, 20 = 669 MB, 22 = 2.6 GB), while `*`, `?`, `{0,n}`
+# chains stay flat (~41 MB), flat `a{99999}` stays 41 MB, and a ranged
+# `{1,99999}` is a counter loop. A capturing group, lookaround, atomic group,
+# branch and conditional are 1 + their contents; a non-capturing or flag-only
+# group is free; a character class is its ITEM count (each literal, range and
+# category, plus one for a negation), not its code-point span. `a{99999}`
+# (100000) is the largest flat repeat allowed. Deliberate over-refusals:
+# `(a){99999}` (199999), a flat `a{100000}`, open counts like `W{2000,}` of a
+# wide class, plus-chains nested deeper than 15 and exact-count chains deeper
+# than ~10 for `{2}` — harmless or rare, but not told apart by a plain number;
+# a flat run of consecutive literals is over-counted on purpose
+# (conservative). The structural nesting caps (`_search_nesting_check`) come
+# first and bound depth, not cost.
+_SEARCH_EXPANSION_LIMIT = 100000
+
+
+class _SearchBoundUnavailable(RuntimeError):
+    """The private stdlib parser the expansion bound needs could not load."""
+
+
+class _SearchPatternTooComplex(Exception):
+    """The stdlib parser raised something other than its own `error` while
+    PARSING the pattern (OverflowError for a count over 2^32, RecursionError
+    for deep nesting, ...): it cannot be sized, so it is refused. Raised ONLY
+    for the parse step; a failure while sizing a parsed tree is a bug and
+    propagates."""
+
+
+_SEARCH_MAX_REPEAT_DEPTH = 4     # a repeat inside a repeat inside ...
+_SEARCH_MAX_SPECIAL_DEPTH = 8    # capturing / lookaround / atomic groups
+_SEARCH_MAX_GROUP_DEPTH = 32     # every kind of group (also bounds recursion)
+
+
+def _search_parse(pattern: str):
+    """Parse `pattern` with the STDLIB parser; returns `(tree, constants)`.
+
+    THE ONLY code that touches the private `re._parser` / `re._constants`
+    (3.11+; `sre_parse` / `sre_constants` before). A Python upgrade that moves
+    them fails a test (test_long_read_compile_bomb_647 c6) and answers loudly
+    at request time: `_SearchBoundUnavailable` (never a silent skip of the
+    bound). `re.error` passes through (the pattern is not Python `re`
+    syntax); any other exception the PARSE step raises (OverflowError for a
+    count over 2^32, RecursionError for deep nesting, ...) becomes
+    `_SearchPatternTooComplex`. Only the parse step is guarded.
+
+    THIS STDLIB-`re` PARSE IS LOAD-BEARING for the cost model: every pattern
+    that reaches `regex.compile` was first parsed here by stdlib `re`. The
+    `regex` module accepts a strict superset of stdlib `re` syntax (`(?f)`,
+    `(?V1)`, `\\p{L}`, ...), so a pattern that bypasses this gate is
+    unbounded: its nesting and repeat counts were never measured. Never add a
+    path to `regex.compile` that does not pass through here first.
+    """
+    try:
+        try:
+            from re import _constants as sc, _parser as sp
+        except ImportError:                 # Python < 3.11
+            import sre_constants as sc
+            import sre_parse as sp
+        parse = sp.parse
+        sc.MAX_REPEAT, sc.MIN_REPEAT, sc.BRANCH, sc.SUBPATTERN, sc.ASSERT
+        sc.ASSERT_NOT, sc.GROUPREF_EXISTS, sc.IN
+    except (ImportError, AttributeError) as e:
+        raise _SearchBoundUnavailable(
+            f"{type(e).__name__}: {e}") from e
+    try:
+        tree = parse(pattern)
+    except re.error:
+        raise
+    except Exception as e:      # noqa: BLE001 - parse step ONLY
+        raise _SearchPatternTooComplex(f"{type(e).__name__}") from e
+    return tree, sc
+
+
+def _search_nesting_check(pattern: str):
+    """The structural nesting caps, checked BEFORE the cost walk (they bound
+    depth, not cost: wide shallow shapes are left to the M3 estimate, the
+    calibration cells and #1116). Returns None, or the cap value that was
+    exceeded, first in the order repeat, special-group, any-group.
+
+    Depths (the longest chain of each kind): a REPEAT is MAX_REPEAT /
+    MIN_REPEAT / POSSESSIVE_REPEAT (groups add no repeat depth); a SPECIAL
+    group is a capturing group, lookaround or atomic group; ANY group is
+    every group node of the stdlib tree, including flag-only groups and
+    conditionals. A plain non-capturing `(?:...)` is NOT a node in the stdlib
+    tree (`(?:a)` parses to just the literal), so it adds to no depth and no
+    cost. depth == cap is allowed, cap + 1 refused.
+    """
+    tree, sc = _search_parse(pattern)
+    repeats = (sc.MAX_REPEAT, sc.MIN_REPEAT,
+               getattr(sc, "POSSESSIVE_REPEAT", None))
+    atomic = getattr(sc, "ATOMIC_GROUP", None)
+    asserts = (sc.ASSERT, sc.ASSERT_NOT)
+    deepest = [0, 0, 0]                      # repeat, special, any
+
+    def walk(parsed, rep: int, spec: int, grp: int) -> None:
+        for op, av in parsed:
+            if op in repeats:
+                deepest[0] = max(deepest[0], rep + 1)
+                walk(av[2], rep + 1, spec, grp)
+            elif op == sc.SUBPATTERN:
+                s = spec + (1 if av[0] is not None else 0)
+                deepest[1] = max(deepest[1], s)
+                deepest[2] = max(deepest[2], grp + 1)
+                walk(av[-1], rep, s, grp + 1)
+            elif op == sc.BRANCH:
+                for arm in av[1]:
+                    walk(arm, rep, spec, grp)
+            elif op in asserts or (atomic is not None and op == atomic):
+                body = av[1] if op in asserts else av
+                deepest[1] = max(deepest[1], spec + 1)
+                deepest[2] = max(deepest[2], grp + 1)
+                walk(body, rep, spec + 1, grp + 1)
+            elif op == sc.GROUPREF_EXISTS:
+                deepest[2] = max(deepest[2], grp + 1)
+                walk(av[1], rep, spec, grp + 1)
+                if av[2]:
+                    walk(av[2], rep, spec, grp + 1)
+
+    walk(tree, 0, 0, 0)
+    for depth, cap in zip(deepest, (_SEARCH_MAX_REPEAT_DEPTH,
+                                    _SEARCH_MAX_SPECIAL_DEPTH,
+                                    _SEARCH_MAX_GROUP_DEPTH)):
+        if depth > cap:
+            return cap
+    return None
+
+
+def _search_expansion_estimate(pattern: str) -> int:
+    """Worst-case unrolled size of `pattern`, from the stdlib parser, by the
+    M3 node-count model described above `_SEARCH_EXPANSION_LIMIT` (every
+    node counts; a repeat is 1 + copies x its body, copies being the MINIMUM
+    count plus one when it has a loop part or its body contains another
+    repeat; a `{m,n}` range beyond that is a counter loop, so
+    `((a{1,255}){1,255}){1,255}` stays small). The pure model: NO nesting
+    caps (`_search_nesting_check` has those). Raises `re.error` when the
+    stdlib parser rejects the pattern, `_SearchPatternTooComplex` when the
+    parse step raises anything else, and `_SearchBoundUnavailable` when the
+    private parser cannot be imported. An exception from the size walk itself
+    is a bug and propagates.
+    """
+    tree, sc = _search_parse(pattern)
+    repeats = (sc.MAX_REPEAT, sc.MIN_REPEAT,
+               getattr(sc, "POSSESSIVE_REPEAT", None))
+    atomic = getattr(sc, "ATOMIC_GROUP", None)
+    asserts = (sc.ASSERT, sc.ASSERT_NOT)
+
+    def size(parsed) -> tuple[int, bool]:
+        # Model M3: EVERY node counts at least 1, and a node that wraps a
+        # body costs 1 + the body (each wrapper is unrolled with the body when
+        # an outer repeat is expanded). Free: a non-capturing / flag-only
+        # group (the stdlib tree adds no node of its own for it). Returns
+        # (size, whether the subtree contains a repeat).
+        total, has_rep = 0, False
+        for op, av in parsed:
+            if op in repeats:
+                low, high, sub = av
+                body, body_rep = size(sub)
+                # copies = the MINIMUM count, plus one extra copy when the
+                # repeat has a loop part (open counts have high = MAXREPEAT)
+                # or its body contains another repeat (measured: nested
+                # exact counts cost (n+1) per level); a ranged `{1,99999}`
+                # is otherwise a counter loop
+                copies = max(1, low + (1 if (high > low or body_rep) else 0))
+                total += 1 + copies * body
+                has_rep = True
+            elif op == sc.SUBPATTERN:
+                body, body_rep = size(av[-1])
+                total += (1 if av[0] is not None else 0) + body
+                has_rep = has_rep or body_rep
+            elif op == sc.BRANCH:
+                arms = [size(b) for b in av[1]]
+                total += 1 + sum(a for a, _r in arms)
+                has_rep = has_rep or any(r for _a, r in arms)
+            elif op in asserts:
+                body, body_rep = size(av[1])
+                total += 1 + body
+                has_rep = has_rep or body_rep
+            elif op == sc.GROUPREF_EXISTS:
+                yes, yes_rep = size(av[1])
+                no, no_rep = size(av[2]) if av[2] else (0, False)
+                total += 1 + yes + no
+                has_rep = has_rep or yes_rep or no_rep
+            elif atomic is not None and op == atomic:
+                body, body_rep = size(av)
+                total += 1 + body
+                has_rep = has_rep or body_rep
+            elif op == sc.IN:
+                # a character class weighs its ITEMS (each literal, range and
+                # category, plus one for a negation): compile cost tracks the
+                # item count, not the code-point span of a range.
+                total += len(av)
+            else:
+                total += 1
+        return max(total, 1), has_rep
+
+    # the size walk is NOT guarded: an exception here is a bug and propagates
+    return size(tree)[0]
+
+
+def _toc_for_source(source: dict[str, str]) -> dict:
+    """The table of contents of a tome/library (umwelt #647), derived at read
+    time and never stored.
+
+    A heading is an ATX markdown heading (`#` x1-6, whitespace, text) outside
+    a fenced code block. Its range runs to the line before the next heading
+    of the same or a higher level (an outline: a `##` range includes its
+    `###`s), or to the end of its file. `chars` is the range's size counting
+    one newline per line. At most `_TOC_MAX_HEADINGS` are returned: the
+    deepest level is dropped first until the rest fit; if even the shallowest
+    level alone is too many, its first ones in file order are kept.
+    """
+    files, found = [], []
+    for rel in sorted(source):
+        text = source[rel]
+        lines = _source_lines(text)
+        files.append({"file": rel, "lines": len(lines), "chars": len(text)})
+        starts = []                     # (level, title, 1-based line)
+        fence = None                    # the opening fence while inside one
+        for n, line in enumerate(lines, 1):
+            fm = _TOC_FENCE_RE.match(line)
+            if fence is not None:
+                if (fm and fm.group(1)[0] == fence[0]
+                        and len(fm.group(1)) >= len(fence)):
+                    fence = None
+                continue
+            if fm:
+                fence = fm.group(1)
+                continue
+            hm = _TOC_HEADING_RE.match(line)
+            if hm:
+                level = len(hm.group(1))
+                starts.append((level, line[level:].strip()[:_TOC_TITLE_MAX_CHARS], n))
+        for i, (level, title, start) in enumerate(starts):
+            end = len(lines)
+            for later_level, _t, later_start in starts[i + 1:]:
+                if later_level <= level:
+                    end = later_start - 1
+                    break
+            found.append({
+                "file": rel, "level": level, "title": title,
+                "start_line": start, "end_line": end,
+                "chars": sum(len(x) + 1 for x in lines[start - 1:end])})
+    shown = found
+    for level in range(6, 0, -1):
+        if len(shown) <= _TOC_MAX_HEADINGS:
+            break
+        shown = [h for h in shown if h["level"] < level]
+    if len(found) > _TOC_MAX_HEADINGS and len(shown) < 1:
+        shallow = min(h["level"] for h in found)
+        shown = [h for h in found if h["level"] == shallow][:_TOC_MAX_HEADINGS]
+    return {"files": files, "headings": shown,
+            "shown": len(shown), "total": len(found)}
 # umwelt #486: the two server-owned metadata.graft_ref/graft_version keys
 # (see the create_thing/update_thing rejection comments elsewhere in this
 # file — callers can never SET these) are also the ones look_at must not
@@ -899,6 +1266,17 @@ def resolve_actor(conn, request, declared: str | None = None) -> ActorResolution
         )
 
     if db.backfill_window_open(conn):
+        # umwelt#1043: the `world:` prefix is the author namespace of
+        # package-made things. An unauthenticated caller must not be able to
+        # DECLARE it (declared identities are unverified by design), or on a
+        # world with no avatars they would act as the package author. Done
+        # once, here, for every converted route; a callers' agent_id of None
+        # is each route's existing 401. Token callers never reach this branch.
+        if declared and _has_reserved_agent_prefix(declared):
+            return ActorResolution(
+                agent_id=None, verified=False, source="declared",
+                window_open=True,
+            )
         return ActorResolution(
             agent_id=_canonical_agent(declared) if declared else declared,
             verified=False, source="declared",
@@ -1650,7 +2028,38 @@ def _render_project_board(conn, thing: dict) -> str | None:
     for t in all_tasks:
         status_counts[t["status"]] = status_counts.get(t["status"], 0) + 1
 
-    lines = [f"\U0001f4cb  {tree['label']} — {len(all_tasks)} task(s)"]
+    lines = [f"\U0001f4cb  {_display_safe(tree['label'])} — "
+             f"{len(all_tasks)} task(s)"]
+    # umwelt#1043 slice 4: the project's description, under the title. Absent
+    # (no line at all) when empty. Anyone may set_description, so it is
+    # resident text inside an engine render, and two rules keep it from
+    # passing for engine output:
+    # - every line is QUOTED under a "description:" header ("   | text"), so
+    #   no description line can start like an engine line ("   owners: ...",
+    #   "   status: ..."); an indent alone did not stop that (review r1);
+    # - every line goes through _display_safe (the Cc/Zl/Zp classes names and
+    #   labels refuse at the door, umwelt #874), so a terminal escape becomes
+    #   the placeholder instead of reaching another resident's terminal raw.
+    description = (db.get_project(conn, project_id) or {}).get(
+        "description") or ""
+    # - the render is bounded (Ariadne, #1173): the same helper and cap that
+    #   bound rendered thing descriptions (#147), applied BEFORE splitting so
+    #   the "…" stays inside a quoted line. Write-path caps are #1174.
+    desc_lines = _truncate_description(
+        description.strip(), _DESCRIPTION_MAX_LEN).splitlines()
+    if desc_lines:
+        lines.append("   description:")
+        for desc_line in desc_lines:
+            lines.append("   | " + _display_safe(desc_line.strip()))
+    # umwelt #1051: the header names the project's owners, role beside the
+    # name when there is one. A legacy project with no owners says so.
+    owners = db.list_project_owners(conn, project_id)
+    if owners:
+        lines.append("   owners: " + ", ".join(
+            o["agent"] + (f" ({o['role']})" if o["role"] else "")
+            for o in owners))
+    else:
+        lines.append("   owners: none yet")
     if status_counts:
         counts_line = ", ".join(
             f"{k}:{v}" for k, v in sorted(status_counts.items()))
@@ -1676,6 +2085,462 @@ def _render_project_board(conn, thing: dict) -> str | None:
         _render_task(root, 1)
 
     return "\n".join(lines)
+
+
+# umwelt #1051: the name of the extra content entry use() appends to a work
+# card. Self-describing on purpose: a reader sees "--- derived at read time:
+# projects owned ---" and knows this part is the world's, not the card's text.
+_WORK_CARD_SECTION_KEY = "derived at read time: projects owned"
+
+# umwelt #1068 / #1051: a project label shown inside ENGINE-COMPOSED text (the
+# work card section, the new-owner notification, the board title line). A
+# legacy row can hold a label that was never checked (newlines, ESC, U+2028):
+# shown raw, it could forge extra lines in text the reader trusts as the
+# world's. Such a label prints as this literal placeholder instead; the
+# project is NOT dropped. One predicate (_name_char_problem), one helper.
+_UNPRINTABLE_LABEL = "(unprintable label)"
+
+
+def _display_safe(text: str) -> str:
+    """`text` unchanged, or the placeholder if it holds any Cc/Zl/Zp
+    character (the same classes _name_char_problem refuses at the door)."""
+    return _UNPRINTABLE_LABEL if _name_char_problem(text) else text
+# The section lists at most this many projects; the rest become one
+# "... and N more" line (the header keeps the TOTAL). Bounds the output of a
+# card whose owner owns hundreds of projects.
+_WORK_CARD_MAX_PROJECTS = 50
+
+
+def _work_card_section(conn, thing: dict) -> str | None:
+    """The derived section of a work card (umwelt #1051), or None when
+    `thing` is not a usable card.
+
+    A card is a thing whose `metadata.work_card` is literally True AND whose
+    `metadata.owner` is a non-blank string (the card's SUBJECT -- NOT the
+    reader) that passes the same name check as any name (no control
+    character: a card author must not be able to forge engine-looking lines
+    through it) and is at most _NAME_MAX_LEN characters. Anything else
+    returns None: no section, no error.
+
+    Computed here, on every read, from `project_owners`; never stored:
+
+        Projects owned by <owner> (N):
+        - <label> [<status>]
+          move_to {"place": "<place id>"}
+        ... and <M> more
+        card.md last changed <YYYY-MM-DD>
+
+    or `Projects owned by <owner> (0): none.` for an owner with no projects.
+    Order: active, paused, done, archived, then label (db.projects_owned_by).
+    N is the TOTAL; at most _WORK_CARD_MAX_PROJECTS projects are listed and
+    the `... and M more` line (M = the rest) appears only when there are
+    some. The call is on its own line, 2-space indent, so that it runs as
+    printed (there is no effect that moves an avatar) and no line outgrows
+    78 columns with a 40-char label; the place id is not repeated on the
+    label line. A project with no room is one line:
+    `- <label> [<status>] (no room)`. The date is the thing's own
+    `updated_at`, falling back to `created_at` for a card never edited, so a
+    stale hand-written part is visible instead of silent. `<owner>` prints
+    in canonical form.
+    """
+    meta = thing.get("metadata") or {}
+    if meta.get("work_card") is not True:
+        return None
+    owner_raw = meta.get("owner")
+    if not isinstance(owner_raw, str):
+        return None
+    owner = _canonical_agent(owner_raw)
+    if (not owner or _name_char_problem(owner_raw)
+            or len(owner) > _NAME_MAX_LEN):
+        return None
+    projects = db.projects_owned_by(conn, owner)
+    if projects:
+        lines = [f"Projects owned by {owner} ({len(projects)}):"]
+        for p in projects[:_WORK_CARD_MAX_PROJECTS]:
+            if p["place_id"]:
+                lines.append(f"- {_display_safe(p['label'])} [{p['status']}]")
+                lines.append("  move_to "
+                             + json.dumps({"place": p["place_id"]}))
+            else:
+                lines.append(f"- {_display_safe(p['label'])} "
+                             f"[{p['status']}] (no room)")
+        rest = len(projects) - _WORK_CARD_MAX_PROJECTS
+        if rest > 0:
+            lines.append(f"... and {rest} more")
+    else:
+        lines = [f"Projects owned by {owner} (0): none."]
+    changed = thing.get("updated_at") or thing.get("created_at") or ""
+    lines.append(f"card.md last changed {changed[:10]}")
+    return "\n".join(lines)
+
+
+# --- the Project Register (umwelt #1074, slice A) ----------------------------
+#
+# A readable thing whose `metadata.project_register` is literally True gets ONE
+# extra content entry on every use(), derived from `projects`, `project_owners`
+# and `places`: the work card's mechanism (#1051), nothing stored. Filtering is
+# use() ARGS, not an act: every act appends to a capped action_log, and a read
+# must not spend a write budget (design authority's ruling on #1074).
+
+_PROJECT_REGISTER_SECTION_KEY = "derived at read time: project register"
+_REGISTER_STATUSES = ("active", "paused", "done", "archived")
+_REGISTER_ALLOWED = "(allowed: owner=, status=, q=, all)"
+_REGISTER_NARROW = "(narrow with owner= / status= / q=)"
+# Row caps (the header keeps the TOTALS), then a hard cap on the whole text.
+_REGISTER_MAX_OPEN_ROWS = 60
+_REGISTER_MAX_LIST_ROWS = 40        # the done list and the archived list
+_REGISTER_MAX_NOOWNER_LABELS = 10
+_REGISTER_MAX_OWNER_LINES = 30
+_REGISTER_MAX_ROOMS = 20
+_REGISTER_MAX_CHARS = 20000
+
+
+def _register_now():
+    """Today, for the register's ages. The ONE clock seam: the formatter below
+    takes `now` as an argument and never reads wall time itself."""
+    return _bin_datetime.now(_bin_timezone.utc)
+
+
+def _is_project_register(thing: dict) -> bool:
+    """True only for a literal `metadata.project_register is True` (a string
+    'true', 1 or a truthy dict does not flag a thing)."""
+    return ((thing.get("metadata") or {}).get("project_register")) is True
+
+
+def _parse_register_args(args):
+    """Parse the register's use() args. PURE. Returns (filters, None) or
+    (None, "register: <reason> (allowed: ...)"); never raises.
+
+    Args: `owner=<agent>` (case-folded like any agent handle; may repeat, and
+    the project must then have every one), `status=<active|paused|done|
+    archived>` (may repeat; they AND), `q=<text>` (at most one; a
+    case-insensitive substring of the label, the description or an owner
+    name), and the bare word `all` (list the archived projects too). All
+    filters AND together. An unknown key, a bad status, an empty `owner=` or
+    `q=`, a second `q=` or an empty argument is refused by name: nothing is
+    silently ignored. The offender is named through _display_safe.
+    """
+    def bad(reason):
+        return None, f"register: {reason} {_REGISTER_ALLOWED}"
+
+    owners, statuses, q, want_all, echo = [], [], None, False, []
+    for raw in args:
+        arg = raw.strip()
+        if not arg:
+            return bad("empty argument")
+        shown = _display_safe(arg)
+        echo.append(arg)
+        if "=" not in arg:
+            if arg.casefold() == "all":
+                want_all = True
+                continue
+            return bad(f"unknown argument '{shown}'")
+        key, _, value = arg.partition("=")
+        key, value = key.strip().casefold(), value.strip()
+        if key == "owner":
+            if not value:
+                return bad("empty owner=")
+            owners.append(_canonical_agent(value))
+        elif key == "status":
+            if value.casefold() not in _REGISTER_STATUSES:
+                return bad(f"bad status '{_display_safe(value)}'")
+            statuses.append(value.casefold())
+        elif key == "q":
+            if not value:
+                return bad("empty q=")
+            if q is not None:
+                return bad("more than one q=")
+            q = value.casefold()
+        else:
+            return bad(f"unknown argument '{shown}'")
+    return {
+        "owners": owners, "statuses": statuses, "q": q, "all": want_all,
+        "echo": echo,
+        "filtered": bool(owners or statuses or q is not None),
+        "show_archived": want_all or "archived" in statuses,
+    }, None
+
+
+def _register_matches(project: dict, owners: list, filters: dict) -> bool:
+    """Every filter must hold (AND)."""
+    names = [o["agent"] for o in owners]
+    canon = {_canonical_agent(n) for n in names}
+    if any(o not in canon for o in filters["owners"]):
+        return False
+    if any(project["status"] != s for s in filters["statuses"]):
+        return False
+    q = filters["q"]
+    if q is not None:
+        hay = [project["label"], project["description"], *names]
+        if not any(q in (h or "").casefold() for h in hay):
+            return False
+    return True
+
+
+_REGISTER_MIN_NEXT_STEPS = 3
+
+
+def _register_row(project: dict, owners: list, now,
+                  open_tasks: int | None = None,
+                  board_id: str | None = None) -> list[str]:
+    """One project as one to three lines. Every piece of text goes through
+    _display_safe; the room call is built with json.dumps like the work card's.
+    `open_tasks` (None: not an open-project row) adds `, open tasks: N` and,
+    under _REGISTER_MIN_NEXT_STEPS, ` (<3 next steps)`; `board_id` adds one more
+    runnable `look_at` line after the move_to call."""
+    if owners:
+        parts = []
+        for o in owners:
+            name = _display_safe(o["agent"])
+            role = o.get("role") or ""
+            parts.append(f"{name} ({_display_safe(role)})" if role else name)
+        owner_text = ", ".join(parts)
+    else:
+        owner_text = "(none)"
+    updated = project["updated_at"] or ""
+    try:
+        dt = _bin_datetime.fromisoformat(updated.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_bin_timezone.utc)
+        dt = dt.astimezone(_bin_timezone.utc)
+        n_now = now if now.tzinfo is not None else now.replace(
+            tzinfo=_bin_timezone.utc)
+        when = (f"updated {dt.date().isoformat()} "
+                f"({max(0, (n_now - dt).days)}d ago)")
+    except (ValueError, TypeError, AttributeError):
+        when = f"updated {_display_safe(str(updated)[:10])}"
+    line = (f"- {_display_safe(project['label'])} [{project['status']}] "
+            f"owners: {owner_text}, {when}")
+    if open_tasks is not None:
+        line += f", open tasks: {open_tasks}"
+        if open_tasks < _REGISTER_MIN_NEXT_STEPS:
+            line += " (<3 next steps)"
+    if project["place_id"]:
+        move = "  move_to " + json.dumps({"place": project["place_id"]})
+        if board_id:
+            # Its own line, built with json.dumps like the room call: both
+            # advertised calls run as printed (a trailing `  board <id>` on
+            # the move_to line broke copy-paste of that call).
+            return [line, move,
+                    "  look_at " + json.dumps({"thing": board_id})]
+        return [line, move]
+    return [line + " (no room)"]
+
+
+def _register_list(title: str, projects: list, owners_map: dict, now,
+                   cap: int, task_counts: dict | None = None,
+                   boards: dict | None = None) -> list[str]:
+    """A titled list of at most `cap` rows, then one `... and K more` line.
+    `task_counts`/`boards` are passed only for the open-projects list."""
+    lines = [title]
+    if not projects:
+        return lines + ["(none)"]
+    for p in projects[:cap]:
+        lines.extend(_register_row(
+            p, owners_map.get(p["id"], []), now,
+            None if task_counts is None else task_counts.get(p["id"], 0),
+            (boards or {}).get(p["id"])))
+    if len(projects) > cap:
+        lines.append(f"... and {len(projects) - cap} more {_REGISTER_NARROW}")
+    return lines
+
+
+def _format_project_register(projects: list, owners_map: dict, rooms: list,
+                             rooms_total: int, filters: dict, now,
+                             structural: tuple | list = (),
+                             task_counts: dict | None = None,
+                             boards: dict | None = None) -> str:
+    """The register text. PURE: no database, no clock (`now` is an argument).
+
+    `projects` are ALL projects (the header counts describe all of them even
+    under a filter), `owners_map` is db.project_owners_map's shape, `rooms` is
+    [{id, label, count}] already capped (count is None for a room the viewer
+    may not enter: it prints `(private)`) and `rooms_total` how many there are.
+    `structural` is the labels of the loose rooms flagged structural (umwelt
+    #1084): they print on ONE line under the rooms, never in the list, and
+    carry no count. Empty: no such line.
+    See _parse_register_args for the filters; the layout is pinned by
+    tests/test_project_register_1074.py.
+    `task_counts` {project_id: open tasks} and `boards` {project_id: board
+    thing id} annotate the open-projects rows only (done/archived rows are
+    untouched). `task_counts=None` means unknown: rows print no count (never a
+    false `open tasks: 0`); with a dict, an id absent from it counts 0. An id
+    absent from `boards` prints no board.
+    """
+    boards = boards if boards is not None else {}
+    rank = {s: i for i, s in enumerate(_REGISTER_STATUSES)}
+    order = lambda p: (rank[p["status"]], p["label"].casefold(), p["id"])
+    by_status = {s: [p for p in projects if p["status"] == s]
+                 for s in _REGISTER_STATUSES}
+    lines = [
+        f"Project Register: {len(projects)} projects "
+        f"({len(by_status['active'])} active, {len(by_status['paused'])} paused, "
+        f"{len(by_status['done'])} done, {len(by_status['archived'])} archived)"]
+    blocks: list[list[str]] = []
+
+    if filters["filtered"]:
+        lines.append("Filter: " + " ".join(
+            _display_safe(a) for a in filters["echo"]))
+        matched = [p for p in projects
+                   if _register_matches(p, owners_map.get(p["id"], []), filters)]
+        hidden = [] if filters["show_archived"] else [
+            p for p in matched if p["status"] == "archived"]
+        shown = [p for p in matched if p not in hidden]
+        lines.append(f"Matching: {len(shown)}")
+        if not shown:
+            lines.append("No projects match.")
+        open_p = sorted((p for p in shown if p["status"] in ("active", "paused")),
+                        key=order)
+        done_p = sorted((p for p in shown if p["status"] == "done"), key=order)
+        arch_p = sorted((p for p in shown if p["status"] == "archived"),
+                        key=order)
+        if open_p:
+            blocks.append(_register_list(
+                "Open projects (active, paused):", open_p, owners_map, now,
+                _REGISTER_MAX_OPEN_ROWS, task_counts, boards))
+        if done_p:
+            blocks.append(_register_list(
+                "Done, awaiting archive:", done_p, owners_map, now,
+                _REGISTER_MAX_LIST_ROWS))
+        if arch_p:
+            blocks.append(_register_list(
+                "Archived:", arch_p, owners_map, now, _REGISTER_MAX_LIST_ROWS))
+        if hidden:
+            blocks.append([f"Archived (hidden): {len(hidden)}. "
+                           "Add arg 'all' to list them."])
+    else:
+        open_p = sorted(by_status["active"] + by_status["paused"], key=order)
+        per_owner: dict[str, int] = {}
+        for p in open_p:
+            for o in owners_map.get(p["id"], []):
+                per_owner[o["agent"]] = per_owner.get(o["agent"], 0) + 1
+        lines.append("Open projects by owner:")
+        ranked = sorted(per_owner.items(), key=lambda kv: (-kv[1], kv[0]))
+        for agent, n in ranked[:_REGISTER_MAX_OWNER_LINES]:
+            lines.append(f"- {_display_safe(agent)}: {n}")
+        if len(ranked) > _REGISTER_MAX_OWNER_LINES:
+            lines.append(f"... and {len(ranked) - _REGISTER_MAX_OWNER_LINES} more")
+        if not ranked:
+            lines.append("(none)")
+        ownerless = [p for p in open_p if not owners_map.get(p["id"])]
+        lines.append(f"Open projects with no owner: {len(ownerless)}")
+        for p in ownerless[:_REGISTER_MAX_NOOWNER_LABELS]:
+            lines.append(f"- {_display_safe(p['label'])}")
+        if len(ownerless) > _REGISTER_MAX_NOOWNER_LABELS:
+            lines.append(f"... and "
+                         f"{len(ownerless) - _REGISTER_MAX_NOOWNER_LABELS} more")
+        blocks.append(_register_list(
+            "Open projects (active, paused):", open_p, owners_map, now,
+            _REGISTER_MAX_OPEN_ROWS, task_counts, boards))
+        blocks.append(_register_list(
+            "Done, awaiting archive:", sorted(by_status["done"], key=order),
+            owners_map, now, _REGISTER_MAX_LIST_ROWS))
+        if filters["show_archived"]:
+            blocks.append(_register_list(
+                "Archived:", sorted(by_status["archived"], key=order),
+                owners_map, now, _REGISTER_MAX_LIST_ROWS))
+        elif by_status["archived"]:
+            blocks.append([f"Archived (hidden): {len(by_status['archived'])}. "
+                           "Add arg 'all' to list them."])
+        room_lines = ["Rooms with no project row:"]
+        for r in rooms:
+            n = r["count"]     # None: the viewer may not enter (private)
+            tail = ("(private)" if n is None
+                    else f"({n} thing{'s' if n != 1 else ''})")
+            room_lines.append(f"- {_display_safe(r['label'])} "
+                              f"[{_display_safe(r['id'])}] {tail}")
+        if rooms_total > len(rooms):
+            room_lines.append(f"... and {rooms_total - len(rooms)} more")
+        if not rooms:
+            room_lines.append("(none)")
+        if structural:
+            # Capped like the gap list (same limit, same "... and N more"
+            # wording): an uncapped line is the one list that could push the
+            # whole register past _REGISTER_MAX_CHARS and be dropped, hiding
+            # every flagged room.
+            names = [_display_safe(label)
+                     for label in structural[:_REGISTER_MAX_ROOMS]]
+            if len(structural) > _REGISTER_MAX_ROOMS:
+                names.append(f"... and "
+                             f"{len(structural) - _REGISTER_MAX_ROOMS} more")
+            room_lines.append(
+                "Structural (no project by design): " + ", ".join(names))
+        blocks.append(room_lines)
+
+    for b in blocks:
+        lines.append("")
+        lines.extend(b)
+    text = "\n".join(lines)
+    if len(text) <= _REGISTER_MAX_CHARS:
+        return text
+    trailer = (f"... output truncated at {_REGISTER_MAX_CHARS} characters "
+               f"{_REGISTER_NARROW}")
+    kept, used = [], len(trailer)
+    for ln in lines:
+        if used + len(ln) + 1 > _REGISTER_MAX_CHARS:
+            break
+        kept.append(ln)
+        used += len(ln) + 1
+    return "\n".join(kept + [trailer])
+
+
+def _project_register_section(conn, thing: dict, args, *, now=None,
+                              viewer=None):
+    """The derived register entry for `thing`, or None when `thing` is not a
+    register (metadata.project_register is not literally True). `args` is
+    use()'s list of strings (see _parse_register_args); a bad one returns the
+    one-line `register: ...` refusal instead of the table.
+
+    `viewer` is the canonical agent use() resolved, or None. A room's
+    existence, label and id are public, but its INTERIOR (here: its thing
+    count) is only for whoever may enter it (db._place_interior_visible_to,
+    umwelt#538 rev 3 rule 2): a room the viewer may not enter prints
+    `(private)`, and its count is never even queried.
+
+    Read-only: ONE query for the projects, ONE for the owners map, one grouped
+    open-task count and one board lookup for the row annotations, one for the
+    register's place's children, one for which of them are flagged structural
+    (#1084) and one grouped count for the rooms listed
+    that the viewer may enter: a constant number of statements however many
+    projects or rooms there are.
+    """
+    if not _is_project_register(thing):
+        return None
+    filters, err = _parse_register_args(list(args or []))
+    if err is not None:
+        return err
+    projects = db.list_projects(conn)
+    owners_map = db.project_owners_map(conn)
+    rooms: list[dict] = []
+    rooms_total = 0
+    structural: list[str] = []
+    own_place = thing.get("place_id")
+    if own_place and not filters["filtered"]:
+        taken = {p["place_id"] for p in projects if p["place_id"]}
+        loose = [c for c in db.get_place_children(conn, own_place)
+                 if c["id"] not in taken and c["id"] != own_place]
+        # umwelt #1084: a loose room whose own metadata.structural is True
+        # moves to its own line (named, never counted, never dropped); a
+        # project's room is not loose, so the flag cannot take it out of
+        # the project rows.
+        flagged = db.structural_child_ids(conn, own_place)
+        structural = [c["label"] for c in loose if c["id"] in flagged]
+        loose = [c for c in loose if c["id"] not in flagged]
+        rooms_total = len(loose)
+        listed = loose[:_REGISTER_MAX_ROOMS]
+        enterable = {c["id"] for c in listed
+                     if db._place_interior_visible_to(c, viewer)}
+        counts = db.count_live_things_by_place(
+            conn, [c["id"] for c in listed if c["id"] in enterable])
+        rooms = [{"id": c["id"], "label": c["label"],
+                  "count": (counts.get(c["id"], 0)
+                            if c["id"] in enterable else None)}
+                 for c in listed]
+    return _format_project_register(
+        projects, owners_map, rooms, rooms_total, filters,
+        now if now is not None else _register_now(), structural,
+        db.open_task_counts_by_project(conn),
+        db.project_board_ids(conn, _PROJECT_BOARD_KIND_ID))
 
 
 def _render_charge_board(thing: dict) -> str | None:
@@ -2815,7 +3680,19 @@ _KIND_CHAIN_MAX_NODES = _KIND_EXTENDS_MAX_HOPS + 1
 # kinddef-creation time. See act()'s authorization loop for the DB-backed
 # branch, and _apply_effect_grant_caller/_apply_effect_revoke_caller for
 # the ONLY write path to thing_grants.
-_KIND_CALLER_CLOSED_SET = ("author", "place_owner", "anyone", "granted")
+#
+# `package` (umwelt#1043 slice 2) is the second DB-adjacent member: true iff
+# the thing's author carries the reserved `world:` prefix AND the thing is one
+# the loaded package created (its id is in world_package.thing_ids) AND the
+# caller is a registered resident. The reserved prefix is refused at
+# enter/register AND at identity resolution (resolve_actor will not resolve an
+# unauthenticated declared name that carries it), and the thing_ids test means
+# a thing that merely has such an author string is not package content. A
+# world that already held an avatar with such a name BEFORE this change is not
+# checked. The class is deliberately NOT a general "anyone": an action opts in
+# by naming it, and today only the charge board's `add-entry` does.
+_KIND_CALLER_CLOSED_SET = ("author", "place_owner", "anyone", "granted",
+                           "package")
 
 # umwelt#300 S0(d): the literal cohort marker create_thing stamps onto
 # every NEWLY forged thing (via _create_thing_from_spec — see that
@@ -2900,13 +3777,27 @@ def _validate_caller_list(callers, context: str) -> None:
 # rather than the retire+add workaround that mints a new id and loses the
 # original entry's provenance (see _apply_effect_board_entry_edit's
 # docstring).
+# `project_owner_add` / `project_owner_remove` (umwelt #1051) edit the
+# acting board's OWN project's owner list (project_owners), the same
+# board->project fail-close as project_set, with the caller rule (owners
+# plus the world's project owner admins, _ids.project_owner_admins();
+# bootstrap on an ownerless project) enforced INSIDE the effect
+# from the server-derived acting agent -- see
+# _apply_effect_project_owner_add.
+# `project_archive` / `project_restore` (umwelt #1074 slice B) archive or
+# restore the acting board's OWN project: status and the room's parent move
+# in ONE transaction, the caller rule (owners plus the world's project archive admins,
+# _ids.project_archive_admins()) is decided
+# inside that write -- see _apply_effect_project_archive.
 _KIND_EFFECT_CLOSED_SET = ("move_to", "notify_author", "project_task_set",
                             "agent_state_set", "project_task_create",
                             "project_task_link", "project_set",
                             "project_create", "grant_caller",
                             "revoke_caller", "board_entry_add",
                             "board_entry_retire", "action_log_rotate",
-                            "source_append", "board_entry_edit")
+                            "source_append", "board_entry_edit",
+                            "project_owner_add", "project_owner_remove",
+                            "project_archive", "project_restore")
 
 # Per-effect-type allowed key sets (umwelt #114 round 2) — an effect row is
 # validated closed, not just its `type`: any key beyond the type's own
@@ -2930,6 +3821,15 @@ _KIND_EFFECT_ALLOWED_KEYS = {
     "board_entry_edit": {"type", "entry_id_arg", "text_arg"},
     "action_log_rotate": {"type"},
     "source_append": {"type", "path_arg", "text_arg"},
+    # umwelt #1051: like project_set, bound to the board's OWN project and
+    # carrying NO key that could name another one -- only the arg names the
+    # target AGENT (and, for add, the optional role) arrives in.
+    "project_owner_add": {"type", "agent_arg", "role_arg"},
+    "project_owner_remove": {"type", "agent_arg"},
+    # umwelt #1074: bound to the board's OWN project and carrying no key at
+    # all that could name another one, or anything else -- only the type.
+    "project_archive": {"type"},
+    "project_restore": {"type"},
 }
 
 # board_entry_add/board_entry_retire's caps (umwelt #400) — same
@@ -3643,6 +4543,24 @@ def _validate_kinddef_source(source: dict) -> dict:
                         f"kinddef.json actions[{aname!r}].effects[{i}] "
                         "(project_set) requires a non-empty string "
                         "'value_arg'", 422)
+            elif etype in ("project_archive", "project_restore"):
+                # Nothing else to validate: _KIND_EFFECT_ALLOWED_KEYS has
+                # already refused every key but `type` above.
+                pass
+            elif etype in ("project_owner_add", "project_owner_remove"):
+                agent_arg = effect.get("agent_arg")
+                if not isinstance(agent_arg, str) or not agent_arg.strip():
+                    raise _ThingSpecError(
+                        f"kinddef.json actions[{aname!r}].effects[{i}] "
+                        f"({etype}) requires a non-empty string "
+                        "'agent_arg'", 422)
+                if "role_arg" in effect:
+                    role_arg = effect.get("role_arg")
+                    if not isinstance(role_arg, str) or not role_arg.strip():
+                        raise _ThingSpecError(
+                            f"kinddef.json actions[{aname!r}].effects[{i}] "
+                            f"({etype}).role_arg, if given, must be a "
+                            "non-empty string", 422)
             elif etype == "project_create":
                 label_arg = effect.get("label_arg")
                 if not isinstance(label_arg, str) or not label_arg.strip():
@@ -3950,6 +4868,36 @@ def _record_place_gate(conn, viewer: str | None, place_id: str, subject: str):
             }), 403))
 
 
+def _is_package_thing(conn, thing_id: str) -> bool:
+    """True iff `thing_id` is one of the things the loaded world package
+    created (a value of world_package.thing_ids). One query; fails CLOSED if
+    the table or column is absent, the column is NULL, or it does not parse."""
+    try:
+        rows = conn.execute(
+            "SELECT thing_ids FROM world_package WHERE thing_ids IS NOT NULL"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return False
+    for (raw,) in rows:
+        try:
+            if thing_id in json.loads(raw).values():
+                return True
+        except (ValueError, AttributeError, TypeError):
+            continue
+    return False
+
+
+def _package_caller_ok(conn, agent: str, thing: dict) -> bool:
+    """The `package` caller class (umwelt#1043): the thing was made by the
+    loaded world package (its author carries the reserved `world:` prefix AND
+    its id is in world_package.thing_ids) and `agent` is a registered
+    resident (has an avatar — the same test the other write routes use). One
+    implementation for every site that consults the class."""
+    return (_has_reserved_agent_prefix(thing["author"])
+            and db.avatar_exists(conn, agent)
+            and _is_package_thing(conn, thing["id"]))
+
+
 def _callers_authorized(conn, callers: list[str], agent: str, thing: dict) -> bool:
     """Whether `agent` is authorized under ANY of the declared `callers`
     caller classes against `thing` — the shared evaluation loop for BOTH
@@ -3973,6 +4921,8 @@ def _callers_authorized(conn, callers: list[str], agent: str, thing: dict) -> bo
         if caller == "place_owner" and place_owner is not None and agent == place_owner:
             return True
         if caller == "granted" and db.has_grant(conn, thing["id"], agent):
+            return True
+        if caller == "package" and _package_caller_ok(conn, agent, thing):
             return True
         if caller.startswith("named:") and agent == _canonical_agent(caller[len("named:"):]):
             return True
@@ -4598,6 +5548,47 @@ _PROJECT_BOARD_KINDDEF_JSON: dict = {
             "effects": [{"type": "project_set", "field": "status",
                          "value_arg": "status"}],
         },
+        # umwelt#1043 slice 4: the project's own description, same binding
+        # (project_set is bound to the board's own project) and same callers
+        # as set_project_status. A board's description is what a newcomer
+        # reads first; before this the only way to write one was the
+        # founding call.
+        "set_description": {
+            "callers": ["anyone"], "requires": ["description"], "from": [],
+            "to": None,
+            "effects": [{"type": "project_set", "field": "description",
+                         "value_arg": "description"}],
+        },
+        # umwelt #1051: owners. `callers: anyone` reaches the effect; WHO may
+        # actually change owners (owners plus the world's project owner admins; bootstrap on an ownerless
+        # project) is enforced inside the effect from the acting agent, the
+        # same way project_set is bound to the board's own project.
+        "add_owner": {
+            "callers": ["anyone"], "requires": ["agent"], "from": [],
+            "to": None,
+            "effects": [{"type": "project_owner_add", "agent_arg": "agent",
+                         "role_arg": "role"}],
+        },
+        "remove_owner": {
+            "callers": ["anyone"], "requires": ["agent"], "from": [],
+            "to": None,
+            "effects": [{"type": "project_owner_remove",
+                         "agent_arg": "agent"}],
+        },
+        # umwelt #1074 slice B: archive / restore this board's OWN project.
+        # `callers: anyone` reaches the effect; WHO may (the project's
+        # owners, the world's project archive admins) is decided inside the guarded write from the
+        # acting agent. No args: nothing can name another project.
+        "archive_project": {
+            "callers": ["anyone"], "requires": [], "from": [],
+            "to": None,
+            "effects": [{"type": "project_archive"}],
+        },
+        "restore_project": {
+            "callers": ["anyone"], "requires": [], "from": [],
+            "to": None,
+            "effects": [{"type": "project_restore"}],
+        },
     },
 }
 
@@ -4661,7 +5652,7 @@ def _ensure_engine_kinddef(conn, things_dir: Path, kind_id: str,
         try:
             _write_source(things_dir, kind_id, new_source)
             db.create_thing(
-                conn, id=kind_id, place_id=db.WORKSHOP_PLACE_ID,
+                conn, id=kind_id, place_id=db.role_place_id(conn, "workshop"),
                 name=name, description=description,
                 kind="kinddef", exec_command=None, metadata={},
                 author="engine", created_at=db.now_iso(),
@@ -4732,11 +5723,14 @@ def _ensure_project_board_kinddef(conn, things_dir: Path) -> str:
     kind_description = (
         "The project board kind (umwelt #221/#227) — claim/hand_off/"
         "set_status act on a bound project's tasks via project_task_set; "
-        "add_task/add_subtask/link_dep/unlink_dep/set_project_status "
+        "add_task/add_subtask/link_dep/unlink_dep/set_project_status/set_description "
         "(S4) create tasks, link/unlink task_deps, and mutate the bound "
-        "project's own status. callers=anyone is safe because every "
+        "project's own status; add_owner/remove_owner (#1051) edit the "
+        "bound project's owners (owners plus the world's project admins, "
+        "enforced in the "
+        "effect). callers=anyone is safe because every "
         "board-bound effect fail-closes any write outside this board's "
-        "own bound project (umwelt #161 S2 / #227 S4, ob_2892)."
+        "own bound project (umwelt #161 S2 / #227 S4)."
     )
     return _ensure_engine_kinddef(
         conn, things_dir, _PROJECT_BOARD_KIND_ID, _PROJECT_BOARD_KINDDEF_JSON,
@@ -4811,7 +5805,8 @@ def _ensure_project_registrar(conn, things_dir: Path) -> str:
         try:
             db.create_thing(
                 conn, id=_PROJECT_REGISTRAR_THING_ID,
-                place_id=db.WORKSHOP_PLACE_ID, name="project_registrar",
+                place_id=db.role_place_id(conn, "workshop"),
+                name="project_registrar",
                 description=instance_description, kind="readable",
                 exec_command=None,
                 metadata={"kind_id": _PROJECT_REGISTRAR_KIND_ID},
@@ -4857,8 +5852,11 @@ _CHARGE_BOARD_KINDDEF_JSON: dict = {
     "extends": None,
     "fields": {},
     "actions": {
+        # `package` (umwelt#1043): a board a world package made is
+        # APPEND-ONLY for residents -- add-entry is the one action that names
+        # the class; edit, retire, grants and rotation stay author/granted.
         "add-entry": {
-            "callers": ["author", "granted"], "requires": ["text"],
+            "callers": ["author", "granted", "package"], "requires": ["text"],
             "from": [], "to": None,
             "effects": [{"type": "board_entry_add", "text_arg": "text"}],
         },
@@ -5235,7 +6233,7 @@ def _apply_effect_project_task_create(
     of the board's structure-editing surface — creates a NEW task under
     the acting board thing's OWN bound project (`thing.metadata.
     project_id`), never a caller-named project. Same board->project
-    fail-close posture as `_apply_effect_project_task_set` (ob_2892):
+    fail-close posture as `_apply_effect_project_task_set`:
     until a board is bound, this effect always refuses; there is no field
     in `args` or the effect schema that can name a different project.
 
@@ -5318,7 +6316,7 @@ def _apply_effect_project_task_link(conn, thing: dict, actor: str,
     add/remove a `task_deps` edge between two tasks.
 
     BOARD-BOUND, same posture as `project_task_set`/`project_task_create`
-    (ob_2892 — corrected here after a reviewer-fairy catch found this
+    (corrected here after a reviewer-fairy catch found this
     effect had shipped WITHOUT the bound despite the spec/security-review
     both requiring it): refuses when the acting board thing has no
     `metadata.project_id`, and refuses unless BOTH `task_id` and
@@ -5397,7 +6395,7 @@ def _apply_effect_project_task_link(conn, thing: dict, actor: str,
                 f"{depends_on_task['project_id']!r}) are not in the same "
                 "project")
 
-    # BOARD-SCOPE BOUND (ob_2892 — load-bearing, do not omit; the reviewer-
+    # BOARD-SCOPE BOUND (load-bearing, do not omit; the reviewer-
     # fairy fix): the same-project-as-each-other check above is NOT enough
     # on its own — it never verifies against the ACTING BOARD's own bound
     # project, so without this check a board bound to project A could
@@ -5488,6 +6486,433 @@ def _apply_effect_project_set(conn, thing: dict, actor: str, args: dict,
         return f"project {board_project!r} not found"
 
     db.update_project(conn, board_project, {field: value}, db.now_iso())
+    return None
+
+
+# umwelt #1051: project owners. The ruling (Ariadne, issue #1051): owners plus
+# the world's owner admins may add or remove an owner; an ownerless legacy
+# project may be given its FIRST owner by an owner admin or by the project's
+# created_by; a project keeps at least one owner while it is active or paused
+# (done and archived are exempt).
+# umwelt #1166: the owner admins are world config, read at call time by
+# `_ids.project_owner_admins()` (env UMWELT_PROJECT_OWNER_ADMINS), never a
+# handle literal here: registration is open, so a literal is claimable.
+# umwelt #1074: besides a project's owners, the world's archive admins
+# (`_ids.project_archive_admins()`, env UMWELT_PROJECT_ARCHIVE_ADMINS) may
+# archive or restore ANY project (Village Law D3 / A5: the maintainer may move
+# and archive anyone's resolved work). Named in config, not a new caller
+# class (the engine has no "maintainer" class, by ruling).
+# The one place an archived project's room is moved to. Made by hand in a
+# world; the engine never creates it (an absent one is a named refusal).
+_PROJECT_ARCHIVED_PLACE_ID = "place_archived"
+_PROJECT_OWNER_ROLE_MAX_LEN = 32
+# Statuses in which a project must keep at least one owner.
+_PROJECT_OWNER_KEEP_ONE_STATUSES = ("active", "paused")
+
+
+def _project_owner_edit_refusal(conn, project: dict, actor: str) -> str | None:
+    """The caller rule for add_owner / remove_owner, enforced from the
+    server-derived acting agent (`actor`, already canonical). None = allowed,
+    else a reason that names the rule.
+
+      * owners of the project, and the world's owner admins: always;
+      * a project with NO owners (every pre-#1051 project): an owner admin,
+        or the project's created_by, may add the FIRST owner -- after that it
+        is owners-plus-admins like any other.
+    """
+    if actor in _project_owner_admins():
+        return None
+    owners = [o["agent"] for o in db.list_project_owners(conn, project["id"])]
+    if owners:
+        if actor in owners:
+            return None
+        return (f"only this project's owners or a project admin of this "
+                f"world may add or remove an owner; {actor or '(no agent)'!r} is not an owner of "
+                f"{project['label']!r}")
+    if actor and actor == _canonical_agent(project["created_by"]):
+        return None
+    return (f"{project['label']!r} has no owners yet: only a project admin "
+            "or the project's founder (created_by) may add its first owner")
+
+
+def _project_move_refusal_text(code: str, project: dict, actor: str, *,
+                               restore: bool, target: str) -> str:
+    """The named reason for one `db.project_move_blocker` code. Every code
+    has its own wording (a caller must be able to tell them apart)."""
+    label = _display_safe(project["label"])
+    verb = "restored" if restore else "archived"
+    if code == "not_allowed":
+        return (f"only this project's owners or a project admin of this "
+                f"world may archive or restore a project; {actor or '(no agent)'!r} is not an "
+                f"owner of {label!r}")
+    if code == "already_archived":
+        return f"{label!r} is already archived"
+    if code == "not_archived":
+        return (f"{label!r} is not archived (status {project['status']}): "
+                "only an archived project can be restored")
+    if code == "no_owner":
+        return (f"{label!r} has no owner: add an owner first (add_owner), "
+                "then restore it")
+    if code == "no_room":
+        return (f"{label!r} has no room (no place_id), so there is nothing "
+                f"to move and it cannot be {verb}")
+    if code == "room_missing":
+        return (f"the room row is missing: {label!r} points at "
+                f"{project['place_id']!r}, which does not exist")
+    if code == "target_missing":
+        return (f"{target!r} must exist first: the engine does not create "
+                f"it, so {label!r} cannot be {verb} until it does")
+    if code == "room_is_target":
+        return (f"the room of {label!r} is {target!r} itself: it cannot be "
+                f"{verb} into itself")
+    if code == "cycle":
+        return (f"moving the room of {label!r} under {target!r} would "
+                f"create a cycle ({target!r} is inside that room)")
+    if code == "project_missing":
+        return f"project {project['id']!r} not found"
+    return f"refused ({code})"
+
+
+def _apply_effect_project_move(conn, thing: dict, actor: str, restore: bool
+                               ) -> tuple[str | None, dict | None]:
+    """Shared body of `project_archive` / `project_restore`: bind to the
+    board's own project, pre-check for a readable reason, then the guarded
+    write (db.archive_project / db.restore_project), which is the authority."""
+    board_project = (thing.get("metadata") or {}).get("project_id")
+    if board_project is None:
+        return ("board thing is not bound to a project "
+                "(no metadata.project_id)"), None
+    project = db.get_project(conn, board_project)
+    if project is None:
+        return f"project {board_project!r} not found", None
+
+    actor = _canonical_agent(actor)
+    is_admin = actor in _project_archive_admins()
+    target = (db.role_place_id(conn, "workshop") if restore
+              else _PROJECT_ARCHIVED_PLACE_ID)
+
+    def refusal(proj: dict) -> str | None:
+        code = db.project_move_blocker(
+            conn, board_project, actor, is_admin=is_admin, restore=restore,
+            target_place_id=target,
+            archived_place_id=_PROJECT_ARCHIVED_PLACE_ID)
+        if code is None:
+            return None
+        return _project_move_refusal_text(code, proj, actor, restore=restore,
+                                          target=target)
+
+    # (1) The courtesy pre-check: gives the readable reason. NOT the
+    # authority -- the guarded write below re-decides everything.
+    reason = refusal(project)
+    if reason is not None:
+        return reason, None
+
+    # (2) The authority: one transaction, every guard re-read inside it.
+    verb = "restore" if restore else "archive"
+    write = db.restore_project if restore else db.archive_project
+    kwargs = ({"workshop_place_id": target,
+               "archived_place_id": _PROJECT_ARCHIVED_PLACE_ID} if restore
+              else {"archived_place_id": target})
+    try:
+        result = write(conn, board_project, actor, is_admin=is_admin,
+                       at=db.now_iso(), **kwargs)
+    except sqlite3.Error as e:
+        return f"{verb} failed, nothing was changed: {e}", None
+    if result is None:
+        # Refused at the write (a lost race): nothing was written. The
+        # reason is composed from a read taken NOW; the write was authoritative.
+        project = db.get_project(conn, board_project) or project
+        return (refusal(project)
+                or f"{verb} was refused at the write because the project "
+                   "changed while the request ran; nothing was changed, "
+                   "try again"), None
+    return None, result
+
+
+def _apply_effect_project_archive(conn, thing: dict, actor: str, args: dict,
+                                  effect: dict) -> tuple[str | None, dict | None]:
+    """`project_archive` effect (umwelt #1074 slice B): archive the acting
+    board's OWN bound project (`thing.metadata.project_id`) -- `status ->
+    archived` and the project's room reparented straight under
+    `place_archived` (one hop), as ONE transaction (db.archive_project). The
+    room's things and child rooms follow the room by reference (Law D2);
+    no thing row is touched, and things the owner had already carried
+    elsewhere stay where they are. Like `project_set` there is no argument
+    that names a project (the effect takes NO keys, and `args` is never read):
+    the binding is server-owned.
+
+    Who may: the project's owners (project_owners rows) plus
+    the world's archive admins (`_ids.project_archive_admins()`), judged against the server-derived canonical
+    acting agent, INSIDE the guarded write. A pre-check gives the readable
+    reason; the write is the authority, so two racing requests cannot both
+    pass.
+
+    Allowed from any status except archived. Named refusals (nothing is
+    written for any of them): not an owner or archive admin; already archived; the
+    project has no room; the room row is missing; `place_archived` does not
+    exist (never created here); the room IS `place_archived`; the reparent
+    would create a cycle. No auto-archive anywhere: `done` archives nothing.
+
+    The room's current parent is recorded in the same write, in the room's
+    own `places.metadata` under `archived_from_parent` (umwelt #1094), so
+    `project_restore` can put the room back; nothing is recorded when the
+    room has no parent, is already under `place_archived`, or its metadata
+    is not a JSON object (the archive still succeeds).
+
+    Best-effort like every project-board effect. Returns `(None, result)` on
+    success, `result` = {project, status, room, moved_to, things_in_room,
+    child_rooms, archived_from} (archived_from = the parent recorded, or
+    None) read into act()'s `effect_results`; else `(reason, None)`."""
+    return _apply_effect_project_move(conn, thing, actor, restore=False)
+
+
+def _apply_effect_project_restore(conn, thing: dict, actor: str, args: dict,
+                                  effect: dict) -> tuple[str | None, dict | None]:
+    """`project_restore` effect (umwelt #1074 slice B): the reverse of
+    `project_archive` on the acting board's OWN project -- allowed ONLY from
+    archived; `status -> active` (always -- not the status the project had
+    before it was archived) and the room's parent back to the parent it had
+    before archive when that parent still exists and the move is sound,
+    otherwise to the workshop, ONE transaction. The pre-archive parent is the
+    room's `places.metadata.archived_from_parent` (consumed by the restore;
+    an owner replacing the room metadata after archive therefore forces the
+    workshop). The result says which: `restored_to` (== `moved_to`),
+    `fallback` (None, or one of no_record / parent_missing / parent_is_room /
+    parent_is_archive / parent_cycle / record_malformed) and `fallback_text`
+    (None, or one plain sentence saying why the workshop was used) -- these
+    ride in `effect_results`, which the MCP `act` tool prints, so the
+    sentence reaches the agent. Same binding, same who-may rule, same
+    guarded-write posture. Also refuses (by name, nothing written) a project with NO owner
+    row -- an archived project is exempt from keep-one, so it may have none --
+    with a reason that says to add an owner first; that guard is inside the
+    write too, so an owner removed after the pre-check makes the write refuse.
+    Other named refusals: not archived; no room; the room row is missing; the
+    EFFECTIVE target (the recorded parent, else the workshop) does not exist,
+    is the room, or would create a cycle -- so an unusable record falls back
+    to the workshop rather than refusing. `act()` has no
+    presence requirement, so an owner need not be standing in the archived
+    room. Returns `(None, result)` like `_apply_effect_project_archive`."""
+    return _apply_effect_project_move(conn, thing, actor, restore=True)
+
+
+def _project_owner_target(args: dict, effect: dict) -> tuple[str | None, str | None]:
+    """(canonical agent, None) from `args[effect.agent_arg]`, or
+    (None, reason). One line of plain text, folded through _canonical_agent
+    -- 'Sol' and 'sol' are one owner."""
+    agent_arg = effect["agent_arg"]
+    raw = args.get(agent_arg)
+    if not isinstance(raw, str) or not raw.strip():
+        return None, f"agent_arg {agent_arg!r} value is missing or not a non-empty string"
+    problem = _name_char_problem(raw)
+    if problem:
+        return None, f"agent {problem}"
+    agent = _canonical_agent(raw)
+    if len(agent) > _NAME_MAX_LEN:
+        return None, (f"agent name exceeds the {_NAME_MAX_LEN}-char limit "
+                      f"(got {len(agent)})")
+    return agent, None
+
+
+# The named rule, used when a refusal's reason cannot be derived afresh (a lost
+# race whose re-read happens to look authorized again).
+_PROJECT_OWNER_RULE_TEXT = (
+    "only this project's owners or a project admin of this world may add or "
+    "remove an owner; on a project with no owners yet, a project admin or the "
+    "project's founder (created_by) may add the first one")
+
+
+def _is_registered_identity(conn, agent: str) -> bool:
+    """True iff `agent` (canonical) is a registered agent or a human
+    resident. Built from the two predicates the world already uses and
+    nothing else: the avatar registry send_crossing validates `to_agent`
+    against (`db.list_avatar_agents`, umwelt #835), and `db.is_human_sender`
+    (a registered type=human avatar, or the `_ids.human_residents()`
+    pre-registration list). No second notion of "registered" is introduced.
+    """
+    return (agent in set(db.list_avatar_agents(conn))
+            or db.is_human_sender(conn, agent))
+
+
+def _notify_new_owner(conn, project: dict, agent: str, actor: str,
+                      role: str | None) -> str | None:
+    """Tell a newly added owner. Same server-side mechanism as
+    `_apply_effect_notify_author`: a crossing built by `db.build_crossing`
+    with `sender=actor`, into the recipient's home Post
+    (`place_post_<agent>`), `to_agent=<agent>`, and the wake decided by
+    `_evaluate_wake(..., wake=False)` -- the effect's default, so this is an
+    ORDINARY addressed crossing, never a gong. The recipient is the target
+    the effect resolved server-side, never a caller-supplied field. Like
+    notify_author it does not mint a Post: a target with none cannot be told.
+
+    The text is engine-composed: one short sentence (project label and role
+    through _display_safe) and, when the project has a room, the runnable
+    move_to call alone on its own line. Returns None, or a reason."""
+    home = f"place_post_{agent}"
+    if db.get_place(conn, home) is None:
+        return (f"notification to {agent!r} not sent: {agent!r} has no Post "
+                "— never registered")
+    body = (f"{actor} added you as an owner of project "
+            f"'{_display_safe(project['label'])}'")
+    if role:
+        body += f" (role: {_display_safe(role)})"
+    body += "."
+    if project.get("place_id"):
+        body += "\nmove_to " + json.dumps({"place": project["place_id"]})
+    try:
+        wake_granted, _wake_status = _evaluate_wake(conn, actor, agent, False)
+        sent_at = db.now_iso()
+        db.build_crossing(
+            conn, id=str(uuid.uuid4()), sender=actor, destination=home,
+            sent_at=sent_at, received_at=sent_at, crossing_latency_s=0.0,
+            crossing_hops=0, body=body, to_agent=agent,
+            wake_granted=wake_granted,
+        )
+    except Exception as e:  # best-effort: never undo the owner row
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return f"notification to {agent!r} failed: {e}"
+    return None
+
+
+def _apply_effect_project_owner_add(conn, thing: dict, actor: str, args: dict,
+                                    effect: dict) -> str | None:
+    """`project_owner_add` effect (umwelt #1051): add `args[agent_arg]` as an
+    owner of the acting board's OWN bound project (`thing.metadata.
+    project_id`), or -- when they already own it -- update their role. Like
+    `project_set` there is no argument that names a project: the binding is
+    server-owned, so nothing in `args` can redirect the write.
+
+    Order: (1) the caller rule as a fast pre-check that gives the readable
+    reason (_project_owner_edit_refusal); (2) the target: a string, one line,
+    <= 40 chars, case-folded; (3) the target must be a REGISTERED identity
+    (_is_registered_identity) -- add only, on the canonical name, before any
+    write; (4) the role; (5) ONE guarded write (db.add_project_owner) that
+    re-decides the caller rule inside the statement: the pre-check is a
+    courtesy, THAT statement is the authority, so two racing requests cannot
+    both pass. A refusal there carries the same named-rule message as the
+    sequential one (composed from a read taken after the 0-row result).
+    (6) Only when a NEW owner row was inserted for someone other than the
+    actor, the new owner is told (_notify_new_owner): not for a role update,
+    a no-op re-add, a self-add or a refused add. A notification failure never
+    undoes the add: the owner row stays and the failure is reported.
+
+    Role (optional, `args[role_arg]`): a string, no control characters
+    (one line), trimmed, at most _PROJECT_OWNER_ROLE_MAX_LEN characters
+    AFTER trimming. Absent on a re-add = keep the existing role; present
+    (even '') = set it.
+
+    Best-effort like every project-board effect: None on success, else a
+    short reason surfaced in `effect_failures`."""
+    board_project = (thing.get("metadata") or {}).get("project_id")
+    if board_project is None:
+        return "board thing is not bound to a project (no metadata.project_id)"
+    project = db.get_project(conn, board_project)
+    if project is None:
+        return f"project {board_project!r} not found"
+
+    refusal = _project_owner_edit_refusal(conn, project, actor)
+    if refusal is not None:
+        return refusal
+
+    agent, reason = _project_owner_target(args, effect)
+    if reason is not None:
+        return reason
+
+    if not _is_registered_identity(conn, agent):
+        return (f"{agent!r} is not a registered agent or human resident; "
+                "an owner must be someone the world knows — check the name, "
+                "or have them enter the world first")
+
+    role = None
+    role_arg = effect.get("role_arg")
+    if role_arg is not None and role_arg in args:
+        raw_role = args[role_arg]
+        if not isinstance(raw_role, str):
+            return f"role {role_arg!r} must be a string"
+        problem = _name_char_problem(raw_role)
+        if problem:
+            return f"role {problem}"
+        role = raw_role.strip()
+        if len(role) > _PROJECT_OWNER_ROLE_MAX_LEN:
+            return (f"role exceeds the {_PROJECT_OWNER_ROLE_MAX_LEN}-char "
+                    f"limit (got {len(role)}) — a role is a short label "
+                    "like 'design' or 'build lead'")
+
+    inserted = db.add_project_owner(
+        conn, board_project, agent, role, actor, db.now_iso(),
+        is_admin=actor in _project_owner_admins(),
+        founder=_canonical_agent(project["created_by"]))
+    if inserted is None:
+        # Lost the race (or refused at the write): nothing was written. The
+        # reason is composed from a read taken NOW; it may be approximate
+        # under a race, the write above is what was authoritative.
+        project = db.get_project(conn, board_project) or project
+        return (_project_owner_edit_refusal(conn, project, actor)
+                or _PROJECT_OWNER_RULE_TEXT)
+
+    if inserted and agent != actor:
+        failure = _notify_new_owner(conn, project, agent, actor, role)
+        if failure is not None:
+            return f"owner added, but the {failure}"
+    return None
+
+
+def _apply_effect_project_owner_remove(conn, thing: dict, actor: str,
+                                       args: dict, effect: dict) -> str | None:
+    """`project_owner_remove` effect (umwelt #1051): remove `args[agent_arg]`
+    from the owners of the acting board's OWN bound project. Same binding,
+    same caller rule as project_owner_add -- and, as there, the pre-check
+    only gives the readable reason: the DELETE statement itself requires
+    that the actor still be an owner (or an owner admin) AND, while the project is
+    active or paused, that another owner remain (db.remove_project_owner),
+    atomically. An owner may always remove THEMSELF (subject to that
+    keep-one). The registered-identity rule is add-only: an existing owner
+    row whose name is not registered can still be removed.
+
+    KEEP-ONE RULE: while the project is active or paused, its last owner
+    cannot be removed (by anyone, an admin included -- the rule protects the
+    project, not the caller). Done and archived projects are exempt.
+
+    Returns None on success, else a reason for `effect_failures`."""
+    board_project = (thing.get("metadata") or {}).get("project_id")
+    if board_project is None:
+        return "board thing is not bound to a project (no metadata.project_id)"
+    project = db.get_project(conn, board_project)
+    if project is None:
+        return f"project {board_project!r} not found"
+
+    refusal = _project_owner_edit_refusal(conn, project, actor)
+    if refusal is not None:
+        return refusal
+
+    agent, reason = _project_owner_target(args, effect)
+    if reason is not None:
+        return reason
+
+    owners = [o["agent"] for o in db.list_project_owners(conn, board_project)]
+    if agent not in owners:
+        return f"{agent!r} is not an owner of {project['label']!r}"
+
+    keep_one = project["status"] in _PROJECT_OWNER_KEEP_ONE_STATUSES
+    if not db.remove_project_owner(
+            conn, board_project, agent, keep_one, actor=actor,
+            is_admin=actor in _project_owner_admins()):
+        # Nothing was deleted. Say why from a read taken now (it may be
+        # approximate under a race; the DELETE was authoritative).
+        project = db.get_project(conn, board_project) or project
+        refusal = _project_owner_edit_refusal(conn, project, actor)
+        if refusal is not None:
+            return refusal
+        owners = [o["agent"]
+                  for o in db.list_project_owners(conn, board_project)]
+        if agent not in owners:
+            return f"{agent!r} is not an owner of {project['label']!r}"
+        return (f"{agent!r} is the last owner of {project['label']!r} "
+                f"(status {project['status']}): a project keeps at least "
+                "one owner while it is active or paused — add another "
+                "owner first")
     return None
 
 
@@ -6630,6 +8055,10 @@ def _render_world_html() -> str:
         "<div class=mhead><span id=mtitle></span><button id=mclose aria-label=close>✕</button></div>"
         "<div class=body id=mbody></div></div></div>"
         "<script>"
+        # umwelt#1105: this engine's API number, substituted at serve time and
+        # sent as X-Umwelt-Client-API on every fetch below (the gate would
+        # otherwise 409 the human's own world view).
+        "const CLIENT_API='" + str(_engine_api.ENGINE_API) + "';"
         "const $=s=>document.querySelector(s),modal=$('#modal');let modalOpen=false;"
         "let agentName='',placeId=null,places=[];"
         "function esc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML;}"
@@ -6637,9 +8066,9 @@ def _render_world_html() -> str:
         "function closeModal(){modal.style.display='none';modalOpen=false;}"
         "$('#mclose').onclick=closeModal;modal.onclick=e=>{if(e.target===modal)closeModal();};"
         "document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal();});"
-        "async function post(p,b){const r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},"
+        "async function post(p,b){const r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json','X-Umwelt-Client-API':CLIENT_API},"
         "body:JSON.stringify(b)});try{return await r.json();}catch(e){return {error:'the world hit an error ('+r.status+')'};}}"
-        "async function loadPlaces(){try{const j=await(await fetch('/umwelt/places')).json();places=j.places||[];}catch(e){places=[];}}"
+        "async function loadPlaces(){try{const j=await(await fetch('/umwelt/places',{headers:{'X-Umwelt-Client-API':CLIENT_API}})).json();places=j.places||[];}catch(e){places=[];}}"
         "function ptag(a){const t=a.type?(' <span class=ty>('+esc(a.type)+(a.lineage?(' · '+esc(a.lineage)):'')+')</span>'):'';return '🧍 '+esc(a.agent)+t;}"
         "function renderHere(v){const p=v.place||{};"
         "const welcome=v.born===true?'<div class=who style=\"color:#8fbf6a\">✨ welcome to the world, '+esc(agentName)+'! your body is born.</div>'"
@@ -6779,6 +8208,9 @@ def _render_projects_html() -> str:
         "<footer>read-only · rendered client-side from the same read API "
         "agents use · port 5003</footer>"
         "<script>"
+        # umwelt#1105: see _render_world_html -- the number is substituted at
+        # serve time and sent on both fetches below.
+        "const CLIENT_API='" + str(_engine_api.ENGINE_API) + "';"
         "const $=s=>document.querySelector(s);"
         "function esc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML;}"
         "function statusCounts(tasks){const counts={};"
@@ -6806,7 +8238,7 @@ def _render_projects_html() -> str:
         "async function loadTasks(pid){"
         "const box=document.getElementById('tasks-'+pid);if(!box)return;"
         "try{"
-        "const j=await(await fetch('/umwelt/projects/'+encodeURIComponent(pid))).json();"
+        "const j=await(await fetch('/umwelt/projects/'+encodeURIComponent(pid),{headers:{'X-Umwelt-Client-API':CLIENT_API}})).json();"
         "const tasks=(j.project&&j.project.tasks)||[];"
         "box.innerHTML='<div class=lblrow>status counts</div><div class=trow>'"
         "+countsRow(statusCounts(tasks))+'</div>'"
@@ -6823,7 +8255,7 @@ def _render_projects_html() -> str:
         "+'</div>').join('');"
         "projects.forEach(p=>loadTasks(p.id));}"
         "async function loadProjects(){"
-        "try{const j=await(await fetch('/umwelt/projects')).json();renderProjects(j.projects||[]);}"
+        "try{const j=await(await fetch('/umwelt/projects',{headers:{'X-Umwelt-Client-API':CLIENT_API}})).json();renderProjects(j.projects||[]);}"
         "catch(e){$('#projects').innerHTML='<p class=empty>could not reach the world.</p>';}}"
         "loadProjects();"
         "</script>"
@@ -7248,6 +8680,13 @@ _THING_CONTENT_ROW_BYTES = 4194304     # 4 MiB
 # Every other row with an uncapped field: the send_crossing ceiling, the
 # largest bound already ruled before thing content.
 _UNCAPPED_ROW_BYTES = 262144           # 256 KiB
+# POST /umwelt/edit (#1154), fully capped: two strings of _EDIT_STRING_MAX_CHARS
+# (32,768) characters. Worst case for JSON escaping is an astral character,
+# written as a surrogate pair of two 6-byte \\uXXXX escapes = 12 bytes, so two
+# maximal all-astral strings are 2 * 32,768 * 12 = 786,432 bytes, plus the
+# fixed fields; rounded UP to 1 MiB (Ariadne's ruling on #1154: the contract's
+# first figure of 262,144 used 6 bytes per character).
+_EDIT_ROW_BYTES = 1048576              # 1 MiB
 # POST /umwelt/use, a fully-capped route that outgrows the default: 16 args,
 # 16,384 chars total (_USE_ARGS_MAX_*) = 98,938 bytes at 6 bytes per
 # character, x2, rounded UP to a multiple of 4 KiB.
@@ -7265,6 +8704,11 @@ _WRITE_BODY_ROWS: dict[tuple[str, str], BodyRow] = {
         ("spec.source", "spec.exec_command", "spec.metadata")),
     ("POST", "/umwelt/customize_avatar"): BodyRow(
         _UNCAPPED_ROW_BYTES, ("description", "lineage", "render_spec")),
+    # umwelt #1154: a fully-capped route that outgrows the default, like
+    # `use`: old_string and new_string are each capped at
+    # _EDIT_STRING_MAX_CHARS characters, so no field is uncapped. The thing's
+    # own size is not part of the request.
+    ("POST", "/umwelt/edit"): BodyRow(_EDIT_ROW_BYTES),
     ("POST", "/umwelt/enter"): BodyRow(
         _UNCAPPED_ROW_BYTES, ("avatar_description", "lineage")),
     ("POST", "/umwelt/login"): BodyRow(
@@ -7340,6 +8784,44 @@ def _bound_send_crossing_body(wsgi_app):
         resolve_route=lambda environ: environ.get("PATH_INFO"),
         send_only_compat=True,
     )
+
+
+# umwelt#1105 -- the engine-API gate (see engine_api.py, PROTOCOL.md "Engine
+# API gate"). ONE frozenset decides which API routes answer a request whose
+# X-Umwelt-Client-API is absent / non-canonical / != ENGINE_API: the comms
+# routes (a seat must still be able to hear and speak across a version skew),
+# the login handshake, and /health. `/umwelt/login` additionally carries an
+# `engine_api_notice` on a successful mismatching login. The wake_* routes, the
+# heartbeat, /umwelt/places and /umwelt/enter are deliberately NOT in it.
+# Widening this set is a security-lane change: tests pin its ceiling.
+_API_GATE_EXEMPT: frozenset[str] = frozenset({
+    "/health",
+    "/umwelt/login",
+    "/umwelt/login/challenge",
+    "/umwelt/crossings_here",
+    "/umwelt/crossings_for_agent",
+    "/umwelt/search_crossings",
+    "/umwelt/whats_new",
+    "/umwelt/open_crossing",
+    "/umwelt/send_crossing",
+})
+
+# The world's own browser pages and their static files are not API routes and
+# have no client contract (umwelt#1105 ruling 4): the HTML is served ungated,
+# and the inline JS they carry sends the header itself on every fetch. Kept
+# apart from _API_GATE_EXEMPT on purpose -- that set is API routes only.
+# `static` serves nothing today (no src/umwelt/static directory; see the tripwire cell in test_engine_api_gate_variants.py).
+_API_GATE_UNGATED_ENDPOINTS: frozenset[str] = frozenset({
+    "world_view", "projects_view", "static",
+})
+
+
+def _with_engine_api_notice(payload: dict) -> dict:
+    """umwelt#1105: add the gate's `engine_api_notice` to a SUCCESSFUL login
+    body when this request's client API did not match (set by the gate). The
+    notice informs; it never changes the status or any other key."""
+    notice = g.get("engine_api_notice")
+    return {**payload, "engine_api_notice": notice} if notice else payload
 
 
 def create_app(db_path: str, world_version_file: str | None = None,
@@ -7448,6 +8930,44 @@ def create_app(db_path: str, world_version_file: str | None = None,
               f"cannot load: {_m['reason']}", file=sys.stderr)
 
     @app.before_request
+    def _engine_api_gate() -> Response | tuple[Response, int] | None:
+        """umwelt#1105: refuse (409) a non-exempt request whose
+        X-Umwelt-Client-API is not exactly this engine's number. Decided from
+        the header and the path alone: it never opens the DB, and (registered
+        ahead of every other hook) it can only ever refuse, never grant. A
+        request whose routing already failed (404/405) is left to Flask, as
+        _reject_non_object_body does."""
+        if request.routing_exception is not None:
+            return None
+        if request.endpoint in _API_GATE_UNGATED_ENDPOINTS:
+            return None
+        client_api = _engine_api.parse_client_api(
+            request.headers.get(_engine_api.CLIENT_HEADER))
+        mismatch = client_api != _engine_api.ENGINE_API
+        if request.path in _API_GATE_EXEMPT:
+            g.engine_api_notice = ({
+                "client_api": client_api,
+                "engine_api": _engine_api.ENGINE_API,
+                "remedy": _engine_api.REMEDY,
+            } if mismatch else None)
+            return None
+        if not mismatch:
+            return None
+        return jsonify({
+            "error": "engine API mismatch",
+            "client_api": client_api,
+            "engine_api": _engine_api.ENGINE_API,
+            "remedy": _engine_api.REMEDY,
+        }), 409
+
+    @app.after_request
+    def _stamp_engine_api(resp: Response) -> Response:
+        """umwelt#1105: every response -- 404, 405, 422, the 409 itself --
+        names this engine's API number."""
+        resp.headers[_engine_api.ENGINE_HEADER] = str(_engine_api.ENGINE_API)
+        return resp
+
+    @app.before_request
     def _open_db() -> None:
         g.conn = sqlite3.connect(db_path)
         g.conn.execute("PRAGMA foreign_keys = ON")
@@ -7514,6 +9034,7 @@ def create_app(db_path: str, world_version_file: str | None = None,
         body = {
             "status": "ok" if db_probe["ok"] else "degraded",
             "world": "umwelt",
+            "engine_api": _engine_api.ENGINE_API,
             "db": db_path,
             "db_probe": db_probe,
             "commit": boot_commit,
@@ -7676,7 +9197,7 @@ def create_app(db_path: str, world_version_file: str | None = None,
 
         anchors = []
         home_place_id = f"place_post_{agent}"
-        for anchor_id in (home_place_id, "place_square"):
+        for anchor_id in (home_place_id, db.role_place_id(g.conn, "hub")):
             if anchor_id in covered_ids:
                 continue
             anchor_tree = db.place_tree(g.conn, anchor_id, 0, agent)
@@ -7842,16 +9363,21 @@ def create_app(db_path: str, world_version_file: str | None = None,
         display = agent if display is None else display
         home_place_id = f"place_post_{agent}"
         if db.get_place(conn, home_place_id) is None:
+            # umwelt#1043: under the world's residences place when it has
+            # one; with no such role parent_id is None and the row written
+            # is exactly the one this call has always written.
             db.upsert_place(conn, home_place_id, "private", agent,
                             f"{display.title()}'s Post",
-                            f"{display.title()}'s private corner of the world.")
+                            f"{display.title()}'s private corner of the world.",
+                            parent_id=db.residences_place_id(conn))
         return home_place_id
 
     _HOME_POST_PREFIX = "place_post_"
 
     def _home_post_birth_refusal(conn, agent: str):
         """umwelt #915: the 422 for a FIRST birth whose home post id would
-        exceed PLACE_ID_MAX_LEN, else None. Shared by register() and enter()
+        exceed PLACE_ID_MAX_LEN, or whose name carries the reserved `world:`
+        prefix (umwelt#1043), else None. Shared by register() and enter()
         so the two doors cannot drift; called BEFORE _ensure_home_place so a
         refusal writes no place and no avatar.
 
@@ -7862,6 +9388,19 @@ def create_app(db_path: str, world_version_file: str | None = None,
         "First birth" means no avatar yet: a name whose home post was seeded
         by seed_places but who never entered is still refused if over the cap.
         """
+        # umwelt#1043: `world:` is the author namespace of package-made
+        # things. Checked FIRST and for everyone, so a refusal here writes no
+        # place, no avatar and no identity. (It is also refused at identity
+        # resolution, resolve_actor, for callers that never enter.) A world
+        # that already holds an avatar with such a name from before this rule
+        # is not checked: it would be refused here only on a first birth.
+        if _has_reserved_agent_prefix(agent):
+            return jsonify({
+                "error": f"agent names starting with "
+                         f"{RESERVED_AGENT_PREFIX!r} are reserved for world "
+                         "packages (checked after Unicode normalisation and "
+                         "case-folding) — pick another name"
+            }), 422
         if db.avatar_exists(conn, agent):
             return None
         name_max = PLACE_ID_MAX_LEN - len(_HOME_POST_PREFIX)
@@ -8236,10 +9775,10 @@ def create_app(db_path: str, world_version_file: str | None = None,
         Response: enter's shape (place + things + present + unseen + avatar) plus
         `born` (True on first-ever registration, False on reconnect).
 
-        Trust scope (v0): `agent` is caller-declared/forgeable (ob_2721/#24) — anyone
+        Trust scope (v0): `agent` is caller-declared/forgeable (#24) — anyone
         can register any name and mint a home + body under it (Sybil-on-avatars).
         Sound only among our_side callers today; the gated-registration decision
-        (ob_0941) + engine-attested identity (#24) are what make this a real gate.
+        + engine-attested identity (#24) are what make this a real gate.
         """
         body = request.get_json(force=True, silent=True) or {}
         agent_raw = _str_identity(body, "agent")
@@ -8262,7 +9801,7 @@ def create_app(db_path: str, world_version_file: str | None = None,
         # Lei's account model: one account = one avatar with a name, a TYPE
         # (human, or agent + model lineage), and a customizable description.
         # Open registration for the local stage (supersedes the GATED call
-        # ob_0941 for now): any admitted private-network caller can register, username-only, no
+        # for now): any admitted private-network caller can register, username-only, no
         # password — the same trust posture as the village today.
         atype = _str_identity(body, "type", "human").lower() or "human"
         if atype not in ("human", "agent"):
@@ -8354,8 +9893,8 @@ def create_app(db_path: str, world_version_file: str | None = None,
         contract from getting fuzzy with an optional-place reconnect branch).
 
         Trust scope (v0): the driver→avatar binding rides the caller-declared
-        `agent` field — there is no engine-attested identity yet (ob_2721/
-        #24). A forged `agent` value can reconnect to another agent's avatar,
+        `agent` field — there is no engine-attested identity yet (#24).
+        A forged `agent` value can reconnect to another agent's avatar,
         or claim to be someone it isn't. Sound only among our_side callers
         today; hardens when the identity layer lands. Same posture as
         world_view's private-read scoping.
@@ -8552,7 +10091,7 @@ def create_app(db_path: str, world_version_file: str | None = None,
         metadata, so callers can confirm what the world now shows.
 
         Trust scope (v0): the caller-declared `agent` is forgeable — same
-        posture as enter/register/move_to (ob_2721/#24); a forged `agent`
+        posture as enter/register/move_to (#24); a forged `agent`
         could dress another agent's avatar. Sound only among our_side
         callers today; hardens when the identity layer lands.
         """
@@ -8674,8 +10213,8 @@ def create_app(db_path: str, world_version_file: str | None = None,
         move_avatar is a harmless no-op — move_to does not birth one.
 
         Trust scope (v0): the driver→avatar binding rides the caller-declared
-        `agent` field — there is no engine-attested identity yet (ob_2721/
-        #24). A forged `agent` value can move another agent's avatar, or
+        `agent` field — there is no engine-attested identity yet (#24).
+        A forged `agent` value can move another agent's avatar, or
         claim to be someone it isn't. Sound only among our_side callers
         today; hardens when the identity layer lands. Same posture as
         world_view's private-read scoping.
@@ -9005,9 +10544,16 @@ def create_app(db_path: str, world_version_file: str | None = None,
         # can never drift into two different wordings. Omitted entirely
         # (not set to null) when not gated, so existing consumers see no
         # shape change.
-        if thing["size_class"] in _GATED_SIZE_CLASSES:
-            thing["gate_notice"] = _TOME_POINTER_TEMPLATE.format(
-                name=thing["name"], size_class=thing["size_class"])
+        # umwelt #647: look_at reads NO source — the notice carries "about N
+        # tokens" from the stat-based estimate above (use() says "N lines in
+        # F file(s)", it reads the source anyway). Set only for a READABLE: a
+        # non-readable gated thing gets none, because read/download refuse it
+        # and its source is access-gated.
+        if (thing["size_class"] in _GATED_SIZE_CLASSES
+                and thing["kind"] == "readable"):
+            thing["gate_notice"] = _tome_briefing(
+                thing["name"], thing["size_class"],
+                f"about {thing['content_length_estimate']} tokens")
         response = {"thing": thing,
                     "use_stats": db.use_stats(g.conn, thing_id)}
         # umwelt #133: avatars are look-at-able for STATUS too — last
@@ -9162,7 +10708,9 @@ def create_app(db_path: str, world_version_file: str | None = None,
             # Readables have nothing to invoke args against — a non-empty
             # args on a readable is a category error, not a no-op (loud,
             # not silent — same posture as #57's whole complaint).
-            if args:
+            # (umwelt #1074: except the Project Register, whose args are its
+            # filters.)
+            if args and not _is_project_register(thing):
                 return jsonify({"error": "readable things take no args"}), 422
             # umwelt #88 slice 4 — examine gating: use() (via look_at's
             # "read path") is the ONE render site that puts a thing's full
@@ -9173,8 +10721,8 @@ def create_app(db_path: str, world_version_file: str | None = None,
             # (Lei's repo-thing answer — see #88's issue body).
             size_class = _size_class_for(things_dir, thing, source=source)
             if size_class in _GATED_SIZE_CLASSES:
-                pointer = _TOME_POINTER_TEMPLATE.format(
-                    name=thing["name"], size_class=size_class)
+                pointer = _tome_briefing(thing["name"], size_class,
+                                         _source_extent(source))
                 # umwelt #488: graft_ref/graft_version are author-only
                 # within metadata — same posture and same shared denylist
                 # as look_at (umwelt #486, see that route's docstring).
@@ -9208,14 +10756,37 @@ def create_app(db_path: str, world_version_file: str | None = None,
                     "size_class": size_class,
                     "metadata": gated_metadata,
                     "manifest": manifest,
+                    # umwelt #647: where to read (derived now, never stored).
+                    "toc": _toc_for_source(source),
                 }})
             # readable things: use() returns their content, no execution.
             n = len(source)
             briefing = (f"You opened '{thing['name']}' — it holds "
                         f"{n} file{'s' if n != 1 else ''}.")
+            # umwelt #1051: a work card (metadata.work_card is True) gets a
+            # section DERIVED at read time from project_owners, appended as
+            # one extra content entry -- the clients print every content
+            # entry, so it renders everywhere with no client change. Nothing
+            # is stored (no write of any kind happens here beyond the
+            # use-telemetry row below), and any thing that is not a card
+            # takes the original line unchanged: `content` is `source`.
+            content = source
+            card_section = _work_card_section(g.conn, thing)
+            if card_section is not None:
+                content = dict(source)
+                content[_WORK_CARD_SECTION_KEY] = card_section
+            # umwelt #1074: a Project Register (metadata.project_register is
+            # True) gets its own derived entry the same way; `args` are its
+            # filters. Read-only, nothing stored.
+            register_section = _project_register_section(
+                g.conn, thing, args,
+                viewer=_canonical_agent(agent) if agent else None)
+            if register_section is not None:
+                content = dict(content)
+                content[_PROJECT_REGISTER_SECTION_KEY] = register_section
             _record_use(g.conn, thing_id, agent, "readable")
             return jsonify({"outcome": {"briefing": briefing,
-                                        "content": source, "kind": "readable",
+                                        "content": content, "kind": "readable",
                                         "size_class": size_class}})
 
         if thing["kind"] == "blueprint":
@@ -9396,42 +10967,60 @@ def create_app(db_path: str, world_version_file: str | None = None,
                     error=outcome.get("error"))
         return jsonify({"outcome": outcome})
 
-    # -- download (umwelt #122) ---------------------------------------------
-    @app.route("/umwelt/download", methods=["POST"])
-    def download() -> Response:
-        """The sanctioned egress path the tome/library examine-gate now
-        points at instead of dead-ending (#122's refuse-and-redirect). Same
-        id-addressable, reach-free resolution as look_at/use — a thing
-        inside a container is fine.
+    # -- readable gate chain (umwelt #122 download, #647 read/search) ------
+    def _readable_gate(readable_only_error: str):
+        """The ONE gate chain `download`, `read` and `search` share, so the
+        three can never answer differently for the same thing. Returns
+        `(body, thing, agent), None` on success or `None, (response, status)`
+        / `None, response` to return as-is.
 
-        The server returns DATA only; it never writes the caller's
-        filesystem. `download` is a client/API verb (like `forge`), NOT a
-        `use()`-sandbox action — the sandbox is network/FS-isolated from the
-        caller's real disk, so a sandboxed action could never write it
-        anyway. Writing the returned source dict to disk is the CLIENT's
-        job (MUD / `uw` / MCP wrapper — a separate build, not this route).
+        Order: auth (401) -> `thing` required (400) -> not found (404) ->
+        the thing read gate (umwelt#982) -> avatar (422) -> readable-only
+        (422, the text the caller passes: download keeps its v1 wording).
+
+        `agent` is OPTIONAL (anonymous = a viewer that may enter public
+        places only), resolved through resolve_actor like look_at/use -- a
+        token's identity wins over a declared one (anti-forgery).
+
+        umwelt #122 SECURITY GUARD (readable-only v1 — Borges's security
+        seat) — the load-bearing line of these routes.
+
+        A READABLE's content is CONTEXT-gated, never ACCESS-gated: the
+        tome/library examine-gate exists to protect the READER's context
+        window from an inline render, not to withhold the content itself
+        — the gate's own briefing already invites the reader to read it
+        another way. So handing out a readable (tome/library included)
+        crosses no confidentiality boundary — the content was never
+        access-gated, only context-gated. Egressing or paging it is a
+        delivery-channel change, not a new disclosure.
+
+        A NON-readable's source is ACCESS-gated: use() returns an
+        executable's run OUTPUT (never its source) and a blueprint/kinddef
+        is instantiated (never dumped as a template) — so handing out THAT
+        source here would be genuinely NEW disclosure use() never granted.
+        Hence readable-only in v1; source-egress for other kinds is
+        deferred to the provenance/signing north-star. The guard is
+        `kind == "readable"`, nothing looser — do not widen this without
+        a corresponding security review.
         """
         body = request.get_json(force=True, silent=True) or {}
         thing_id = _str_identity(body, "thing")
-        # umwelt#982: `agent` is OPTIONAL here (anonymous = a viewer that may
-        # enter public places only), resolved through resolve_actor like
-        # look_at/use -- the gate below needs to know who is asking, and a
-        # token's identity wins over a declared one (anti-forgery).
         agent_raw = _str_identity(body, "agent")
         resolution = resolve_actor(g.conn, request, declared=agent_raw)
         if resolution.agent_id is None:
-            return jsonify({"error": "authentication failed"}), 401
+            return None, (jsonify({"error": "authentication failed"}), 401)
         agent = resolution.agent_id
         if not thing_id:
-            return jsonify({"error": "thing is required"}), 400
+            return None, (jsonify({"error": "thing is required"}), 400)
 
         thing = db.get_thing(g.conn, thing_id)
         if thing is None:
-            return jsonify({"error": f"thing {thing_id!r} not found"}), 404
+            return None, (jsonify(
+                {"error": f"thing {thing_id!r} not found"}), 404)
         # umwelt#982: the thing read gate -- before any source is read.
         refusal = _thing_view_refusal(g.conn, agent or None, thing, thing_id)
         if refusal is not None:
-            return refusal
+            return None, refusal
 
         # Completeness check, same category error use() gives a body
         # (avatar) — presence, not a usable/downloadable thing (invariant
@@ -9439,39 +11028,363 @@ def create_app(db_path: str, world_version_file: str | None = None,
         # gets this specific, correctly-named error rather than the generic
         # readable-only 422.
         if db.is_body_kind(thing["kind"]):
-            return jsonify({
+            return None, (jsonify({
                 "error": "avatars are presence, not a usable thing — "
                          "there is nothing to use() on a body"
-            }), 422
-
-        # umwelt #122 SECURITY GUARD (readable-only v1 — Borges's security
-        # seat) — the load-bearing line of this endpoint.
-        #
-        # A READABLE's content is CONTEXT-gated, never ACCESS-gated: the
-        # tome/library examine-gate exists to protect the READER's context
-        # window from an inline render, not to withhold the content itself
-        # — the gate's own briefing already invites "examine it with your
-        # own tools." So downloading a readable (tome/library included)
-        # crosses no confidentiality boundary — the content was never
-        # access-gated, only context-gated (kept out of the inline-render
-        # channel to protect the reader's context window). Egressing it to
-        # disk is a delivery-channel change, not a new disclosure.
-        #
-        # A NON-readable's source is ACCESS-gated: use() returns an
-        # executable's run OUTPUT (never its source) and a blueprint/kinddef
-        # is instantiated (never dumped as a template) — so egressing THAT
-        # source here would be genuinely NEW disclosure use() never granted.
-        # Hence readable-only in v1; source-egress for other kinds is
-        # deferred to the provenance/signing north-star. The guard is
-        # `kind == "readable"`, nothing looser — do not widen this without
-        # a corresponding security review.
+            }), 422)
         if thing["kind"] != "readable":
-            return jsonify({"error": "download is readable-only in v1"}), 422
+            return None, (jsonify({"error": readable_only_error}), 422)
+        return (body, thing, agent), None
+
+    def _is_int(value, minimum: int, maximum: int | None = None) -> bool:
+        """A real integer in range (a bool is not one)."""
+        return (isinstance(value, int) and not isinstance(value, bool)
+                and value >= minimum
+                and (maximum is None or value <= maximum))
+
+    def _pick_file(body: dict, source: dict[str, str]):
+        """Which file of the source dict a `read`/`search` names. Returns
+        `(name, None)` or `(None, (response, 422))`. An ABSENT `file` falls
+        back to the only file; an explicitly given one (an empty string
+        included) must be a key."""
+        given = body.get("file")
+        if given is not None:
+            if given not in source:
+                return None, (jsonify(
+                    {"error": f"file {given!r} is not in this thing"}), 422)
+            return given, None
+        names = sorted(source)
+        if len(names) == 1:
+            return names[0], None
+        listed = ", ".join(names[:_READ_FILE_LIST_MAX])
+        if len(names) > _READ_FILE_LIST_MAX:
+            listed += f", +{len(names) - _READ_FILE_LIST_MAX} more"
+        return None, (jsonify({"error": (
+            f"file is required: this thing has {len(names)} files "
+            f"({listed})")}), 422)
+
+    # -- read (umwelt #647) -------------------------------------------------
+    @app.route("/umwelt/read", methods=["POST"])
+    def read_long() -> Response:
+        """Claude Code's `Read` for a readable: `{agent?, thing, file?,
+        offset?, limit?}` -> one page of lines. See PROTOCOL.md.
+
+        Lines are taken from the 1-based `offset` until `limit` lines, or
+        until the next line would push the page over _READ_PAGE_MAX_CHARS
+        (each line charged len + _READ_LINE_OVERHEAD_CHARS, after the
+        per-line cut). At least one line is always returned, so paging always
+        progresses. Read-only: no use row (use_stats keeps meaning "used").
+        """
+        ok, err = _readable_gate("read is readable-only")
+        if err is not None:
+            return err
+        body, thing, _agent = ok
+        offset = body.get("offset", 1)
+        limit = body.get("limit", _READ_DEFAULT_LIMIT)
+        if not _is_int(offset, 1):
+            return jsonify({"error": "offset must be an integer >= 1"}), 422
+        if not _is_int(limit, 1):
+            return jsonify({"error": "limit must be an integer >= 1"}), 422
+        source = _read_source(things_dir, thing["id"])
+        name, err = _pick_file(body, source)
+        if err is not None:
+            return err
+        lines = _source_lines(source[name])
+        total = len(lines)
+        page, cut_lines, spent = [], [], 0
+        n = offset
+        while n <= total and len(page) < limit:
+            line = lines[n - 1]
+            was_cut = len(line) > _READ_LINE_MAX_CHARS
+            if was_cut:
+                line = line[:_READ_LINE_MAX_CHARS]
+            charge = len(line) + _READ_LINE_OVERHEAD_CHARS
+            if page and spent + charge > _READ_PAGE_MAX_CHARS:
+                break
+            page.append(line)
+            spent += charge
+            if was_cut:
+                cut_lines.append(n)
+            n += 1
+        return jsonify({
+            "name": thing["name"], "file": name, "files": sorted(source),
+            "size_class": _size_class_for(things_dir, thing, source=source),
+            "total_lines": total, "offset": offset, "lines": page,
+            "next_offset": n if n <= total else None,
+            "cut_lines": cut_lines,
+        })
+
+    # -- search (umwelt #647) -----------------------------------------------
+    @app.route("/umwelt/search", methods=["POST"])
+    def search_long() -> Response:
+        """Claude Code's `Grep` for a readable: `{agent?, thing, pattern,
+        file?, output_mode?, "-i"?, "-A"?, "-B"?, "-C"?, head_limit?,
+        offset?}`. Matching is per line; files in sorted order. See
+        PROTOCOL.md.
+
+        TIME GUARD (the security-relevant part): ONE deadline per search is
+        taken up front, and every match call gets `timeout = deadline - now`
+        (the `regex` package's per-call timeout). When that is <= 0, or a
+        call raises TimeoutError, the answer is 422 "pattern timed out",
+        ALL OR NOTHING: no `entries`, no `total` counted before the deadline
+        fired. A per-call or per-line budget would give a 40,000-line tome
+        40,000 budgets.
+
+        COMPILE BOMB: compiling cannot be interrupted, so before compiling
+        the pattern is parsed with the stdlib parser, checked against the
+        structural nesting caps (`_search_nesting_check`: 422 `pattern too
+        complex` {error, limit: "nesting", max_depth}), and an expansion
+        estimate (`_search_expansion_estimate`) is taken; above
+        `_SEARCH_EXPANSION_LIMIT` it is 422 `pattern too complex`
+        ({error, limit, estimate}) and nothing is compiled; a pattern the
+        stdlib parser rejects is 422 `pattern not supported (Python re syntax
+        only)`. Order: the 512-char cap, then the nesting caps, then the
+        estimator, then compile.
+        A flat repeat such as `a{100001}` is refused by design (a known
+        false positive: the bound is a number, not a cost model). A
+        MemoryError from compile is caught and answered 422 as a REPORTING
+        BACKSTOP only, NOT the protection.
+        """
+        ok, err = _readable_gate("search is readable-only")
+        if err is not None:
+            return err
+        body, thing, _agent = ok
+        if "pattern" not in body:
+            return jsonify({"error": "pattern is required"}), 400
+        pattern = body["pattern"]
+        if not isinstance(pattern, str) or not pattern:
+            return jsonify(
+                {"error": "pattern must be a non-empty string"}), 422
+        # Length cap: a cheap sanity bound, NOT the safety bound (see the
+        # docstring: the deadline is).
+        if len(pattern) > _SEARCH_PATTERN_MAX_CHARS:
+            return jsonify({"error": (
+                f"pattern is too long (max {_SEARCH_PATTERN_MAX_CHARS} "
+                f"chars)")}), 422
+        mode = body.get("output_mode", "content")
+        if mode not in _SEARCH_OUTPUT_MODES:
+            return jsonify({"error": (
+                "output_mode must be one of: "
+                + ", ".join(_SEARCH_OUTPUT_MODES))}), 422
+        ignore_case = body.get("-i", False)
+        if not isinstance(ignore_case, bool):
+            return jsonify({"error": "-i must be a boolean"}), 422
+        ctx = {}
+        for flag in ("-A", "-B", "-C"):
+            if flag in body:
+                if not _is_int(body[flag], 0, _SEARCH_CONTEXT_MAX):
+                    return jsonify({"error": (
+                        f"{flag} must be an integer 0.."
+                        f"{_SEARCH_CONTEXT_MAX}")}), 422
+                ctx[flag] = body[flag]
+        after_n = ctx.get("-A", ctx.get("-C", 0))
+        before_n = ctx.get("-B", ctx.get("-C", 0))
+        head_limit = body.get("head_limit", _SEARCH_HEAD_LIMIT_DEFAULT)
+        if not _is_int(head_limit, 1):
+            return jsonify(
+                {"error": "head_limit must be an integer >= 1"}), 422
+        offset = body.get("offset", 0)
+        if not _is_int(offset, 0):
+            return jsonify({"error": "offset must be an integer >= 0"}), 422
+        source = _read_source(things_dir, thing["id"])
+        if body.get("file") is not None:
+            if body["file"] not in source:
+                return jsonify({"error": (
+                    f"file {body['file']!r} is not in this thing")}), 422
+            names = [body["file"]]
+        else:
+            names = sorted(source)
+
+        # COMPILE BOMB bound (round C): runs after the length cap and BEFORE
+        # anything is compiled. Compile cannot be interrupted, so this
+        # estimate IS the protection; refusing here compiles nothing. The
+        # stdlib parser rejecting the pattern means it is not Python `re`
+        # syntax (`\p{L}`, `(?V1)`, `(?<n>x)` ...), which is what "Python re
+        # syntax" always meant. KNOWN FALSE POSITIVE, by design: a flat
+        # `a{100001}` compiles in 0.025 s but scores above the limit.
+        try:
+            nesting_cap = _search_nesting_check(pattern)
+            estimate = (None if nesting_cap is not None
+                        else _search_expansion_estimate(pattern))
+        except re.error as e:
+            # `detail` is the stdlib parser's own message (it may echo part of
+            # the caller's own pattern), cut to 200 chars: no traceback, no
+            # estimate, no ellipsis, no padding (Ariadne's ruling B).
+            return jsonify({
+                "error": "pattern not supported (Python re syntax only)",
+                "detail": str(e)[:200]}), 422
+        except _SearchBoundUnavailable as e:
+            # fail LOUD: never skip the bound because its parser went missing
+            return jsonify({"error": (
+                f"search is unavailable: the pattern-size bound cannot load "
+                f"on this server ({e})")}), 503
+        except _SearchPatternTooComplex:
+            # the PARSE step raised OverflowError / RecursionError / ...: too
+            # complex to size, refused, never a 500, never compiled. No
+            # estimate exists. (A failure in the size walk is NOT caught.)
+            return jsonify({"error": "pattern too complex",
+                            "limit": _SEARCH_EXPANSION_LIMIT}), 422
+        if nesting_cap is not None:
+            # a structural depth cap, checked before the cost walk
+            return jsonify({"error": "pattern too complex",
+                            "limit": "nesting",
+                            "max_depth": nesting_cap}), 422
+        if estimate > _SEARCH_EXPANSION_LIMIT:
+            return jsonify({"error": "pattern too complex",
+                            "limit": _SEARCH_EXPANSION_LIMIT,
+                            "estimate": estimate}), 422
+
+        # Resolved at REQUEST time, by name. A missing package is a 503, never
+        # a silent fallback to stdlib `re` (which has no timeout).
+        import importlib
+        module_name = _SEARCH_REGEX_MODULE_NAME
+        try:
+            rx_mod = importlib.import_module(module_name)
+        except ImportError:
+            return jsonify({"error": (
+                f"search is unavailable: the {module_name!r} package is not "
+                f"installed on this server")}), 503
+        flags = rx_mod.V0 | (rx_mod.I if ignore_case else 0)
+        # The ONE deadline starts BEFORE compile, so compile time counts
+        # against it. Compile itself cannot be interrupted (no timeout
+        # parameter): the estimator above is what protects the server; this
+        # only keeps the all-or-nothing time contract honest by refusing the
+        # answer when compile alone spent the budget.
+        deadline = time.monotonic() + _SEARCH_DEADLINE_S
+        try:
+            rx = rx_mod.compile(pattern, flags)
+        except rx_mod.error as e:
+            return jsonify({"error": f"pattern does not compile: {e}"}), 422
+        except MemoryError:
+            # A reporting backstop ONLY, NOT the protection: by the time
+            # compile raises this the memory was already spent. It turns an
+            # escaped 500 into a named 422 for a pattern the estimate missed.
+            return jsonify({"error": (
+                "pattern too complex (compiling it ran out of memory)")}), 422
+        except RecursionError:
+            # Same backstop, its own truthful text. `regex.compile` can
+            # recurse deeply on plain-group and branch chains that no nesting
+            # cap counts (a plain `(?:` is not a tree node); the 512-character
+            # pattern limit keeps that unreachable today. A reporting
+            # backstop ONLY, NOT the protection.
+            return jsonify({"error": (
+                "pattern too complex (compiling it ran out of stack)")}), 422
+        if time.monotonic() >= deadline:
+            return jsonify({"error": "pattern timed out"}), 422
+
+        hits_by_file = []               # [(file, lines, [1-based hit lines])]
+        for rel in names:
+            lines = _source_lines(source[rel])
+            hits = []
+            for n, line in enumerate(lines, 1):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return jsonify({"error": "pattern timed out"}), 422
+                try:
+                    found = rx.search(line, timeout=remaining)
+                except TimeoutError:
+                    return jsonify({"error": "pattern timed out"}), 422
+                if found is not None:
+                    hits.append(n)
+            if hits:
+                hits_by_file.append((rel, lines, hits))
+
+        def cut(text: str) -> str:
+            return text[:_READ_LINE_MAX_CHARS]
+
+        def content_entries():
+            """Every match as an entry, in order, from `offset` on. A context
+            line is never a match line and is given to the EARLIEST entry
+            whose window holds it (never repeated); entries before `offset`
+            are walked only to keep that ownership right."""
+            index = 0
+            for rel, lines, hits in hits_by_file:
+                hit_set, owned = set(hits), set()
+                for n in hits:
+                    before = [k for k in range(max(1, n - before_n), n)
+                              if k not in hit_set and k not in owned]
+                    after = [k for k in range(
+                                 n + 1, min(len(lines), n + after_n) + 1)
+                             if k not in hit_set and k not in owned]
+                    owned.update(before)
+                    owned.update(after)
+                    if index >= offset:
+                        yield {"file": rel, "line": n,
+                               "text": cut(lines[n - 1]),
+                               "before": [[k, cut(lines[k - 1])]
+                                          for k in before],
+                               "after": [[k, cut(lines[k - 1])]
+                                         for k in after]}
+                    index += 1
+
+        if mode == "content":
+            total = sum(len(h) for _f, _l, h in hits_by_file)
+            candidates = content_entries()
+
+            def charge(entry: dict) -> int:
+                # every rendered line (match or context) is printed with its
+                # file name, so each costs file + text + overhead and the
+                # engine's next_offset stays the only paging (clients render
+                # `file:line:text` rows and never clip).
+                texts = ([entry["text"]]
+                         + [t for _k, t in entry["before"]]
+                         + [t for _k, t in entry["after"]])
+                return sum(len(entry["file"]) + len(t)
+                           + _READ_LINE_OVERHEAD_CHARS for t in texts)
+        else:
+            total = len(hits_by_file)
+            if mode == "count":
+                rows = [{"file": rel, "count": len(h)}
+                        for rel, _l, h in hits_by_file]
+            else:
+                rows = [{"file": rel} for rel, _l, _h in hits_by_file]
+            candidates = iter(rows[offset:])
+
+            def charge(entry: dict) -> int:
+                return len(entry["file"]) + _READ_LINE_OVERHEAD_CHARS
+
+        page, spent = [], 0
+        for entry in candidates:
+            if len(page) >= head_limit:
+                break
+            cost = charge(entry)
+            if page and spent + cost > _READ_PAGE_MAX_CHARS:
+                break
+            page.append(entry)
+            spent += cost
+        reached = offset + len(page)
+        more = reached < total
+        return jsonify({
+            "name": thing["name"], "output_mode": mode, "total": total,
+            "entries": page, "truncated": more,
+            "next_offset": reached if more else None,
+        })
+
+    # -- download (umwelt #122) ---------------------------------------------
+    @app.route("/umwelt/download", methods=["POST"])
+    def download() -> Response:
+        """The sanctioned egress path the tome/library examine-gate points
+        at (#122's refuse-and-redirect; #647 wired the clients and added
+        `read`/`search` for partial reads). Same id-addressable, reach-free
+        resolution as look_at/use — a thing inside a container is fine.
+
+        The server returns DATA only; it never writes the caller's
+        filesystem. `download` is a client/API verb (like `forge`), NOT a
+        `use()`-sandbox action — the sandbox is network/FS-isolated from the
+        caller's real disk, so a sandboxed action could never write it
+        anyway. Writing the returned source dict to disk is the CLIENT's
+        job (`uw download` / the MCP `download` tool, umwelt #647/#708).
+        The gate chain and its security reasoning are `_readable_gate`'s.
+        """
+        ok, err = _readable_gate("download is readable-only in v1")
+        if err is not None:
+            return err
+        _body, thing, _agent = ok
 
         # Full source, UNGATED regardless of size_class — a tome/library
         # readable IS downloadable; that is the entire point of this verb
         # (the gate blocks inline RENDER, not egress).
-        source = _read_source(things_dir, thing_id)
+        source = _read_source(things_dir, thing["id"])
         content_length = sum(len(v or "") for v in source.values())
         return jsonify({
             "source": source,
@@ -9582,53 +11495,37 @@ def create_app(db_path: str, world_version_file: str | None = None,
     # keys on thing.author == caller. NOTE the gate is TRUST-SCOPED — `agent` is
     # caller-declared (no auth in v0), so it enforces author-only among
     # cooperating our_side agents but is not impersonation-resistant until agent
-    # identity is engine-attested (umwelt #24; the shared foundation dv_0230).
-    @app.route("/umwelt/update_thing", methods=["POST"])
-    def update_thing() -> Response:
-        body = request.get_json(force=True, silent=True) or {}
+    # identity is engine-attested (umwelt #24).
+    # -- the ONE gate and write path for a thing's text (umwelt#1154) ----------
+    # `update_thing` and `edit` share everything after the request is parsed:
+    # the gate (404 / avatar 422 / 403 / the #982 `anyone` read gate), the patch
+    # validation, and the atomic re-check + write. They differ only in WHERE the
+    # patch comes from: update_thing's is in the request; edit's is computed
+    # inside the write transaction (see `make_prepared`). The helpers return a
+    # refusal as a response (or a (response, status) tuple) and a success as a
+    # `_PreparedPatch`, so each branch below is the code it always was, moved
+    # here unchanged.
+
+    def _writer_identity(body):
+        """agent + thing from the body, then the 400 and the bearer-token 401.
+        Returns ((agent, thing_id), None) or (None, refusal). `edit` uses
+        this; update_thing keeps its own inline copy of the same three steps
+        because its patch checks interleave with them."""
         agent_raw = _str_identity(body, "agent")
         thing_id = _str_identity(body, "thing")
-        patch = body.get("patch") or {}
         if not agent_raw or not thing_id:
-            return jsonify({"error": "agent and thing are required"}), 400
-        # umwelt#495 slice 1b (write-surface conversion): resolve_actor
-        # replaces the direct _canonical_agent(agent_raw) fold. No token
-        # -> BYTE-IDENTICAL to before (resolve_actor's declared-branch
-        # applies the same _canonical_agent fold). A valid bearer token
-        # now wins over `agent_raw` entirely (anti-forgery); a presented
-        # bad/unknown/expired token returns 401 — fail-closed per Mira's
-        # ruling (presented-but-unresolvable must 401 on every converted
-        # route, including during the backfill window). See /umwelt/look
-        # for the identical read-route comment this mirrors.
+            return None, (jsonify({"error": "agent and thing are required"}), 400)
         resolution = resolve_actor(g.conn, request, declared=agent_raw)
         if resolution.agent_id is None:
-            return jsonify({"error": "authentication failed"}), 401
-        agent = resolution.agent_id
-        if not isinstance(patch, dict):
-            return jsonify({"error": "patch must be an object"}), 400
-        # umwelt #400/#494: reject ANY `_SERVER_OWNED_METADATA_KEYS` member
-        # in a metadata patch — same write-guard posture as create_thing's
-        # matching rejection above (see that constant's definition for the
-        # full rationale, including why `entries` must stay off the
-        # separate read-visibility denylist). A non-dict patch["metadata"]
-        # is left to whatever (unrelated) handling already exists below;
-        # this only guards the shape act() and the board_entry_*/
-        # advance_ref mechanisms themselves write. Before #400 this was two
-        # separate literal checks (action_log; graft_ref/graft_version) —
-        # #494 flagged that shape as fail-open on a new server-owned key
-        # nobody remembers to add to every literal check.
-        if isinstance(patch.get("metadata"), dict):
-            _server_owned_hit = (
-                _SERVER_OWNED_METADATA_KEYS & patch["metadata"].keys())
-            if _server_owned_hit:
-                return jsonify({
-                    "error": _server_owned_metadata_message(
-                        _server_owned_hit, "the request body")
-                }), 422
+            return None, (jsonify({"error": "authentication failed"}), 401)
+        return (resolution.agent_id, thing_id), None
 
+    def _thing_write_gate(agent, thing_id):
+        """404 / avatar 422 / 403 / the #982 read gate. Returns
+        (thing, None) or (None, refusal)."""
         thing = db.get_thing(g.conn, thing_id)
         if thing is None:
-            return jsonify({"error": f"thing {thing_id!r} not found"}), 404
+            return None, (jsonify({"error": f"thing {thing_id!r} not found"}), 404)
         # Category error, not an authorization question — fires before the
         # author check since it's true regardless of who's asking. Avatars
         # are engine-managed presence, not agent-editable (invariant #4);
@@ -9636,10 +11533,10 @@ def create_app(db_path: str, world_version_file: str | None = None,
         # thing invariant #4 exists to prevent) or let a forged agent rename
         # another agent's avatar (same trust-scoped-v0 class as move_to).
         if db.is_body_kind(thing["kind"]):
-            return jsonify({
+            return None, (jsonify({
                 "error": "avatars are engine-managed presence, not "
                          "agent-editable — use move_to to relocate a body"
-            }), 422
+            }), 422)
         # umwelt#300 S0(d): declarative, kinddef-level update_thing
         # permission — replaces the old bare author-only check. A
         # NULL-cohort thing (every thing forged before this PR, per
@@ -9666,7 +11563,7 @@ def create_app(db_path: str, world_version_file: str | None = None,
         effective_callers = _update_thing_effective_callers(
             g.conn, things_dir, thing)
         if not _callers_authorized(g.conn, effective_callers, agent, thing):
-            return jsonify({"error": "not authorized to update this thing"}), 403
+            return None, (jsonify({"error": "not authorized to update this thing"}), 403)
 
         # umwelt#982: the thing read gate, ONLY where a kind grants `anyone`
         # (the default for a typed, new-cohort thing whose kinddef declares
@@ -9679,8 +11576,13 @@ def create_app(db_path: str, world_version_file: str | None = None,
         if "anyone" in effective_callers:
             refusal = _thing_view_refusal(g.conn, agent, thing, thing_id)
             if refusal is not None:
-                return refusal
+                return None, refusal
 
+        return thing, None
+
+    def _prepare_thing_patch(thing, thing_id, patch):
+        """Validate a patch against `thing` and build the DB patch. Returns a
+        `_PreparedPatch`, or a refusal (a response / (response, status))."""
         extra = set(patch) - set(_MUTABLE_THING_KEYS)
         if extra:
             return jsonify({
@@ -9915,6 +11817,13 @@ def create_app(db_path: str, world_version_file: str | None = None,
             new_name = patch.get("name", thing["name"])
             new_description = patch.get("description", thing["description"])
             db_patch["weight_est"] = db.compute_weight_est(new_name, new_description)
+        return _PreparedPatch(patch, db_patch)
+
+    def _apply_thing_patch(thing_id, agent, prepared, make_prepared=None):
+        """The atomic re-check + write. `prepared` is a `_PreparedPatch`, or
+        None with `make_prepared(c)` computing it inside the transaction
+        (raising `_ThingWriteRefusal` to roll back). Returns (refusal, None)
+        or (None, prepared)."""
         # umwelt#300 S0(d), Mira's security acceptance criteria point 6:
         # policy cannot be widened by a failed/stale check. The fast
         # pre-check above ran against `thing` as fetched at the TOP of
@@ -9948,6 +11857,13 @@ def create_app(db_path: str, world_version_file: str | None = None,
         # column update can). "source" in patch was validated (shape,
         # blueprint/kinddef parse) above; only the actual write moves.
         def _do_write(c):
+            nonlocal prepared
+            if make_prepared is not None:
+                # umwelt#1154 (edit): the new text is computed HERE, on a
+                # fresh read, under the same BEGIN IMMEDIATE as the
+                # re-check and the write; a refusal raises and rolls back.
+                prepared = make_prepared(c)
+            patch, db_patch = prepared.patch, prepared.db_patch
             source_changed = False
             if "source" in patch:
                 # umwelt#1014: compare BEFORE writing (R3 — a byte-identical
@@ -9961,13 +11877,226 @@ def create_app(db_path: str, world_version_file: str | None = None,
 
         try:
             authorized = db.atomic_authorized_write(g.conn, _is_still_authorized, _do_write)
+        except _ThingWriteRefusal as refusal:
+            return refusal.response, None
         except (ValueError, OSError) as e:
             # Same error shape update_thing always returned for a bad
             # source write — unchanged by moving the call site.
-            return jsonify({"error": f"source write failed: {e}"}), 400
+            return (jsonify({"error": f"source write failed: {e}"}), 400), None
         if not authorized:
-            return jsonify({"error": "not authorized to update this thing"}), 403
-        return jsonify({"thing_id": thing_id, "updated": sorted(patch.keys())})
+            return (jsonify({"error": "not authorized to update this thing"}), 403), None
+        return None, prepared
+
+    @app.route("/umwelt/update_thing", methods=["POST"])
+    def update_thing() -> Response:
+        body = request.get_json(force=True, silent=True) or {}
+        agent_raw = _str_identity(body, "agent")
+        thing_id = _str_identity(body, "thing")
+        patch = body.get("patch") or {}
+        if not agent_raw or not thing_id:
+            return jsonify({"error": "agent and thing are required"}), 400
+        # umwelt#495 slice 1b (write-surface conversion): resolve_actor
+        # replaces the direct _canonical_agent(agent_raw) fold. No token
+        # -> BYTE-IDENTICAL to before (resolve_actor's declared-branch
+        # applies the same _canonical_agent fold). A valid bearer token
+        # now wins over `agent_raw` entirely (anti-forgery); a presented
+        # bad/unknown/expired token returns 401 — fail-closed per Mira's
+        # ruling (presented-but-unresolvable must 401 on every converted
+        # route, including during the backfill window). See /umwelt/look
+        # for the identical read-route comment this mirrors.
+        resolution = resolve_actor(g.conn, request, declared=agent_raw)
+        if resolution.agent_id is None:
+            return jsonify({"error": "authentication failed"}), 401
+        agent = resolution.agent_id
+        if not isinstance(patch, dict):
+            return jsonify({"error": "patch must be an object"}), 400
+        # umwelt #400/#494: reject ANY `_SERVER_OWNED_METADATA_KEYS` member
+        # in a metadata patch — same write-guard posture as create_thing's
+        # matching rejection above (see that constant's definition for the
+        # full rationale, including why `entries` must stay off the
+        # separate read-visibility denylist). A non-dict patch["metadata"]
+        # is left to whatever (unrelated) handling already exists below;
+        # this only guards the shape act() and the board_entry_*/
+        # advance_ref mechanisms themselves write. Before #400 this was two
+        # separate literal checks (action_log; graft_ref/graft_version) —
+        # #494 flagged that shape as fail-open on a new server-owned key
+        # nobody remembers to add to every literal check.
+        if isinstance(patch.get("metadata"), dict):
+            _server_owned_hit = (
+                _SERVER_OWNED_METADATA_KEYS & patch["metadata"].keys())
+            if _server_owned_hit:
+                return jsonify({
+                    "error": _server_owned_metadata_message(
+                        _server_owned_hit, "the request body")
+                }), 422
+
+        thing, refusal = _thing_write_gate(agent, thing_id)
+        if refusal is not None:
+            return refusal
+
+        prepared = _prepare_thing_patch(thing, thing_id, patch)
+        if not isinstance(prepared, _PreparedPatch):
+            return prepared
+        refusal, prepared = _apply_thing_patch(thing_id, agent, prepared)
+        if refusal is not None:
+            return refusal
+        return jsonify({"thing_id": thing_id,
+                        "updated": sorted(prepared.patch.keys())})
+
+    # -- edit (umwelt #1154): Claude Code's Edit for a thing's text --------------
+    @app.route("/umwelt/edit", methods=["POST"])
+    def edit_thing() -> Response:
+        """`{agent, thing, file?, field?, old_string, new_string,
+        replace_all?}`: replace `old_string` by `new_string` in a thing's
+        source file (`field: "source"`, the default) or its description
+        (`field: "description"`). See PROTOCOL.md "edit".
+
+        ONE gate: the identity / 404 / avatar / 403 / `anyone` steps and the
+        patch validation and atomic write are `update_thing`'s own helpers.
+        The only thing `edit` adds is the new text, and it is computed INSIDE
+        the write transaction (`make_prepared`), on a fresh read of the text as
+        stored, so the uniqueness of `old_string` is the concurrency guard: two
+        parallel edits of one unique string cannot both win.
+
+        400 agent/thing missing · 401 / 403 / 404 / the avatar 422: exactly
+        `update_thing`'s · 409 zero matches, or 2+ without replace_all ·
+        422 a shape error or a result over its cap. No use row.
+        """
+        body = request.get_json(force=True, silent=True) or {}
+        ident, refusal = _writer_identity(body)
+        if refusal is not None:
+            return refusal
+        agent, thing_id = ident
+        thing, refusal = _thing_write_gate(agent, thing_id)
+        if refusal is not None:
+            return refusal
+
+        def _bad(msg):
+            return jsonify({"error": msg}), 422
+
+        field = body.get("field", "source")
+        if not isinstance(field, str) or field not in ("source", "description"):
+            return _bad("field must be \"source\" or \"description\"")
+        file_arg = body.get("file")
+        if file_arg is not None:
+            if field != "source":
+                return _bad("file is only valid with field \"source\"")
+            if not isinstance(file_arg, str):
+                return _bad("file must be a string")
+        old = body.get("old_string")
+        new = body.get("new_string")
+        for label, value in (("old_string", old), ("new_string", new)):
+            if not isinstance(value, str):
+                return _bad(f"{label} must be a string "
+                            f"(got {_json_type_name(value)})")
+            if len(value) > _EDIT_STRING_MAX_CHARS:
+                return _bad(f"{label} exceeds the {_EDIT_STRING_MAX_CHARS}-"
+                            f"char limit (got {len(value)})")
+        if old == "":
+            return _bad("old_string must not be empty")
+        if old == new:
+            return _bad("old_string and new_string are identical — "
+                        "no changes to make")
+        replace_all = body.get("replace_all", False)
+        if not isinstance(replace_all, bool):
+            return _bad("replace_all must be a boolean "
+                        f"(got {_json_type_name(replace_all)})")
+
+        result: dict = {}
+
+        def _refuse(status, message, **fields):
+            raise _ThingWriteRefusal(
+                (jsonify({"error": message, **fields}), status))
+
+        def make_prepared(c):
+            # Everything below runs under BEGIN IMMEDIATE, after the atomic
+            # authorization re-check, on a FRESH read.
+            fresh = db.get_thing(c, thing_id)
+            if field == "description":
+                text = fresh["description"] or ""
+                where = {"field": "description"}
+                where_text = f"the description of {thing_id}"
+            else:
+                try:
+                    source = _read_source_exact(things_dir, thing_id)
+                except UnicodeDecodeError:
+                    # A sibling file is not UTF-8 text: edit works on whole
+                    # text files, so it cannot handle this tree. (update_thing
+                    # replaces the whole tree and is unaffected.)
+                    _refuse(422, (
+                        f"{thing_id} has a source file that is not UTF-8 "
+                        "text, so edit cannot handle it; replace the source "
+                        "with update_thing instead"))
+                name, err = _pick_file(body, source)
+                if err is not None:
+                    raise _ThingWriteRefusal(err)
+                text = source[name]
+                where = {"field": "source", "file": name}
+                where_text = f"{name} of {thing_id}"
+            starts, pos = [], text.find(old)
+            while pos != -1:
+                starts.append(pos)
+                pos = text.find(old, pos + len(old))
+            n = len(starts)
+            if n == 0:
+                msg = f"old_string not found in {where_text} (matches: 0)"
+                if "\r" in text and "\r" not in old:
+                    msg += (" — this " + ("file" if field == "source"
+                            else "text") + " uses CRLF line endings; "
+                            "old_string must use \\r\\n")
+                _refuse(409, msg, matches=0, thing=thing_id, **where)
+            if n > 1 and not replace_all:
+                lines = [text.count("\n", 0, i) + 1 for i in starts[:5]]
+                _refuse(409, (
+                    f"old_string matches {n} times in {where_text} "
+                    f"(matches: {n}; lines {', '.join(map(str, lines))}) — "
+                    "pass replace_all or widen old_string"),
+                    matches=n, lines=lines, thing=thing_id, **where)
+            new_text = (text.replace(old, new) if replace_all
+                        else text[:starts[0]] + new + text[starts[0] + len(old):])
+            if (field == "source"
+                    and len(new_text.encode("utf-8")) > _THING_CONTENT_ROW_BYTES):
+                _refuse(422, (
+                    f"the edited file would be "
+                    f"{len(new_text.encode('utf-8'))} bytes, over the "
+                    f"{_THING_CONTENT_ROW_BYTES}-byte limit"))
+            # Where the first replacement landed in the NEW text (the text
+            # before it is unchanged, so its start is the first match's).
+            first_line = new_text.count("\n", 0, starts[0]) + 1
+            last_line = (new_text.count("\n", 0, starts[0] + len(new) - 1) + 1
+                         if new else first_line)
+            all_lines = _source_lines(new_text)
+            lo = max(1, first_line - 3)
+            hi = min(len(all_lines), last_line + 3)
+            excerpt = "\n".join(
+                line.rstrip("\r")[:_READ_LINE_MAX_CHARS]
+                for line in all_lines[lo - 1:hi])[:_EDIT_EXCERPT_MAX_CHARS]
+            result.update(replaced=n if replace_all else 1,
+                          first_line=first_line, last_line=last_line,
+                          excerpt=excerpt, **where)
+            if field == "description":
+                patch = {"description": new_text}
+            else:
+                patch = {"source": {**source, name: new_text}}
+            prepared = _prepare_thing_patch(fresh, thing_id, patch)
+            if not isinstance(prepared, _PreparedPatch):
+                raise _ThingWriteRefusal(prepared)
+            return prepared
+
+        refusal, _prepared = _apply_thing_patch(
+            thing_id, agent, None, make_prepared=make_prepared)
+        if refusal is not None:
+            return refusal
+        stamped = db.get_thing(g.conn, thing_id)
+        reply = {"thing_id": thing_id, "field": result["field"]}
+        if "file" in result:
+            reply["file"] = result["file"]
+        reply.update(replaced=result["replaced"],
+                     first_line=result["first_line"],
+                     last_line=result["last_line"],
+                     excerpt=result["excerpt"],
+                     updated_at=stamped.get("updated_at"))
+        return jsonify(reply)
 
     # -- update_place (owner-only edit — places' first generic write route) -
     # Places previously had NO generic "set arbitrary field" route — only
@@ -10065,7 +12194,9 @@ def create_app(db_path: str, world_version_file: str | None = None,
     #    bed substrate) ------------------------------------------------------
     @app.route("/umwelt/checklist", methods=["POST"])
     def checklist() -> Response:
-        """Mutate a checklist thing's items — author-only, a cousin of
+        """Mutate a checklist thing's items — author-only (except check and
+        uncheck and reset on a world-package-made checklist, any registered
+        resident: the `package` caller class, umwelt#1043), a cousin of
         update_thing/add_link, not the cross-agent `act` machinery (umwelt
         #182). A thing "is a checklist" iff its `metadata.checklist` is a
         list; this route never auto-creates one — a bed blueprint (world
@@ -10151,7 +12282,14 @@ def create_app(db_path: str, world_version_file: str | None = None,
             }), 409
 
         author = _canonical_agent(thing["author"])
-        if agent != author:
+        # umwelt#1043: on a checklist a world package made, any registered
+        # resident may tick, untick or reset (`package` caller class) and
+        # NOTHING else -- add, remove and edit stay author-only. reset only
+        # clears done marks (any resident can already do that one item at a
+        # time with uncheck), so it adds no power and keeps the item list.
+        package_tick = (op in ("check", "uncheck", "reset")
+                        and _package_caller_ok(g.conn, agent, thing))
+        if agent != author and not package_tick:
             return jsonify({
                 "error": "only the author may modify this thing's checklist"
             }), 403
@@ -10304,6 +12442,9 @@ def create_app(db_path: str, world_version_file: str | None = None,
         editing surface) / `grant_caller` / `revoke_caller` / `board_entry_add`
         / `board_entry_retire` (umwelt #400 — the `granted` caller class's
         write-path, and the charge-board's own structure-editing surface)
+        / `project_archive` / `project_restore` (umwelt #1074 — the
+        project-board's archive and restore verbs, bound to the board's own
+        project; see `_apply_effect_project_archive`)
         — after that
         transition+log commit. No agent-authored code ever runs; effects
         are the same declarative-row posture as the caller/from/to gates,
@@ -10329,7 +12470,10 @@ def create_app(db_path: str, world_version_file: str | None = None,
             `callers` — resolved against the closed set `author` (the
             target's author) | `place_owner` (owner of the place the target
             currently sits in; may be null for public places, in which case
-            place_owner grants nobody) | `anyone` | `granted` (umwelt #400
+            place_owner grants nobody) | `anyone` | `package` (umwelt#1043 —
+            the target's author carries the reserved `world:` prefix, i.e. a
+            world package made it, and the caller is a registered resident)
+            | `granted` (umwelt #400
             — a live `thing_grants` row for (thing, agent); see
             `db.has_grant` and the `grant_caller`/`revoke_caller` effects
             below, the ONLY write path to that table) | `named:<agent>`
@@ -10641,9 +12785,14 @@ def create_app(db_path: str, world_version_file: str | None = None,
                 action_def = candidate
                 break
         if action_def is None:
+            # umwelt#1043 slice 4: name what IS there (the same effective
+            # action set thing_actions and look_at list), so a mistyped verb
+            # is one read from its fix.
+            available = ", ".join(n for n, _ in _effective_actions(chain))
             return jsonify({
                 "error": f"action {action_name!r} not found in kind chain "
                          f"for {kind_id!r}"
+                         + (f"; available: {available}" if available else "")
             }), 422
 
         # -- authorization ---------------------------------------------------
@@ -10899,6 +13048,28 @@ def create_app(db_path: str, world_version_file: str | None = None,
                 if reason is not None:
                     effect_failures.append(
                         {"type": etype, "index": i, "reason": f"failed: {reason}"})
+            elif etype == "project_owner_add":
+                reason = _apply_effect_project_owner_add(
+                    g.conn, thing, agent, args, effect)
+                if reason is not None:
+                    effect_failures.append(
+                        {"type": etype, "index": i, "reason": f"failed: {reason}"})
+            elif etype == "project_owner_remove":
+                reason = _apply_effect_project_owner_remove(
+                    g.conn, thing, agent, args, effect)
+                if reason is not None:
+                    effect_failures.append(
+                        {"type": etype, "index": i, "reason": f"failed: {reason}"})
+            elif etype in ("project_archive", "project_restore"):
+                apply_fn = (_apply_effect_project_archive
+                            if etype == "project_archive"
+                            else _apply_effect_project_restore)
+                reason, result = apply_fn(g.conn, thing, agent, args, effect)
+                if reason is not None:
+                    effect_failures.append(
+                        {"type": etype, "index": i, "reason": f"failed: {reason}"})
+                else:
+                    effect_results.append({"type": etype, "index": i, **result})
             elif etype == "project_create":
                 reason = _apply_effect_project_create(
                     g.conn, thing, agent, args, effect)
@@ -11180,7 +13351,7 @@ def create_app(db_path: str, world_version_file: str | None = None,
 
     # -- trash_thing / restore_thing / bin / landfill (removal lifecycle,
     #    umwelt #28) -------------------------------------------------------
-    # Permanent destruction is never an agent's act (Lei/Ariadne, ob_0939) —
+    # Permanent destruction is never an agent's act (Lei/Ariadne) —
     # agents can only trash (recoverable soft-delete) and restore. Only the
     # world's periodic GC (gc.py) advances a binned thing toward landfilled
     # and eventually dissolved; dissolve is never exposed here or as an MCP
@@ -11188,7 +13359,7 @@ def create_app(db_path: str, world_version_file: str | None = None,
     # as update_thing above: `agent` is caller-declared (no auth in v0), so
     # author-only enforcement holds among cooperating our_side agents but is
     # not impersonation-resistant until agent identity is engine-attested
-    # (umwelt #24; the shared foundation dv_0230) — identical caveat wording
+    # (umwelt #24) — identical caveat wording
     # to update_thing's, kept consistent on purpose.
     @app.route("/umwelt/trash_thing", methods=["POST"])
     def trash_thing() -> Response:
@@ -11830,7 +14001,7 @@ def create_app(db_path: str, world_version_file: str | None = None,
         # (e) loud audit announcement — broadcast (no to_agent), only into
         # a public place; a private place has no audience for it to matter.
         #
-        # Borges's review catch (dv_1099 / his #161-S4 finding): even a
+        # Borges's review catch (his #161-S4 finding): even a
         # broadcast crossing with wake_me=False routes through
         # _evaluate_wake — the ONE gate every other crossing-sender in this
         # file uses (send_crossing itself, notify_author, the #119 mentions
@@ -12157,7 +14328,7 @@ def create_app(db_path: str, world_version_file: str | None = None,
                 return jsonify({"error": "authentication failed"}), 401
 
             session = db.create_agent_session(g.conn, agent_id, "verified")
-            return jsonify({
+            return jsonify(_with_engine_api_notice({
                 "token": session["token"],
                 "state": session["state"],
                 "expires_at": session["expires_at"],
@@ -12171,7 +14342,7 @@ def create_app(db_path: str, world_version_file: str | None = None,
                 # web session) without the gateway re-deriving bound-state
                 # itself or this route's control flow changing at all.
                 "kind": identity["kind"],
-            }), 200
+            })), 200
 
         # Unbound.
         if db.backfill_window_open(g.conn):
@@ -12181,14 +14352,14 @@ def create_app(db_path: str, world_version_file: str | None = None,
                 # the request (unlike the bound branch above).
                 db.consume_login_challenge(g.conn, challenge, agent_id)
             session = db.create_agent_session(g.conn, agent_id, "unverified")
-            return jsonify({
+            return jsonify(_with_engine_api_notice({
                 "token": session["token"],
                 "state": session["state"],
                 "expires_at": session["expires_at"],
                 "window_open": True,
                 # Same rationale as the verified branch above.
                 "kind": identity["kind"],
-            }), 200
+            })), 200
 
         return jsonify({
             "error": "identity unbound and backfill window closed"}), 401
@@ -12208,7 +14379,7 @@ def create_app(db_path: str, world_version_file: str | None = None,
     # weight_est prices what carrying/inventory-rendering a thing costs a
     # context window (issue #88's keystone: ten short things and one long
     # thing can cost the same). Trust scope (v0): same caller-declared
-    # `agent` posture as every other route here (ob_2721/#24) — sound only
+    # `agent` posture as every other route here (#24) — sound only
     # among our_side callers until the identity layer lands.
 
     @app.route("/umwelt/take", methods=["POST"])
@@ -12717,7 +14888,7 @@ def create_app(db_path: str, world_version_file: str | None = None,
 
 
     # -- send home (umwelt #88 slice 3) --------------------------------------
-    # Calibration session 1 (ob_0254) found the gap this closes: take/put/
+    # Calibration session 1 found the gap this closes: take/put/
     # take_out's over-budget 422 names "send it home" as one of the three
     # outs, but the remote-offload move itself didn't exist until now.
 
@@ -13952,7 +16123,7 @@ def create_app(db_path: str, world_version_file: str | None = None,
         `blocked` is the sender identity to block. Target-held in intent:
         the caller-supplied `agent` is treated as the target, with no
         separate "block on someone else's behalf" path. But umwelt identity
-        is caller-declared, not engine-attested (ob_2721/ob_2750) — so this
+        is caller-declared, not engine-attested — so this
         is NOT enforced "by construction": a caller can forge `agent` to
         edit another resident's block-set, and a blocked sender can bypass
         a block by forging a different `sender`. Real assurance today is
@@ -13981,7 +16152,7 @@ def create_app(db_path: str, world_version_file: str | None = None,
         # editing their OWN wake-block set) through resolve_actor — fail-closed
         # on a presented bad token before the block is written. The docstring's
         # own "a caller can forge `agent` to edit another resident's block-set"
-        # (ob_2721/ob_2750) is exactly the anti-forgery case this closes: a valid
+        # is exactly the anti-forgery case this closes: a valid
         # bearer token now wins over `agent_raw` entirely, so a forged target
         # name cannot mutate another resident's block-set. `blocked` (the SUBJECT
         # being blocked) stays on the declared fold — it is not a caller identity,
@@ -14194,7 +16365,7 @@ def create_app(db_path: str, world_version_file: str | None = None,
 
         Body: {agent, state_hint, on_loop?: bool, activity_line?: str}
         `agent` is read from the body — CALLER-DECLARED v0 identity, the
-        SAME forgeable posture every other verb here uses (ob_0938); a beat
+        SAME forgeable posture every other verb here uses; a beat
         can only write the DECLARING agent's own row (there is no separate
         row-target field). This is NOT a capability-channel frame — the
         writer is a harness hook over plain HTTP, same trust scope as
@@ -14989,7 +17160,7 @@ def create_app(db_path: str, world_version_file: str | None = None,
         404 task_id or depends_on_task_id not found ·
         422 task_id and depends_on_task_id are not in the same project
             (umwelt #230 — same project-scope fail-close posture as
-            `project_task_set`'s board->project bound, ob_2892: a
+            `project_task_set`'s board->project bound: a
             dependency edge is inherently a same-project relation, so
             neither add nor remove is allowed to reach across a project
             boundary) ·
@@ -15036,7 +17207,7 @@ def create_app(db_path: str, world_version_file: str | None = None,
         # SAME-PROJECT BOUND (umwelt #230 — load-bearing, do not omit): a
         # task_deps edge may only ever run between two tasks in the SAME
         # project — same fail-close posture as _apply_effect_project_task_set's
-        # board->project bound (ob_2892). Checked for both add and remove:
+        # board->project bound. Checked for both add and remove:
         # task_deps is inherently a same-project relation, so neither
         # direction should ever be allowed to name a cross-project pair.
         if task["project_id"] != depends_on_task["project_id"]:
@@ -15087,7 +17258,12 @@ def create_app(db_path: str, world_version_file: str | None = None,
                 "error": f"status must be one of {_PROJECT_STATUS}, "
                          f"got {status!r}"
             }), 422
-        return jsonify({"projects": db.list_projects(g.conn, status=status)})
+        projects = db.list_projects(g.conn, status=status)
+        # umwelt #1051: each project carries its owners, [{agent, role}].
+        owners_by_project = db.project_owners_map(g.conn)
+        for p in projects:
+            p["owners"] = owners_by_project.get(p["id"], [])
+        return jsonify({"projects": projects})
 
     @app.route("/umwelt/projects/<project_id>", methods=["GET"])
     def get_project_tree(project_id: str) -> Response:
@@ -15102,6 +17278,8 @@ def create_app(db_path: str, world_version_file: str | None = None,
         tree = db.project_tree(g.conn, project_id)
         if tree is None:
             return jsonify({"error": f"project {project_id!r} not found"}), 404
+        # umwelt #1051: the project's owners, [{agent, role}].
+        tree["owners"] = db.list_project_owners(g.conn, project_id)
         return jsonify({"project": tree})
 
     @app.route("/umwelt/my_court", methods=["GET"])
@@ -15469,7 +17647,26 @@ def main() -> None:
     os.makedirs(os.path.dirname(os.path.abspath(args.db)), exist_ok=True)
     conn = sqlite3.connect(args.db)
     db.init_db(conn)
-    config_path = os.path.expanduser("~/.engram/config.json")
+    # umwelt#1043: a fresh world (no places) loads its world package once; an
+    # existing world is never read or touched. A fresh world whose package
+    # is missing or invalid refuses to start, before any port is bound.
+    from . import world_package
+    try:
+        world_package.boot_load(
+            conn, place_id_ok=lambda v: isinstance(v, str)
+            and bool(_PLACE_ID_RE.match(v)),
+            things_dir=lambda: _things_dir(args.db))
+    except world_package.WorldPackageError as exc:
+        conn.close()
+        print(f"umwelt: refusing to start: {exc}", file=sys.stderr)
+        sys.exit(2)
+    _missing = db.missing_legacy_default_places(conn)
+    if _missing:
+        print("umwelt: this world has no roles and lacks "
+              + ", ".join(_missing)
+              + "; boot no longer re-seeds the default places (umwelt#1043)",
+              file=sys.stderr)
+    config_path =os.path.expanduser("~/.engram/config.json")
     agents: list[str] = []
     try:
         with open(config_path, encoding="utf-8") as fh:
@@ -15479,7 +17676,7 @@ def main() -> None:
             [str(cfg["agent_name"])] if cfg.get("agent_name") else [])
     except (OSError, json.JSONDecodeError, KeyError):
         pass
-    db.seed_places(conn, agents)
+    db.seed_posts(conn, agents)
     conn.close()
 
     sprite_dir_for_cap = _resolve_generation_surface(args.tier_config, args.db)

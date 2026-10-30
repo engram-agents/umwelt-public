@@ -74,6 +74,7 @@ from pathlib import Path
 # other heavy dependency unless a real identity key file is later found.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from umwelt import client_auth  # noqa: E402
+from umwelt import engine_api  # noqa: E402
 
 # Guarded on __name__ (not argv length — umwelt #447: an arity heuristic
 # opens on ANY 4+-arg invocation, including a pytest run like
@@ -115,6 +116,21 @@ else:
 _SESSION = client_auth.AgentSession()
 
 
+_LAST_MISMATCH_LINE = None
+
+
+def _note_engine_api_mismatch(err):
+    """umwelt#1105 C2: when the world's engine-API gate refused a request, say
+    so on stderr -- once per distinct refusal, not once per sub-call -- and let
+    the caller carry on exactly as for any other HTTP error (the bell keeps
+    running; it never exits because of a version skew)."""
+    global _LAST_MISMATCH_LINE
+    line = engine_api.mismatch_line_from_http_error(err)
+    if line and line != _LAST_MISMATCH_LINE:
+        _LAST_MISMATCH_LINE = line
+        print(line, file=sys.stderr, flush=True)
+
+
 def _req(path, payload=None):
     """GET/POST `path`, attaching an Authorization bearer header via
     client_auth whenever SELF is set (umwelt #495/#646) — same session-cache
@@ -134,17 +150,22 @@ def _req(path, payload=None):
             # docstring above.
             headers = client_auth.get_auth_header(BASE, SELF, _SESSION)
         url = BASE + path
+        # umwelt#1105: the engine-API number rides every request, but NOT in
+        # `headers` -- that dict's emptiness means "no bearer token" below.
+        engine_headers = engine_api.client_headers()
         if payload is None:
-            req = urllib.request.Request(url, headers=headers)
+            req = urllib.request.Request(url, headers={**headers, **engine_headers})
         else:
             send_headers = {"Content-Type": "application/json"}
             send_headers.update(headers)
+            send_headers.update(engine_headers)
             req = urllib.request.Request(
                 url, data=json.dumps(payload).encode(), headers=send_headers)
         try:
             with client_auth.urlopen_with_cert_fallback(req, 10) as r:
                 return json.load(r)
         except urllib.error.HTTPError as e:
+            _note_engine_api_mismatch(e)
             if e.code == 401 and attempt == 0 and headers:
                 _SESSION.invalidate()
                 continue
@@ -178,10 +199,13 @@ def proc_cmdline(pid):
     and the "umwelt-bell.py in cmd" guard was never true — reap silently
     no-op'd and re-arming left a duplicate bell on one cursor file (#200).
     `ps -p <pid> -o args=` is portable across macOS (BSD ps) and Linux
-    (procps); the trailing `=` suppresses the header on both."""
+    (procps); the trailing `=` suppresses the header on both. `-ww` (dash
+    form) lifts procps's width cap: without it procps truncates args= to an
+    exported $COLUMNS (pytest-xdist workers export 80), hiding the
+    umwelt-bell.py token of a genuine bell (umwelt#1155, engram-alpha#4227)."""
     try:
         out = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "args="],
+            ["ps", "-ww", "-p", str(pid), "-o", "args="],
             capture_output=True, text=True, timeout=5,
         )
     except Exception:

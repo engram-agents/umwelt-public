@@ -16,7 +16,7 @@ without a filesystem scan. This module owns the on-disk bytes + the inventory
 write; the capability-channel handler (later) is the only caller a *scroll* can
 reach — CAS itself has no socket and no notion of identity.
 
-Design + review: ``docs/CAPABILITY-CHANNEL.md`` (Sol #3795, ``ob_0908``).
+Design + review: ``docs/CAPABILITY-CHANNEL.md`` (Sol #3795).
 """
 
 from __future__ import annotations

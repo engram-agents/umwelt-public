@@ -13,7 +13,7 @@ pattern for exactly this kind of call).
 **Renderer-protocol shape, author-path ONLY.** `generate(render_spec, seed)
 -> bytes` matches `render.py`'s `generate()` signature exactly, so it is
 swap-compatible wherever a `Renderer` callable is expected — BUT per the M4
-design-of-record §1 (the render-vs-author split, `dv_1159`), this class must
+design-of-record §1 (the render-vs-author split), this class must
 NEVER be wired as `get_or_render_sprite`'s `renderer` parameter on the hot
 `/scene` render path. That path is exact-match-or-procedural-fallback ONLY
 and never invokes a model — un-DoS-able by construction. `ImageModelRenderer`

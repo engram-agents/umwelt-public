@@ -18,6 +18,13 @@ pass() {
     echo "ok - $*"
 }
 
+# Resolve a path through every symlink. Any comparison against a symlink-
+# following result must resolve BOTH sides: on macOS mktemp -d returns
+# /var/folders/..., and /var is a symlink to private/var.
+resolve_path() {
+    python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 installer="$script_dir/install-local-marketplace-umwelt.sh"
@@ -33,6 +40,9 @@ cleanup() {
 trap cleanup EXIT
 
 export UMWELT_MARKETPLACE_ROOT="$marketplace_root"
+# Every successful build writes $UMWELT_HOME/.deployed-version (umwelt #1104).
+# Point it at the throwaway dir so a harness run never writes the live marker.
+export UMWELT_HOME="$tmp_market/umwelt-home"
 
 # --- 0. --help exits 0, prints usage, no side effects ---
 help_out="$(bash "$installer" --help)"
@@ -42,8 +52,25 @@ echo "$help_out"
 pass "--help exits 0, prints usage, and has no side effects"
 
 # --- 1. Fresh install with --skip-add (never touch the real claude CLI state) ---
-out1="$(bash "$installer" --allow-dirty --skip-add --skip-venv)"
+out1="$(bash "$installer" --allow-untagged --allow-dirty --skip-add --skip-venv)"
 echo "$out1"
+grep -q '^umwelt_untagged_override=1$' "$UMWELT_HOME/.deployed-version" \
+    || fail "install did not write the deployed-version marker under UMWELT_HOME"
+pass "install writes the deployed-version marker under the throwaway UMWELT_HOME"
+
+# umwelt #1105 D1: the marker records the engine API the tree was built with,
+# under the umwelt_-prefixed key. The number is read from the source of truth
+# (src/umwelt/engine_api.py), never hard-coded here, so a bump needs no edit;
+# the 1104 placeholder `engine_api=unknown` is retired.
+expected_engine_api="$(sed -n 's/^ENGINE_API: int = \([0-9][0-9]*\)$/\1/p' "$repo_root/src/umwelt/engine_api.py")"
+[[ -n "$expected_engine_api" ]] || fail "could not read ENGINE_API from src/umwelt/engine_api.py"
+grep -qx "umwelt_engine_api=$expected_engine_api" "$UMWELT_HOME/.deployed-version" \
+    || fail "marker lacks umwelt_engine_api=$expected_engine_api"
+[[ "$(grep -c '^umwelt_engine_api=' "$UMWELT_HOME/.deployed-version")" == "1" ]] \
+    || fail "marker has more than one umwelt_engine_api line"
+! grep -q '^engine_api=' "$UMWELT_HOME/.deployed-version" \
+    || fail "marker still carries the retired unprefixed engine_api key"
+pass "marker records umwelt_engine_api=$expected_engine_api (and not the retired engine_api placeholder)"
 
 marketplace_json="$marketplace_root/.claude-plugin/marketplace.json"
 plugin_dir="$marketplace_root/plugins/umwelt"
@@ -109,7 +136,7 @@ pass "Codex manifest has the expected identity, component paths, and interface"
 
 # --- 3. Re-running the SAME install -> idempotent, no error, same tree ---
 before_listing="$(find "$marketplace_root" -type f | sort)"
-out2="$(bash "$installer" --allow-dirty --skip-add --skip-venv)"
+out2="$(bash "$installer" --allow-untagged --allow-dirty --skip-add --skip-venv)"
 echo "$out2"
 after_listing="$(find "$marketplace_root" -type f | sort)"
 [[ "$before_listing" == "$after_listing" ]] || fail "re-running the installer changed the file listing"
@@ -118,7 +145,7 @@ pass "re-running the same install is idempotent (no error, same file tree)"
 # --- 4. --skip-build: skips the resync step, still assembles the marketplace
 #        from whatever's already in plugin/umwelt/ ---
 skip_build_root="$tmp_market/marketplace-skip-build"
-out_skip_build="$(UMWELT_MARKETPLACE_ROOT="$skip_build_root" bash "$installer" --allow-dirty --skip-build --skip-add --skip-venv)"
+out_skip_build="$(UMWELT_MARKETPLACE_ROOT="$skip_build_root" bash "$installer" --allow-untagged --allow-dirty --skip-build --skip-add --skip-venv)"
 [[ "$out_skip_build" == *"assuming plugin/umwelt/ is already fresh"* ]] \
     || fail "--skip-build did not print the skip-build acknowledgement"
 [[ -f "$skip_build_root/plugins/umwelt/plugin.json" ]] || fail "--skip-build still did not assemble the marketplace"
@@ -158,7 +185,7 @@ codex_market="$codex_home/.umwelt/marketplace"
 codex_out="$(PATH="$fake_codex_bin:$PATH" FAKE_CODEX_LOG="$codex_log" \
     HOME="$codex_home" CODEX_HOME="$alt_codex_home" \
     UMWELT_MARKETPLACE_ROOT="$codex_market" \
-    bash "$installer" --allow-dirty --target codex --skip-build --skip-venv)"
+    bash "$installer" --allow-untagged --allow-dirty --target codex --skip-build --skip-venv)"
 echo "$codex_out"
 [[ -f "$codex_market/plugins/umwelt/.codex-plugin/plugin.json" ]] \
     || fail "codex target did not assemble the plugin tree"
@@ -201,14 +228,14 @@ compat_first_out="$(PATH="$fake_codex_bin:$PATH" FAKE_CODEX_LOG="$tmp_market/com
     FAKE_CODEX_MARKETPLACE="$compat_market" HOME="$compat_home" CODEX_HOME="$compat_codex_home" \
     CLAUDE_PLUGIN_ROOT="$old_compat_cache" UMWELT_MARKETPLACE_ROOT="$compat_market" \
     UMWELT_INSTALL_TESTING=1 UMWELT_INSTALL_TEST_SHORT_COMMIT=1111111 \
-    bash "$installer" --allow-dirty --target codex --skip-build --skip-venv)"
+    bash "$installer" --allow-untagged --allow-dirty --target codex --skip-build --skip-venv)"
 echo "$compat_first_out"
 compat_first_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["plugins"][0]["version"])' "$compat_market/.claude-plugin/marketplace.json")"
 compat_first_cache="$compat_cache_parent/$compat_first_version"
 [[ -L "$old_compat_cache" ]] || fail "deleted active cache was not restored as a compatibility symlink"
-[[ "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$old_compat_cache")" == "$compat_first_cache" ]] \
+[[ "$(resolve_path "$old_compat_cache")" == "$(resolve_path "$compat_first_cache")" ]] \
     || fail "old active cache link did not resolve to newly installed cache"
-[[ "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$stale_compat_cache")" == "$compat_first_cache" ]] \
+[[ "$(resolve_path "$stale_compat_cache")" == "$(resolve_path "$compat_first_cache")" ]] \
     || fail "already-stale compatibility link was not refreshed to the new cache"
 pass "Codex deletion of the active cache leaves an old-path symlink to the new cache"
 
@@ -217,16 +244,16 @@ compat_second_out="$(PATH="$fake_codex_bin:$PATH" FAKE_CODEX_LOG="$tmp_market/co
     FAKE_CODEX_MARKETPLACE="$compat_market" HOME="$compat_home" CODEX_HOME="$compat_codex_home" \
     CLAUDE_PLUGIN_ROOT="$old_compat_cache" UMWELT_MARKETPLACE_ROOT="$compat_market" \
     UMWELT_INSTALL_TESTING=1 UMWELT_INSTALL_TEST_SHORT_COMMIT=2222222 \
-    bash "$installer" --allow-dirty --target codex --skip-build --skip-venv)"
+    bash "$installer" --allow-untagged --allow-dirty --target codex --skip-build --skip-venv)"
 echo "$compat_second_out"
 compat_second_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["plugins"][0]["version"])' "$compat_market/.claude-plugin/marketplace.json")"
 compat_second_cache="$compat_cache_parent/$compat_second_version"
 [[ "$compat_first_version" != "$compat_second_version" ]] \
     || fail "consecutive synthetic dev upgrades did not produce distinct cache versions"
 [[ -L "$old_compat_cache" ]] || fail "consecutive upgrade did not restore the prior compatibility link"
-[[ "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$old_compat_cache")" == "$compat_second_cache" ]] \
+[[ "$(resolve_path "$old_compat_cache")" == "$(resolve_path "$compat_second_cache")" ]] \
     || fail "consecutive upgrade did not repoint old cache link to the second new cache"
-[[ "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$stale_compat_cache")" == "$compat_second_cache" ]] \
+[[ "$(resolve_path "$stale_compat_cache")" == "$(resolve_path "$compat_second_cache")" ]] \
     || fail "consecutive upgrade did not refresh the stale compatibility link"
 [[ -d "$compat_first_cache" && ! -L "$compat_first_cache" ]] \
     || fail "existing real prior cache was destructively replaced during consecutive upgrade"
@@ -241,7 +268,7 @@ compat_safety_out="$(PATH="$fake_codex_bin:$PATH" FAKE_CODEX_LOG="$tmp_market/co
     HOME="$compat_home" CODEX_HOME="$compat_codex_home" CLAUDE_PLUGIN_ROOT="$protected_compat_cache" \
     UMWELT_MARKETPLACE_ROOT="$compat_market" UMWELT_INSTALL_TESTING=1 \
     UMWELT_INSTALL_TEST_SHORT_COMMIT=3333333 \
-    bash "$installer" --allow-dirty --target codex --skip-build --skip-venv)"
+    bash "$installer" --allow-untagged --allow-dirty --target codex --skip-build --skip-venv)"
 echo "$compat_safety_out"
 [[ -d "$protected_compat_cache" && ! -L "$protected_compat_cache" ]] \
     || fail "existing real active cache directory was replaced"
@@ -265,12 +292,12 @@ unset_compat_out="$(env -u CLAUDE_PLUGIN_ROOT PATH="$fake_codex_bin:$PATH" \
     FAKE_CODEX_MARKETPLACE="$unset_compat_market" HOME="$unset_compat_home" CODEX_HOME="$unset_compat_codex_home" \
     UMWELT_MARKETPLACE_ROOT="$unset_compat_market" UMWELT_INSTALL_TESTING=1 \
     UMWELT_INSTALL_TEST_SHORT_COMMIT=4444444 \
-    bash "$installer" --allow-dirty --target codex --skip-build --skip-venv)"
+    bash "$installer" --allow-untagged --allow-dirty --target codex --skip-build --skip-venv)"
 unset_compat_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["plugins"][0]["version"])' "$unset_compat_market/.claude-plugin/marketplace.json")"
 unset_compat_new="$unset_compat_cache_parent/$unset_compat_version"
 [[ "$unset_compat_out" == *"capturing active Codex cache path for in-session compat: $unset_compat_old"* ]] \
     || fail "unset CLAUDE_PLUGIN_ROOT did not select the direct-child fallback cache"
-[[ -L "$unset_compat_old" && "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$unset_compat_old")" == "$unset_compat_new" ]] \
+[[ -L "$unset_compat_old" && "$(resolve_path "$unset_compat_old")" == "$(resolve_path "$unset_compat_new")" ]] \
     || fail "unset CLAUDE_PLUGIN_ROOT did not restore the fallback cache as a compatibility link"
 [[ -d "$unset_compat_new" && ! -L "$unset_compat_new" ]] \
     || fail "unset CLAUDE_PLUGIN_ROOT did not complete the simulated Codex install"
@@ -288,7 +315,7 @@ outside_compat_out="$(PATH="$fake_codex_bin:$PATH" FAKE_CODEX_LOG="$tmp_market/c
     HOME="$outside_compat_home" CODEX_HOME="$outside_compat_codex_home" CLAUDE_PLUGIN_ROOT="$outside_compat_root" \
     UMWELT_MARKETPLACE_ROOT="$outside_compat_market" UMWELT_INSTALL_TESTING=1 \
     UMWELT_INSTALL_TEST_SHORT_COMMIT=5555555 \
-    bash "$installer" --allow-dirty --target codex --skip-build --skip-venv)"
+    bash "$installer" --allow-untagged --allow-dirty --target codex --skip-build --skip-venv)"
 outside_compat_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["plugins"][0]["version"])' "$outside_compat_market/.claude-plugin/marketplace.json")"
 [[ "$outside_compat_out" != *"capturing active Codex cache path for in-session compat:"* ]] \
     || fail "CLAUDE_PLUGIN_ROOT outside the exact Umwelt cache parent was captured"
@@ -311,7 +338,7 @@ traversal_compat_out="$(PATH="$fake_codex_bin:$PATH" FAKE_CODEX_LOG="$tmp_market
     CLAUDE_PLUGIN_ROOT="$traversal_compat_cache_parent/../outside-traversal-sentinel/." \
     UMWELT_MARKETPLACE_ROOT="$traversal_compat_market" UMWELT_INSTALL_TESTING=1 \
     UMWELT_INSTALL_TEST_SHORT_COMMIT=6666666 \
-    bash "$installer" --allow-dirty --target codex --skip-build --skip-venv)"
+    bash "$installer" --allow-untagged --allow-dirty --target codex --skip-build --skip-venv)"
 [[ "$traversal_compat_out" != *"capturing active Codex cache path for in-session compat:"* ]] \
     || fail "traversal-normalized CLAUDE_PLUGIN_ROOT outside the direct-child set was captured"
 [[ -d "$traversal_compat_outside" && ! -L "$traversal_compat_outside" && "$(cat "$traversal_compat_outside/marker")" == "traversal sentinel" ]] \
@@ -329,7 +356,7 @@ nested_compat_out="$(PATH="$fake_codex_bin:$PATH" FAKE_CODEX_LOG="$tmp_market/co
     HOME="$nested_compat_home" CODEX_HOME="$nested_compat_codex_home" CLAUDE_PLUGIN_ROOT="$nested_compat_root" \
     UMWELT_MARKETPLACE_ROOT="$nested_compat_market" UMWELT_INSTALL_TESTING=1 \
     UMWELT_INSTALL_TEST_SHORT_COMMIT=7777777 \
-    bash "$installer" --allow-dirty --target codex --skip-build --skip-venv)"
+    bash "$installer" --allow-untagged --allow-dirty --target codex --skip-build --skip-venv)"
 [[ "$nested_compat_out" != *"capturing active Codex cache path for in-session compat:"* ]] \
     || fail "nested CLAUDE_PLUGIN_ROOT was captured as an active direct child"
 [[ -d "$nested_compat_root" && ! -L "$nested_compat_root" && "$(cat "$nested_compat_root/marker")" == "nested sentinel" ]] \
@@ -350,12 +377,12 @@ symlink_compat_out="$(PATH="$fake_codex_bin:$PATH" FAKE_CODEX_LOG="$tmp_market/c
     FAKE_CODEX_MARKETPLACE="$symlink_compat_market" HOME="$symlink_compat_home" CODEX_HOME="$symlink_compat_codex_home" \
     CLAUDE_PLUGIN_ROOT="$symlink_compat_old" UMWELT_MARKETPLACE_ROOT="$symlink_compat_market" \
     UMWELT_INSTALL_TESTING=1 UMWELT_INSTALL_TEST_SHORT_COMMIT=8888888 \
-    bash "$installer" --allow-dirty --target codex --skip-build --skip-venv)"
+    bash "$installer" --allow-untagged --allow-dirty --target codex --skip-build --skip-venv)"
 symlink_compat_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["plugins"][0]["version"])' "$symlink_compat_market/.claude-plugin/marketplace.json")"
 symlink_compat_new="$symlink_compat_cache_parent/$symlink_compat_version"
 [[ "$symlink_compat_out" == *"capturing active Codex cache path for in-session compat: $symlink_compat_old"* ]] \
     || fail "direct-child symlink was not exercised by the compatibility capture path"
-[[ -L "$symlink_compat_old" && "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$symlink_compat_old")" == "$symlink_compat_new" ]] \
+[[ -L "$symlink_compat_old" && "$(resolve_path "$symlink_compat_old")" == "$(resolve_path "$symlink_compat_new")" ]] \
     || fail "direct-child symlink was not repointed as a compatibility link after the simulated Codex install"
 [[ -d "$symlink_external_target" && ! -L "$symlink_external_target" && "$(cat "$symlink_external_target/marker")" == "external symlink target sentinel" ]] \
     || fail "compatibility cleanup followed a direct-child symlink into its external target"
@@ -366,7 +393,7 @@ skip_codex_log="$tmp_market/codex-skip.log"
 skip_codex_out="$(PATH="$fake_codex_bin:$PATH" FAKE_CODEX_LOG="$skip_codex_log" \
     HOME="$codex_home" CODEX_HOME="$alt_codex_home" \
     UMWELT_MARKETPLACE_ROOT="$codex_home/.umwelt/marketplace-skip-add" \
-    bash "$installer" --allow-dirty --target codex --skip-build --skip-add --skip-venv)"
+    bash "$installer" --allow-untagged --allow-dirty --target codex --skip-build --skip-add --skip-venv)"
 echo "$skip_codex_out"
 [[ ! -f "$skip_codex_log" ]] || fail "codex --skip-add should not have invoked the fake codex executable"
 skip_codex_mcp_command="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mcpServers"]["umwelt"]["command"])' "$codex_home/.umwelt/marketplace-skip-add/plugins/umwelt/.mcp.json")"
@@ -384,11 +411,11 @@ relative_codex_market="$codex_home/.umwelt/marketplace-relative-codex-home"
 relative_codex_out="$(cd "$codex_home" && PATH="$fake_codex_bin:$PATH" FAKE_CODEX_LOG="$relative_codex_log" \
     HOME="$codex_home" CODEX_HOME=".codex-relative" \
     UMWELT_MARKETPLACE_ROOT="$relative_codex_market" \
-    bash "$installer" --allow-dirty --target codex --skip-build --skip-add --skip-venv)"
+    bash "$installer" --allow-untagged --allow-dirty --target codex --skip-build --skip-add --skip-venv)"
 echo "$relative_codex_out"
 relative_codex_mcp_command="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mcpServers"]["umwelt"]["command"])' "$relative_codex_market/plugins/umwelt/.mcp.json")"
 expected_relative_codex_command="$codex_home/.codex-relative/plugins/cache/umwelt-local/umwelt/$repo_version/launch-umwelt-server.sh"
-[[ "$relative_codex_mcp_command" == "$expected_relative_codex_command" ]] \
+[[ "$(resolve_path "$relative_codex_mcp_command")" == "$(resolve_path "$expected_relative_codex_command")" ]] \
     || fail "relative CODEX_HOME did not canonicalize to the expected absolute launcher path: got $relative_codex_mcp_command expected $expected_relative_codex_command"
 [[ "$relative_codex_mcp_command" = /* ]] \
     || fail "relative CODEX_HOME produced a non-absolute launcher path: $relative_codex_mcp_command"
@@ -412,7 +439,7 @@ fi
 # Genuine default-policy happy path: clean checkout, normal build, no dirty
 # override. This guards against tests accidentally masking the safe default.
 clean_build_market="$tmp_market/clean-build-market"
-clean_build_out="$(UMWELT_MARKETPLACE_ROOT="$clean_build_market" bash "$identity_installer" --skip-add --skip-venv)"
+clean_build_out="$(UMWELT_MARKETPLACE_ROOT="$clean_build_market" bash "$identity_installer" --allow-untagged --skip-add --skip-venv)"
 [[ "$clean_build_out" == *"build-umwelt-plugin: synced"* ]] \
     || fail "clean normal install did not run the plugin build"
 [[ -f "$clean_build_market/plugins/umwelt/plugin.json" ]] \
@@ -437,7 +464,7 @@ for path in sys.argv[1:]:
 PY
 invalid_base_err="$tmp_market/invalid-base-version.err"
 if UMWELT_MARKETPLACE_ROOT="$tmp_market/invalid-base-version" \
-    bash "$identity_installer" --allow-dirty --skip-build --skip-add --skip-venv >/dev/null 2>"$invalid_base_err"; then
+    bash "$identity_installer" --allow-untagged --allow-dirty --skip-build --skip-add --skip-venv >/dev/null 2>"$invalid_base_err"; then
     fail "source version with build metadata should be rejected"
 fi
 grep -q "source manifest version is not a plain SemVer release: 0.1.0+local" "$invalid_base_err" \
@@ -447,8 +474,8 @@ pass "source version with build metadata is rejected before derivation"
 
 identity_market_1="$tmp_market/identity-market-1"
 identity_market_2="$tmp_market/identity-market-2"
-identity_out_1="$(UMWELT_MARKETPLACE_ROOT="$identity_market_1" bash "$identity_installer" --skip-build --skip-add --skip-venv)"
-identity_out_2="$(UMWELT_MARKETPLACE_ROOT="$identity_market_2" bash "$identity_installer" --skip-build --skip-add --skip-venv)"
+identity_out_1="$(UMWELT_MARKETPLACE_ROOT="$identity_market_1" bash "$identity_installer" --allow-untagged --skip-build --skip-add --skip-venv)"
+identity_out_2="$(UMWELT_MARKETPLACE_ROOT="$identity_market_2" bash "$identity_installer" --allow-untagged --skip-build --skip-add --skip-venv)"
 identity_version_1="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["plugins"][0]["version"])' "$identity_market_1/.claude-plugin/marketplace.json")"
 identity_version_2="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["plugins"][0]["version"])' "$identity_market_2/.claude-plugin/marketplace.json")"
 [[ "$identity_version_1" == "$identity_version_2" ]] \
@@ -462,7 +489,7 @@ GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid \
 GIT_AUTHOR_DATE='2030-01-02T03:04:05Z' GIT_COMMITTER_DATE='2030-01-02T03:04:05Z' \
     git -C "$identity_repo" commit -q -m 'identity test commit'
 identity_market_3="$tmp_market/identity-market-3"
-UMWELT_MARKETPLACE_ROOT="$identity_market_3" bash "$identity_installer" --skip-build --skip-add --skip-venv >/dev/null
+UMWELT_MARKETPLACE_ROOT="$identity_market_3" bash "$identity_installer" --allow-untagged --skip-build --skip-add --skip-venv >/dev/null
 identity_version_3="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["plugins"][0]["version"])' "$identity_market_3/.claude-plugin/marketplace.json")"
 [[ "$identity_version_3" != "$identity_version_1" ]] \
     || fail "changed HEAD retained old version identity: $identity_version_3"
@@ -474,20 +501,20 @@ dirty_tracked_file="$identity_repo/plugin/skills/umwelt-login/SKILL.md"
 printf '\ndirty identity test\n' >> "$dirty_tracked_file"
 dirty_err="$tmp_market/dirty.err"
 if UMWELT_MARKETPLACE_ROOT="$tmp_market/identity-dirty" \
-    bash "$identity_installer" --skip-build --skip-add --skip-venv >/dev/null 2>"$dirty_err"; then
+    bash "$identity_installer" --allow-untagged --skip-build --skip-add --skip-venv >/dev/null 2>"$dirty_err"; then
     fail "dirty-tree install should fail without --allow-dirty"
 fi
 grep -q "working tree is dirty before build; refusing" "$dirty_err" \
     || fail "dirty-tree failure did not explain the safety refusal"
 dirty_override_err="$tmp_market/dirty-override.err"
 UMWELT_MARKETPLACE_ROOT="$tmp_market/identity-dirty-override" \
-    bash "$identity_installer" --allow-dirty --skip-build --skip-add --skip-venv >/dev/null 2>"$dirty_override_err"
+    bash "$identity_installer" --allow-untagged --allow-dirty --skip-build --skip-add --skip-venv >/dev/null 2>"$dirty_override_err"
 grep -q "WARNING — dirty-tree override enabled" "$dirty_override_err" \
     || fail "--allow-dirty did not warn that the assembly has a dirty fingerprint"
 dirty_version_1="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["plugins"][0]["version"])' "$tmp_market/identity-dirty-override/.claude-plugin/marketplace.json")"
 printf 'another dirty byte\n' >> "$dirty_tracked_file"
 UMWELT_MARKETPLACE_ROOT="$tmp_market/identity-dirty-override-2" \
-    bash "$identity_installer" --allow-dirty --skip-build --skip-add --skip-venv >/dev/null 2>/dev/null
+    bash "$identity_installer" --allow-untagged --allow-dirty --skip-build --skip-add --skip-venv >/dev/null 2>/dev/null
 dirty_version_2="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["plugins"][0]["version"])' "$tmp_market/identity-dirty-override-2/.claude-plugin/marketplace.json")"
 [[ "$dirty_version_1" == *.dirty.d* && "$dirty_version_1" != "$dirty_version_2" ]] \
     || fail "dirty contents did not get distinct cache identities: $dirty_version_1 / $dirty_version_2"
@@ -499,7 +526,7 @@ pass "dirty tree fails loudly by default; override fingerprints actual dirty con
 git -C "$identity_repo" reset --hard -q HEAD
 tracked_only_base="$tmp_market/tracked-only-base"
 UMWELT_MARKETPLACE_ROOT="$tracked_only_base" \
-    bash "$identity_installer" --skip-build --skip-add --skip-venv >/dev/null
+    bash "$identity_installer" --allow-untagged --skip-build --skip-add --skip-venv >/dev/null
 tracked_only_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["plugins"][0]["version"])' "$tracked_only_base/.claude-plugin/marketplace.json")"
 printf 'untracked\n' > "$identity_repo/plugin/untracked-file"
 printf 'plugin/ignored-file\n' >> "$identity_repo/.git/info/exclude"
@@ -507,7 +534,7 @@ printf 'ignored\n' > "$identity_repo/plugin/ignored-file"
 mkfifo "$identity_repo/plugin/untracked-fifo"
 tracked_only_market="$tmp_market/tracked-only-noise"
 UMWELT_MARKETPLACE_ROOT="$tracked_only_market" \
-    bash "$identity_installer" --skip-build --skip-add --skip-venv >/dev/null
+    bash "$identity_installer" --allow-untagged --skip-build --skip-add --skip-venv >/dev/null
 tracked_only_noise_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["plugins"][0]["version"])' "$tracked_only_market/.claude-plugin/marketplace.json")"
 [[ "$tracked_only_noise_version" == "$tracked_only_version" ]] \
     || fail "untracked/ignored plugin noise changed clean identity"
@@ -526,7 +553,7 @@ GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid \
     git -C "$identity_repo" commit -q -m 'tracked plugin symlink fixture'
 tracked_symlink_market="$tmp_market/tracked-symlink"
 UMWELT_MARKETPLACE_ROOT="$tracked_symlink_market" \
-    bash "$identity_installer" --skip-build --skip-add --skip-venv >/dev/null
+    bash "$identity_installer" --allow-untagged --skip-build --skip-add --skip-venv >/dev/null
 [[ -L "$tracked_symlink_market/plugins/umwelt/skills/tracked-manifest-link" ]] \
     || fail "tracked plugin symlink was dereferenced or omitted"
 [[ "$(readlink "$tracked_symlink_market/plugins/umwelt/skills/tracked-manifest-link")" == "../plugin.json" ]] \
@@ -540,7 +567,7 @@ rm "$special_path"
 mkfifo "$special_path"
 special_err="$tmp_market/tracked-special.err"
 if UMWELT_MARKETPLACE_ROOT="$tmp_market/tracked-special" \
-    bash "$identity_installer" --allow-dirty --skip-build --skip-add --skip-venv >/dev/null 2>"$special_err"; then
+    bash "$identity_installer" --allow-untagged --allow-dirty --skip-build --skip-add --skip-venv >/dev/null 2>"$special_err"; then
     fail "tracked path replaced by FIFO should be rejected"
 fi
 grep -Eq "unsupported worktree type \(special file\)|tracked regular file became a special file" "$special_err" \
@@ -566,7 +593,7 @@ GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid \
 [[ -z "$(git -C "$post_build_repo" status --porcelain)" ]] || fail "post-build fixture was not clean before build"
 post_build_err="$tmp_market/post-build.err"
 if UMWELT_MARKETPLACE_ROOT="$tmp_market/post-build-market" \
-    bash "$post_build_repo/tools/install-local-marketplace-umwelt.sh" --skip-add --skip-venv >/dev/null 2>"$post_build_err"; then
+    bash "$post_build_repo/tools/install-local-marketplace-umwelt.sh" --allow-untagged --skip-add --skip-venv >/dev/null 2>"$post_build_err"; then
     fail "build-dirtied checkout should fail without --allow-dirty"
 fi
 grep -q "working tree is dirty after build; refusing" "$post_build_err" \
@@ -578,7 +605,7 @@ pass "clean-before-build checkout that build dirties is refused by default"
 leading_zero_market="$tmp_market/leading-zero-market"
 UMWELT_INSTALL_TESTING=1 UMWELT_INSTALL_TEST_SHORT_COMMIT=0123456 \
     UMWELT_MARKETPLACE_ROOT="$leading_zero_market" \
-    bash "$identity_installer" --allow-dirty --skip-build --skip-add --skip-venv >/dev/null 2>/dev/null
+    bash "$identity_installer" --allow-untagged --allow-dirty --skip-build --skip-add --skip-venv >/dev/null 2>/dev/null
 leading_zero_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["plugins"][0]["version"])' "$leading_zero_market/.claude-plugin/marketplace.json")"
 [[ "$leading_zero_version" == *".g0123456" || "$leading_zero_version" == *".g0123456.dirty.d"* ]] \
     || fail "leading-zero SHA was not prefixed as a SemVer-safe identifier: $leading_zero_version"
@@ -590,7 +617,7 @@ leading_zero_dirty_market="$tmp_market/leading-zero-dirty-market"
 printf '\nleading-zero dirty hash fixture\n' >> "$identity_repo/plugin/skills/umwelt-login/SKILL.md"
 UMWELT_INSTALL_TESTING=1 UMWELT_INSTALL_TEST_DIRTY_HASH=012345678901 \
     UMWELT_MARKETPLACE_ROOT="$leading_zero_dirty_market" \
-    bash "$identity_installer" --allow-dirty --skip-build --skip-add --skip-venv >/dev/null 2>/dev/null
+    bash "$identity_installer" --allow-untagged --allow-dirty --skip-build --skip-add --skip-venv >/dev/null 2>/dev/null
 leading_zero_dirty_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["plugins"][0]["version"])' "$leading_zero_dirty_market/.claude-plugin/marketplace.json")"
 [[ "$leading_zero_dirty_version" == *".dirty.d012345678901" ]] \
     || fail "leading-zero dirty digest was not prefixed as a SemVer-safe identifier: $leading_zero_dirty_version"
@@ -610,7 +637,7 @@ restore_plugin_json() {
 }
 trap 'restore_plugin_json; cleanup' EXIT
 missing_root="$tmp_market/marketplace-missing-plugin-json"
-if UMWELT_MARKETPLACE_ROOT="$missing_root" bash "$installer" --allow-dirty --skip-build --skip-add --skip-venv >/dev/null 2>&1; then
+if UMWELT_MARKETPLACE_ROOT="$missing_root" bash "$installer" --allow-untagged --allow-dirty --skip-build --skip-add --skip-venv >/dev/null 2>&1; then
     fail "installer should have failed with plugin/plugin.json missing"
 fi
 restore_plugin_json
@@ -626,7 +653,7 @@ pass "installer fails loudly when plugin/plugin.json is missing"
 venv_home="$(mktemp -d)"
 venv_marketplace_root="$venv_home/.umwelt/marketplace"
 if env HOME="$venv_home" UMWELT_MARKETPLACE_ROOT="$venv_marketplace_root" \
-    bash "$installer" --allow-dirty --skip-build --skip-add >/dev/null; then
+    bash "$installer" --allow-untagged --allow-dirty --skip-build --skip-add >/dev/null; then
     [[ -x "$venv_home/.umwelt/venv/bin/python3" ]] \
         || fail "installer (no --skip-venv) did not create \$HOME/.umwelt/venv/bin/python3"
     pass "omitting --skip-venv creates \$HOME/.umwelt/venv/bin/python3"
@@ -670,7 +697,7 @@ degrade_home="$(mktemp -d)"
 degrade_market="$degrade_home/.umwelt/marketplace"
 degrade_out="$(PATH="$stub_bin:$PATH" env HOME="$degrade_home" \
     UMWELT_MARKETPLACE_ROOT="$degrade_market" \
-    bash "$installer" --allow-dirty --skip-build --skip-add)" \
+    bash "$installer" --allow-untagged --allow-dirty --skip-build --skip-add)" \
     || fail "installer should exit 0 on a degraded venv-creation failure (not abort)"
 echo "$degrade_out"
 [[ "$degrade_out" == *"WARNING"* ]] || fail "degraded venv failure did not print a WARNING"

@@ -5,9 +5,9 @@
 # PYTHONPATH, picks a sane python, and drops you into the world over the same
 # HTTP API agents use. Nothing to remember — just run it.
 #
-#   scripts/mud.sh --agent lei          # join the world as lei (non-interactive register)
+#   scripts/mud.sh --agent <your-agent-name>   # join the world under your own name (non-interactive register)
 #   scripts/mud.sh                       # full interactive registration prompt
-#   UMWELT_URL=http://myhost.lan:<port> scripts/mud.sh --agent lei   # from the LAN
+#   UMWELT_URL=http://myhost.lan:<port> scripts/mud.sh --agent <your-agent-name>   # from the LAN
 #
 # Any extra args pass straight through to `python -m umwelt.mud`.
 set -euo pipefail

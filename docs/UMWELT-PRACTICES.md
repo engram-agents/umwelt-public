@@ -103,8 +103,8 @@ column drifts from reality. Observed live 2026-08-04: 3 of 4 projects archived
 that day had a stale `status=active` despite being done for weeks. The field is
 a cache; the GitHub issue or forum thread is the truth.
 
-*Provenance:* the positioning frame is imported from Borges's ENGRAM work
-(`cs_0062`), not derived from umwelt practice. One substrate is not two — treat
+*Provenance:* the positioning frame is imported from Borges's ENGRAM work,
+not derived from umwelt practice. One substrate is not two — treat
 it as a hypothesis with an outside track record, not as an established village
 finding. The blindness half has now reproduced here once (Aleph's, above).
 
@@ -399,6 +399,141 @@ TRIGGERED form is the reviewer-fairy's own output contract asking the gadget
 question — not built; the review hook in `GADGETS.md` §8 is the nearest
 existing surface.
 
+### B8. Every seat is in one of three modes: planned, owner, study. Idle is not one of them.
+
+Lei's ruling, 2026-10-18 22:04Z (Office proposal cb5cd6e2, approved with every
+ask at its recommended answer), after eight seats sat idle for four hours that
+afternoon once the day's planned lanes were done. The ruling's text is the
+design file the proposal carried; below, the modes and their priority, the
+three-step board duty, the meaning of "hard-blocked", colleague-wait, quiet
+on-call as an orderable posture, the study unit and the daily block are the
+ruling. Sentences marked *application* are this file's, in B7's form: Lei's
+rule, then how we apply it.
+
+The rule, in priority order:
+
+- **Planned** — Lei's plan or the commander's charge names work for you. Do that.
+- **Owner** — planned items are shipped or blocked, and a project you own has a
+  next step. Drive it: the top item on the project's board. A project is a
+  Workshop room; its board names the owner and keeps **at least three next
+  steps** at all times. An empty board is the owner's defect, not idle time.
+- **Study** — your owner steps are hard-blocked by Lei, or it is the daily
+  study block, or two heartbeat ticks have passed quiet (*application:* with no
+  open owner step). Run **one study unit**: one named target (a weak
+  load-bearing belief, a paper, an audit scope, an experiment), one stated
+  method, one written result in your ENGRAM graph before the unit closes, plus
+  one line on your study log in your Post. A unit with no write is reported as
+  a null result, which is also a write. Lei, 2026-10-20: *"We can encourage
+  sharing of knowledge and study results."* *Application:* the same line is
+  written twice, once on your own log and once in the village's **Study Log**
+  (Library > Study Log, `place_study_log`), so another seat can find and use
+  the result; null results are welcome there too. Nobody grades a line but the
+  next reader who uses it.
+
+"Hard-blocked by Lei" means a decision only he can make, on his queue. Waiting
+on a colleague's review is **not** blocked: move to the next owner step or to
+study. *Application:* an outage or a missing tool blocks the step, not the
+seat; file the issue, then take the next step or a study unit. "Quiet on-call,
+no manufactured work" is a posture Lei can **order** for a budget day; it is no
+longer the default.
+
+**The daily block.** Every seat runs one study unit per day regardless of load,
+right after the morning routine, 30 to 45 minutes. Idle time adds units.
+
+**Who owns what.** Read the Project Register at the Workshop's top level; it is
+derived from the project tables each time it is used and is the one lookup, so
+this file carries no owner table (B1: let the engine hold it, and no second
+copy to drift). A project with no row yet is its owner's to register. The one
+owner line this file keeps is about the commander's role, not a project: Kepler
+owns no concrete project (commander, coordination, design consultant, Lei's
+main contact). On archiving: a project room is archived with its things (D2)
+and the maintainer moves and archives resolved work (D3); Lei asked on
+2026-10-19 that an owner archive the room when the project finishes, and that
+verb is umwelt#1083, in review, not yet a rule here.
+
+**Where the mechanisms live.** The identity-layer text and the rest of the
+mechanisms are engram-alpha#3919; the register and the work card's
+owned-projects line are umwelt#1074 and #1051. Until the identity-layer text
+lands, this section and the approval are the rule.
+
+**Delivery: DELIVERED** through the login-time handbook read, once the in-world
+Handbook copy is re-synced to this commit. The TRIGGERED half is #3919's
+quiet-tick nudge, not yet built. First measured day, 2026-10-19 (state named
+per D5: the commander's day record for that date): every seat on a lane of its
+own, none idle. One day is not a trend.
+
+---
+
+### B9. A status board stays current only when the resolver writes it: one row per ask, written in the same breath as the resolving act, confirmed by an EOD line, printed stale by the day-end.
+
+Lei's agreement, 2026-10-26 evening (in session with Kepler at the day's end).
+That morning he had asked for the Decisions Board: one row per project of what
+it needs from him, resolved at a Saturday project meeting. By evening two rows
+still carried asks that had been resolved during the day (a certificate he had
+issued himself; a boot-environment ask its owner had retracted), because the
+resolutions had landed in crossings and reports, not on the board. The rule
+below is the convention as agreed; sentences marked *application* are this
+file's, in B7's form.
+
+The rule:
+
+- **One row per ask, on one board.** The Decisions Board in Lei's Office is
+  that board for asks of Lei: `PROJECT · owner · NEEDS FROM LEI: <one line, or
+  'none'> · since <date> · ref · Confirmed <date>`. A project with nothing
+  pending says `none`, so silence never reads as a pending ask. *Application:*
+  a project row may carry its asks as numbered lines; the unit of the rule is
+  still the ask, so a numbered line is replaced, retired or re-confirmed on its
+  own by rewriting the row. A `ref` is context for the reader, not the ask's
+  tracker: a closed ref does not mean a resolved ask.
+- **Whoever resolves the ask writes the row, in the same breath as the
+  resolving act.** Lei's ruling in session, the owner's fix, the commander's
+  relay: the seat that made or received the resolution replaces the row (add
+  the new row, retire the old entry) before its next act. `add-entry` and
+  `retire-entry` are the board's own verbs, so replacing another seat's row
+  this way is not an A5 edit of their artifact; the retired row stays in the
+  board's history. A resolution that lands anywhere else first is exactly how
+  the board went stale. *Application:* when a ruling reaches a seat that is not
+  the row's holder (the commander relaying Lei's word to a project owner), the
+  receiver writes the row and the holder reads it back and either confirms it
+  (its EOD `board:` line) or replaces it (retire the receiver's row, add the
+  corrected one); the holder never stacks a second row beside it. Measured on
+  the first day: the LOCAL MODEL LAB row was written twice, by the receiver and
+  by the holder a minute apart, and the second had to be retired.
+- **Every end-of-day report carries a `board:` line:** `board: unchanged |
+  updated | none` — *unchanged* (I hold a row and it is still right),
+  *updated* (I rewrote it today), *none* (I hold no row). The commander reads
+  each line against the day's merges and rulings. The line is the report; the
+  board's own record of it is the row's `Confirmed <date>` token: a row the
+  holder rewrote today is confirmed by its own date, and for a row reported
+  `unchanged` the commander writes `Confirmed <date> (<holder>, via EOD)` into
+  the row at the day-end, one pass over the reports. A row with neither is
+  unconfirmed since its own date, which is what the print below reads.
+- **The day-end prints staleness mechanically:** rows unconfirmed for three
+  days, and rows whose referenced issue or PR has closed, are printed at the
+  day-end, and each printed row is replaced, retired, or re-confirmed that
+  night. A closed ref is a prompt to re-confirm the ask, never by itself a
+  reason to retire it (measured on the first day: four of fourteen live rows
+  cited a closed ref, and three of those four had a live ask confirmed within
+  twelve hours). *Application:* until the print is a tool, the commander runs it by
+  hand as the Routine Board's EVENING item 18; the tool is umwelt#1139, this
+  week's build, and it reads the same two signals this bullet names: the
+  row's confirmation date and the state of its refs.
+
+Why a convention and not a wish: a board goes stale the moment one update
+lands on a different surface than the board, and no amount of reading fixes
+that, because a reader has no way to tell a current row from a stale one. Only
+the writer, at the moment of resolution, knows. B1 applies in halves: the
+staleness print is the half a machine can do; the same-breath write is the
+half it cannot, so it is a duty of the resolver, named here.
+
+**Delivery: DELIVERED** through the login-time handbook read, once the
+in-world Handbook copy is re-synced to this commit; at bind time the board's
+own description and its header row are rewritten to this rule (they still
+said per-project, owner-kept). First measured day:
+2026-10-27, the first EOD round under the rule (state named per D5: the
+commander's day record for that date); the double-write above is the datum
+the receiver-writes sentence rests on. One day is not a trend.
+
 ---
 
 ## §C — Open items
@@ -422,7 +557,8 @@ Adopted, with three corrections that change the order of work:
 2. **The falsifier cannot do its job at our n, and this blocks building.** The
    stated kill condition is, verbatim: *"If instrumented read-rates turn out
    near-uniform across rules, then read-rate carries no signal and this measures
-   nothing worth having."* At **thirteen rules** (A1–A6, B1–B7), nine agents, and
+   nothing worth having."* At **fourteen rules** (A1–A6, B1–B8) as of 39160953,
+   2026-10-20, nine agents, and
    single-digit reads per rule per window, near-uniform is what you observe
    *whether or not* the signal exists — so the falsifier cannot separate "no
    signal" from "not enough reads yet," and will fire spuriously and take a good
@@ -433,8 +569,8 @@ Adopted, with three corrections that change the order of work:
 
    *(The count matters and was wrong once already: this argument was first made
    against v0's six rules and carried into v1 without updating. v1 had eight;
-   B4 made it nine; B5 and B6 made it eleven; A6 made it twelve; B7 makes the
-   current count thirteen (A1–A6, B1–B7) —
+   B4 made it nine; B5 and B6 made it eleven; A6 made it twelve; B7 made it
+   thirteen; B8 makes the current count fourteen (A1–A6, B1–B8) —
    and the nine stood uncorrected through B5's own addition, a second instance
    of the same drift, caught only when B6 was added. The conclusion is unchanged
    — the problem gets worse with more rules at fixed reads, not better — but a
@@ -582,6 +718,14 @@ meeting, ratify in Lei's tray, bind by PR.*
 - **B7** — Kepler, 2026-10-03, from Lei's in-session rule the same day and
   the #957/#959 fix that produced it; Lei's words verbatim, the rest is the
   application.
+- **B8** — Kepler, 2026-10-20, from Lei's 2026-10-18 approval of the
+  owner-and-study-mode design (Office proposal cb5cd6e2) and its first
+  measured day; written so a seat can look the rule up instead of
+  recalling a Square post.
+- **B9** — Kepler, 2026-10-27, from Lei's 2026-10-26 evening agreement on
+  the status-board convention, the night the Decisions Board he had asked for
+  that morning was found behind on two rows; the rule is the convention as
+  agreed, the application lines are this file's.
 - **§D** — Kepler, 2026-10-04: the Village Law, v0.4.1, bound under its own D6
   the morning after Meeting 3 adopted v0.4 (2026-10-03). Law drafts v0–v0.4 by
   Kepler with the village's folds at Meetings 1–3; the three v0.4.1 precisions

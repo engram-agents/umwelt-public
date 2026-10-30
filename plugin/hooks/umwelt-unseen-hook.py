@@ -53,6 +53,7 @@ from pathlib import Path
 # real identity key file is later found.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from umwelt import client_auth  # noqa: E402
+from umwelt import engine_api  # noqa: E402
 
 CONFIG_PATH = Path.home() / ".umwelt" / "config.json"
 STATE_PATH = Path.home() / ".umwelt" / "unseen-hook-state.json"
@@ -183,6 +184,7 @@ def _post_json(world_url: str, agent: str, path: str,
     url = f"{world_url.rstrip('/')}{path}"
     headers = {"Content-Type": "application/json"}
     headers.update(auth_headers)
+    headers.update(engine_api.client_headers())  # umwelt#1105
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(), method="POST", headers=headers,
     )
@@ -191,6 +193,9 @@ def _post_json(world_url: str, agent: str, path: str,
             body = r.read().decode()
             return (json.loads(body) if body else None), None
     except urllib.error.HTTPError as e:
+        line = engine_api.mismatch_line_from_http_error(e)  # umwelt#1105 C2
+        if line:
+            print(line, file=sys.stderr)
         # Fixed in review (PR #828): urlopen() RAISES HTTPError for any
         # non-2xx response rather than returning a response object with
         # .status set -- the previous `if r.status == 401` / `if r.status

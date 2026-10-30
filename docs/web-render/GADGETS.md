@@ -114,7 +114,7 @@ structure that prevents the pile.
 | **input-row** | `ggInputRow({placeholder, onSubmit, extras?})` | the 3 existing say/use/talk copies → one factory, three call sites | `extras` slot carries the emotion picker |
 | **badge** | `ggBadge({kind, text, parentEl?})` | face badge + emotion bubble (#309) + held-marker (seed list; not yet migrated, §7.2); **landed (#967):** the status mark on a closed (retracted / approved) tray row — so the OUT tray's approved items render closed too | Parent-relative anchored (§3 mode `attached`). Embeddable content class: handle is `{ el, update({kind, text}), destroy() }`; `open()`/`close()` are deliberately absent (no open/close lifecycle, §1 obligation 1's amendment). `kind` ∈ `info`/`closed` (unknown → `info`, warned); text via `textContent` only. The terminal-state classification that decides *when* a tray row gets a `closed` badge is the server's `closed: true` on the look_in row (derived from the kinddef, umwelt #976; app.js keeps no state list), not part of the gadget |
 | **text-measure** | *(CSS utilities, not a factory)* | `.gg-clamp2` (item labels, door signs), `.gg-wrap-any` (#350 break-anywhere), `.gg-mono-block` (#351 pre-wrap) | Documented classes only — no JS object |
-| **editor** | `ggEditor({value?, placeholder?, rows?, onInput?})` | proposal composer's `ask`/`why` fields; village charge board's `add-entry` text field; a readable thing's Edit action (interact-menu edit sub-view, umwelt#547) | Embeddable content widget, not anchored/floating — `open()`/`close()`/`update()` are deliberately absent from the handle (no floating/anchor lifecycle to govern; see §1 obligation 1's amendment). `el.value` is a live get+set accessor over the textarea for drop-in compatibility with existing `<input>`-reading collection code (`_collectParamsArgs`, `openActParamsSubView`) |
+| **editor** | `ggEditor({value?, placeholder?, rows?, toolbar?, onInput?})` | proposal composer's `ask`/`why` fields; village charge board's `add-entry` text field; a readable thing's Edit action (interact-menu edit sub-view, umwelt#547) | `toolbar` defaults to on; `toolbar: false` builds no toolbar element and no buttons (not merely hidden), for fields shown as plain text -- the proposal viewer's review `comment` uses `{rows: 6, toolbar: false}` (umwelt#1050). Embeddable content widget, not anchored/floating — `open()`/`close()`/`update()` are deliberately absent from the handle (no floating/anchor lifecycle to govern; see §1 obligation 1's amendment). `el.value` is a live get+set accessor over the textarea for drop-in compatibility with existing `<input>`-reading collection code (`_collectParamsArgs`, `openActParamsSubView`) |
 | **status** | `ggStatus({anchor, parentEl, afterEl?, id?})` | the action-bar outcome line (#957): "took X" / the server's refusal reason / "take…" while in flight | Embeddable `attached` content class: handle is `{ el, show(kind, text), clear(), destroy() }`. `open()`/`close()`/`update()` are deliberately absent — one line of text with no open/close lifecycle and no floating anchor to re-point (§1 obligation 1's amendment). `kind` ∈ `pending`/`ok`/`error`; text via `textContent` only (server reason strings are untrusted); `ok`/`error` auto-clear after ~6 s, a newer `show()` cancels the older timer, `pending` never auto-clears. `el` carries `role="status"` + `aria-live="polite"` |
 | **chip** | `ggChip({parentEl?, id?, onOpen, onClear, onSelectById})` | the selection chip (#936): the one persistent "what is selected" bar — name, kind, short id (+ copy), where; click opens the interact menu for the selection, ✕ clears it, a "select by id" entry takes a pasted id | Embeddable `attached` content class: handle is `{ el, update({name, kind, id, where, notice, noticeKind}), destroy() }`. `open()`/`close()` are deliberately absent (no open/close lifecycle, §1 obligation 1's amendment). Docks INSIDE `#composer` (a full-width flex row of it), so it can never overlap the composer or the surfaces the composer already clears. It is dumb: it owns no selection state (app.js's `selectThing` is the single writer of `state.selection`) and fetches nothing. Every world-derived string (name, kind, id, where, and `notice` — the SERVER's own refusal text, e.g. `in_private_place` / `binned` / 404) goes through `textContent` only, never `innerHTML` (DESIGN.md §12.10). No `id` in `update()` = the empty state (only the select-by-id entry, plus any `notice`) |
 
@@ -246,6 +246,14 @@ gadgets.css, never in feature CSS):
   table-driven build, closed `Object.create(null)` lookup maps,
   textContent-only + `replaceChildren()`, DOM caps (console 100 / crossings
   200).
+- **Dismiss-registry handles** are generic `{el, close()}` objects (a gadget
+  need not be a `ggWindow`; the migrated console registers this way). Escape
+  and an outside click act only on the TOP handle, and never discard a typed
+  draft (#1058). When a gesture is held back by a draft the registry calls the
+  top handle's OPTIONAL `heldDraft()` (#1078); `ggWindow` implements it as a
+  one-line `.gg-window-hint` under the title bar (role=status, cleared on any
+  close, when the draft is emptied, or when the content is replaced). A handle
+  without `heldDraft` is simply not told; it must not be required.
 - Non-goals for v1: no event bus, no state store — the direct-call coupling
   (`render()` closes the interact menu) is small enough to keep until practice
   says otherwise (实践出真知 — build it when it binds, not before).
@@ -292,6 +300,65 @@ viewer switch or logout closes it, so a half-typed form never submits under a
 different session.
 `actPost`'s third parameter `logKind` is the charter's planned signature and is
 accepted but not read; callers keep their own console text.
+
+### 6.3 Inline review comments on a proposal (#1049, slice A)
+
+In the thing viewer a reviewer selects text in the proposal body and clicks
+"Comment on selected text" (enabled only while a non-collapsed selection starts
+inside the body; wherever it ends, the end is clamped to the body, so a drag
+that overshoots below it still quotes the body part; a selection that starts
+outside the body, e.g. in the title, does not count). The control only appears on things whose viewer lists
+a permitted comment action (a typed action whose `requires` contains `comment`,
+any case, and whose `permitted` is not false), because a draft on any other
+thing could never be sent. The no-toolbar `editor` (#1050) opens; Add puts
+`{quote, comment}` on a **pending list** under the body (Edit in place, Delete;
+quote and comment are plain text). The quote has whitespace collapsed and is
+capped at 160 code points plus `…`. Drafts persist per thing in `localStorage`
+under `umwelt.review.drafts.<thingId>` (a JSON array of `{id, quote, comment}`; if
+storage is unavailable the list lives in memory for the session). Any verdict
+form whose `requires` has `comment` then shows "N inline comments will be
+added" and, on Submit, sends ONE existing act with `args.comment =
+composeReview(overall, drafts)`; drafts are cleared on success and kept on a
+refusal. A composed text over 100000 characters is refused in the form and not
+sent. No server, kinddef or engine change.
+
+Each draft has a stable id (`{id, quote, comment}`): Edit, Delete and the
+clear-after-send act by id, so a second tab cannot make them hit the wrong
+draft, and a draft added in another tab while a send is in flight survives it.
+Storage is the truth whenever it answers (a missing entry means no drafts:
+another tab deleted or sent them); memory is used only when storage throws or
+a write failed. If storage rejects a write, memory stays authoritative and the
+list shows a one-line warning that changes, including deletes, will be lost if
+the page is closed or reloaded. After a failed write this tab ignores storage until a save succeeds, so a draft
+another tab adds meanwhile is invisible here and the next successful save from
+this tab overwrites it (an accepted trade-off; the warning says changes can be
+lost). After a send, only the drafts whose id and text
+were sent are cleared. An accepted send whose server effects partly failed
+still counts as recorded: the drafts are cleared and the message says so,
+worded by the failure's type (`notify_author`: "review recorded, but notifying
+the author failed: ..."; any other type: "review recorded, but an effect failed
+(<type>): ..."). Submit is single-shot (re-enabled only after a refusal or a
+failed request, which shows "request failed: ..."). A draft whose quote is no longer in the body
+text is marked "not in current text"; its quote still travels unchanged.
+
+What slice A does not do: the design doc's blocking / non-blocking marks are
+NOT in slice A (deferred). And the count only survives the bell's 80-character
+headline title while the thing's name is short (about 22 characters or fewer
+for request_changes), so do not rely on the count line being visible there.
+
+The wire format (defined once, in `composeReview`; slice B parses it, so it
+must not change silently). The count leads because the first ~175 characters
+are what the author's bell line shows:
+
+```
+Inline review: N comments.        ("Inline review: 1 comment." for one)
+<overall text, if any>
+<blank line>
+1. > QUOTE
+   the comment (every non-empty line indented 3 spaces)
+2. > QUOTE
+   ...
+```
 
 ## 7. Migration policy (incremental, no freeze)
 

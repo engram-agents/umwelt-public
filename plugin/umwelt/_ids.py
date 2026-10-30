@@ -78,6 +78,34 @@ def human_residents() -> frozenset[str]:
     )
 
 
+def _env_handle_set(name: str) -> frozenset[str]:
+    """Parse a comma-separated handle list from env `name`, exactly like
+    `human_residents()`: stripped, folded with `canonical_agent`, empty
+    entries dropped; unset / empty / whitespace-only -> `frozenset()`.
+    Read on every call (no caching) so a world's config is never frozen at
+    import."""
+    raw = os.environ.get(name) or ""
+    return frozenset(
+        n for n in (canonical_agent(part) for part in raw.split(",")) if n
+    )
+
+
+# umwelt #1166: who may administer projects is WORLD CONFIG, not engine
+# literals (registration is open and declared names are accepted, so a handle
+# baked into the engine is claimable by whoever registers it first).
+def project_owner_admins() -> frozenset[str]:
+    """Handles that may add/remove any project's owners and give an ownerless
+    project its first owner (env `UMWELT_PROJECT_OWNER_ADMINS`). Unset ->
+    `frozenset()`: nobody is special."""
+    return _env_handle_set("UMWELT_PROJECT_OWNER_ADMINS")
+
+
+def project_archive_admins() -> frozenset[str]:
+    """Handles that may archive or restore any project (env
+    `UMWELT_PROJECT_ARCHIVE_ADMINS`). Unset -> `frozenset()`."""
+    return _env_handle_set("UMWELT_PROJECT_ARCHIVE_ADMINS")
+
+
 # umwelt #495: the default on-disk path for an agent's ed25519 identity key.
 #
 # This is the ONE place the default path string lives. Both sides of the

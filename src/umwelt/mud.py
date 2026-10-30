@@ -37,6 +37,7 @@ except ImportError:  # pragma: no cover — not available on Windows
 from ._ids import canonical_agent as _canonical_agent
 from . import avatar_status as _avatar_status
 from . import client_auth as _client_auth
+from . import engine_api as _engine_api
 
 
 # umwelt#699: resolved LAZILY (first WorldClient() constructed with no
@@ -132,6 +133,7 @@ class WorldClient:
         headers = {"Content-Type": "application/json"} if data is not None else {}
         if auth_headers:
             headers.update(auth_headers)
+        headers.update(_engine_api.client_headers())  # umwelt#1105
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
             with _client_auth.urlopen_with_cert_fallback(req, self.timeout) as r:
@@ -178,6 +180,8 @@ class WorldClient:
                 continue
             break
         if status >= 400:
+            if _engine_api.is_mismatch_refusal(status, body):
+                raise WorldError(_engine_api.render_mismatch(body))  # umwelt#1105
             raise WorldError(body.get("error", f"request failed (status {status})"))
         return body
 

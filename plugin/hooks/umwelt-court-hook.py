@@ -58,6 +58,7 @@ from pathlib import Path
 # "must run standalone" posture.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from umwelt import client_auth  # noqa: E402
+from umwelt import engine_api  # noqa: E402
 
 CONFIG_PATH = Path.home() / ".umwelt" / "config.json"
 STATE_PATH = Path.home() / ".umwelt" / "court-hook-state.json"
@@ -192,12 +193,16 @@ def _my_court(world_url: str, agent: str) -> list | None:
         return None
     qs = urllib.parse.urlencode({"agent": agent})
     url = f"{world_url.rstrip('/')}/umwelt/my_court?{qs}"
+    headers = {**headers, **engine_api.client_headers()}  # umwelt#1105
     req = urllib.request.Request(url, method="GET", headers=headers)
     try:
         with client_auth.urlopen_with_cert_fallback(req, TIMEOUT_S) as r:
             body = r.read().decode()
             data = json.loads(body) if body else None
     except urllib.error.HTTPError as e:
+        line = engine_api.mismatch_line_from_http_error(e)  # umwelt#1105 C2
+        if line:
+            print(line, file=sys.stderr)
         # Fixed in review (PR #828) -- see umwelt-unseen-hook.py's identical
         # comment: urlopen() raises HTTPError for a non-2xx response, so the
         # previous `if r.status == 401` check inside the `with` block was

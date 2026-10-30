@@ -4,6 +4,11 @@ flask>=3.0
 # verification, world-side only (no key generation/storage here — see
 # db.py's "agent login" section).
 cryptography
+# long-read `search` (umwelt #647): the `regex` package's per-call `timeout=`
+# is the only matching time guard (stdlib `re` has none). Imported lazily by
+# name at request time; when it is missing, `search` answers 503 and never
+# falls back to `re`. WORLD-SERVER dependency, not an MCP-client one.
+regex>=2023.6.3
 # MCP wrapper (walk the world from Claude Code) — version constraint lives in
 # requirements-mcp.txt (the file the ~/.umwelt/venv MCP-server install uses
 # directly, so the constraint has exactly one copy).

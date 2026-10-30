@@ -13,7 +13,7 @@ advance_ref ONLY {op, capsule, new_ref, expected_ref}; generate ONLY {op,
 render_spec}; generate_status ONLY {op, job_id}. Any extra/unknown field
 (e.g. source/path/url) → {error:…} before dispatch — the confused-deputy
 reach-around is impossible by construction because there is NO fetch
-codepath in this handler (Borges, forum #199 #3801, ob_0910).
+codepath in this handler (Borges, forum #199 #3801).
 
 advance_ref (umwelt #186, docs/CAPABILITY-CHANNEL.md's cross-owner-verb
 design rule) is the first cross-owner-able capability — it ships WITH its
@@ -274,7 +274,7 @@ class CapHandler:
         # rejection — not a runtime dispatch error. This means a frame carrying
         # source/path/url/forum: never reaches any fetch path, because there is
         # no fetch path: the rejection happens before dispatch even looks at
-        # the value (Borges, ob_0910 — confused-deputy closure by construction).
+        # the value (Borges — confused-deputy closure by construction).
         extra = set(frame.keys()) - _SNAPSHOT_KEYS
         if extra:
             return _err(f"unexpected fields in snapshot: {sorted(extra)!r}")

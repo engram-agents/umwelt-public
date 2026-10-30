@@ -16,6 +16,9 @@
 # mentions.py joined in umwelt #511 PR B: mcp_server's `say` wrapper imports
 # the shared @-mention parser instead of a hand-copied regex; it's stdlib
 # `re` only, same vendoring posture as the others.
+# engine_api.py joined in umwelt #1105: every client sends its ENGINE_API
+# number (X-Umwelt-Client-API) and renders the gate's refusal through it;
+# stdlib `re` only, same vendoring posture.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,5 +33,6 @@ cp "$repo_root/src/umwelt/avatar_status.py" "$dest/avatar_status.py"
 cp "$repo_root/src/umwelt/client_auth.py" "$dest/client_auth.py"
 cp "$repo_root/src/umwelt/_ids.py" "$dest/_ids.py"
 cp "$repo_root/src/umwelt/mentions.py" "$dest/mentions.py"
+cp "$repo_root/src/umwelt/engine_api.py" "$dest/engine_api.py"
 
-echo "build-umwelt-plugin: synced src/umwelt/{__init__.py,mcp_server.py,avatar_status.py,client_auth.py,_ids.py,mentions.py} -> plugin/umwelt/"
+echo "build-umwelt-plugin: synced src/umwelt/{__init__.py,mcp_server.py,avatar_status.py,client_auth.py,_ids.py,mentions.py,engine_api.py} -> plugin/umwelt/"

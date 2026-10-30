@@ -4,7 +4,8 @@
     python -m umwelt.world_backup --alarm [--url U] [--agent A] [--to-agent B]
     (sender: $UMWELT_BACKUP_ALARM_FROM, else the generic "world-backup";
      recipient: $UMWELT_BACKUP_ALARM_TO, else empty = unaddressed crossing;
-     destination place id: $UMWELT_BACKUP_ALARM_PLACE, else place_office)
+     destination place id: $UMWELT_BACKUP_ALARM_PLACE, else the hub role of
+     the world at --db, else place_square)
 
 Contract (pinned by tests/test_world_backup.py):
 
@@ -35,6 +36,8 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+from umwelt.engine_api import client_headers
 
 NAME_RE = re.compile(r"^umwelt-\d{8}T\d{6}Z\.db$")
 _TMP_PREFIX = ".umwelt-backup-tmp-"
@@ -274,7 +277,7 @@ def alarm(world_url, *, agent, to_agent, destination, message,
     req = urllib.request.Request(
         world_url.rstrip("/") + "/umwelt/send_crossing",
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **client_headers()},
         method="POST")
     try:
         with opener(req, timeout=15) as resp:
@@ -295,6 +298,14 @@ def _env_deadline():
         return float(raw) if raw else DEFAULT_DEADLINE_S
     except ValueError:
         return DEFAULT_DEADLINE_S
+
+
+def _default_destination(db_path) -> str:
+    """The hub role of the world at `db_path`, read-only; place_square when
+    it cannot be read. Never raises (the lookup swallows every read error),
+    never writes."""
+    from umwelt import db
+    return db.role_place_id_readonly(db_path, "hub")
 
 
 def main(argv=None) -> int:
@@ -323,10 +334,13 @@ def main(argv=None) -> int:
     # Recipient comes from the install-time drop-in; empty = unaddressed.
     p.add_argument("--to-agent",
                    default=os.environ.get("UMWELT_BACKUP_ALARM_TO", ""))
-    # A world PLACE id (not an agent); the issue names place_office.
+    # A world PLACE id (not an agent). Unset: the world's hub role, read
+    # from --db (umwelt#1043). The old default was place_office, which exists
+    # only on worlds where someone created it (it exists on the live world);
+    # installs that relied on it must now set UMWELT_BACKUP_ALARM_PLACE
+    # explicitly.
     p.add_argument("--destination",
-                   default=os.environ.get("UMWELT_BACKUP_ALARM_PLACE")
-                   or "place_office")
+                   default=os.environ.get("UMWELT_BACKUP_ALARM_PLACE") or None)
     p.add_argument("--message",
                    default="umwelt world-DB backup FAILED -- see "
                            "`journalctl --user -u umwelt-world-backup.service`")
@@ -334,6 +348,8 @@ def main(argv=None) -> int:
     if a.alarm:
         from umwelt import client_auth
         a.url = client_auth.resolve_world_url(explicit=a.url)
+        if not a.destination:
+            a.destination = _default_destination(a.db)
         return alarm(a.url, agent=a.agent, to_agent=a.to_agent,
                      destination=a.destination, message=a.message)
     if a.deadline_s <= 0:

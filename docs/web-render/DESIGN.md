@@ -11,8 +11,8 @@ model; §10 renumbers the old M3/M4 (avatar-customization / real-model) to M6/M7
 for the write-layer M3–M5 (the "M3" in Kepler's #267 means the *write layer*, not the old
 avatar-customization M3 — this doc kills that ambiguity).
 
-Grounds `cj_0076` (spatial rendering = the natural eventual human-agent interface) and
-obeys the load-bearing constraint `ob_2694`: **the human game-interface is *just a
+Grounds the framing that spatial rendering is the natural eventual human-agent interface, and
+obeys the load-bearing constraint: **the human game-interface is *just a
 rendering* of the agent-facing world SSoT — a thin, swappable client, never a second
 source of truth.**
 
@@ -60,7 +60,7 @@ new *authority* in the render layer.
 **Why a gateway and not browser→world directly:** image generation and moderation must be
 server-side; the browser must not hold model creds; one aggregated `scene` call beats N
 world calls; and a separate service keeps the safety-critical world server pristine and
-lets the render layer iterate fast (exactly ob_2694 — rendering is the swappable layer).
+lets the render layer iterate fast (rendering is the swappable layer).
 
 ---
 
@@ -68,7 +68,7 @@ lets the render layer iterate fast (exactly ob_2694 — rendering is the swappab
 
 Confirmed from the schema: `things`/`places` carry no x/y/grid/position columns. Grid
 placement is therefore **presentation state owned by the render layer**, not world state —
-which is also the correct home for it under ob_2694.
+which is also the correct home for it.
 
 - **Per-place grid `A×B`:** the gateway picks a grid size per place (default = smallest
   grid that fits its things + present avatars with padding, min 8×6; configurable).
@@ -214,7 +214,7 @@ store (key = sha256(render_spec)) ─▶ sprite_ref ─▶ stamp on blueprint me
   `/sprite/<hash>`). v1 = the world CAS (`cas:sha256:<hash>`, already has a public read
   route) for content-addressed provenance — ENGRAM's native value. Start local; promote.
 
-**This is the ax_0010 spine of the whole project:** build and *run* the entire
+**This is the spine of the whole project:** build and *run* the entire
 pipeline + web experience end-to-end on the procedural backend, prove it, then swap in the
 model as the very last step. The model is a quality upgrade to one function, not a
 prerequisite for anything.
@@ -357,7 +357,7 @@ The browser is a **view + intent-sender**. It holds NO authority and NO world-tr
 mutation is an existing engine verb; the gateway is a thin authenticated proxy; the world
 server stays **sole writer and sole rule-keeper**. If the client can render an action the
 engine would refuse, that is a *client* bug — never the reverse. No parallel client physics,
-no second source of truth. (ob_2694; Kepler #267.)
+no second source of truth. (Kepler #267.)
 
 ### 12.1b Players, not NPCs — human–agent symmetry (Lei's axiom, 2026-07-19)
 
@@ -382,7 +382,7 @@ affordance agents don't get (or the reverse) violates this axiom unless the
 asymmetry is provably client-side or named here. Every render/menu/interaction PR
 states its human–agent symmetry in one line of its description. (Lei, 2026-07-19,
 verbatim spirit: "only a rendering and I/O bandwidth difference, not two fundamentally
-different actors." Kepler's graph: ob_0376; forum #267 post 4762.)
+different actors." Kepler's graph: forum #267 post 4762.)
 
 ### 12.2 The new trust boundary — human identity via a gateway session
 
@@ -422,7 +422,7 @@ never in a client-asserted field.
     returns `{identity, csrf_token}`.
   - `GET /session` → `{identity | "spectator"}`. `POST /session/logout` clears it.
   - **v0 trust = roster-pick, private-network-gated.** No credential yet — picking `leona` from an admitted private-network peer
-    *is* becoming leona, the exact caller-declared posture the world has today (ob_2721),
+    *is* becoming leona, the exact caller-declared posture the world has today,
     relocated to the gateway session. This was the historical v0 acceptance
     under the then-LAN-only gate; the live LAN+tailnet boundary does not turn
     network admission into identity, and later session/auth work supersedes
@@ -518,7 +518,7 @@ so there is no cell-level truth for a server to be authoritative about:
 - **Examine** is already read-only (`GET /inspect` = `look_at`; `/scene` carries `actions[]`
   per thing). Click a thing → its detail + a context menu of its verbs.
 - **Use** → `use` intent → the world's existing **sandboxed** `use()` endpoint. The sandbox
-  is **untouched** — the one safety-critical surface keeps its exact guarantees (ob_2694). A
+  is **untouched** — the one safety-critical surface keeps its exact guarantees. A
   human triggering `use()` runs the same isolated-tempdir / no-network / timed sandbox an
   agent does; and because `forge` is *not* on the write surface (§12.3), a human cannot
   introduce new executables from the client — only run ones already in the world.
@@ -587,6 +587,6 @@ M5 render requirement so it isn't scattered.)
 ---
 
 *Next: hand this v0.2 as design-intent to Luria for M3 (he owns the build pipeline: intent →
-coder-fairy spec → dispatch → review, per cs_0069 — I do NOT write his spec). I hold design +
+coder-fairy spec → dispatch → review, I do NOT write his spec). I hold design +
 security review, and stay hands-on in the code where it's right. Kepler's fast colleague read
 on §12.2–12.3 is the gate before M3 merges.*

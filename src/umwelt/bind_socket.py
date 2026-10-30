@@ -202,6 +202,7 @@ than decided silently.
 
 from __future__ import annotations
 
+import errno
 import json
 import grp
 import os
@@ -225,6 +226,14 @@ from ._ids import canonical_agent
 _BIND_SOCKET_INSTALL_HINT = (
     "sudo install -d -m 0750 -o <server-uid> -g agents "
     "/usr/local/lib/umwelt/run")
+
+# umwelt#1071: usable bytes of an AF_UNIX path (sun_path is 108 bytes on
+# Linux, 104 on macOS/BSD; one is reserved for the terminating NUL). Python
+# exposes no sizeof(sun_path), so this is a constant. It is checked BEFORE
+# bind() so the answer does not depend on the OS's error text; bind()'s own
+# errno-less "AF_UNIX path too long" OSError is still recognised below in
+# case a platform's real limit is lower than this constant.
+_AF_UNIX_PATH_MAX = 103 if sys.platform == "darwin" else 107
 
 # Socket file mode -- see the module docstring's "Socket file mode" section.
 # Owner+group rw; SO_PEERCRED still authorizes the bind target, this is
@@ -416,6 +425,17 @@ class BindSocketHandler:
         self._thread: threading.Thread | None = None
         self._shutdown = threading.Event()
 
+    def _path_too_long_error(self, path_len: int) -> RuntimeError:
+        """umwelt#1071: an over-long AF_UNIX path is an operator-config
+        problem, not a directory-permission one -- no sudo-install hint."""
+        exc = RuntimeError(
+            f"cannot bind identity-bind socket at {self._sock_path!r} -- "
+            f"the path is {path_len} bytes, longer than the AF_UNIX limit "
+            f"of {_AF_UNIX_PATH_MAX} bytes on this platform. Use a shorter "
+            "--bind-socket-path.")
+        exc.reason_class = "socket_path_too_long"
+        return exc
+
     def start(self) -> None:
         """Bind the UDS, chown+chmod it to the shared-eligibility mode,
         start listening, accept connections in a daemon thread.
@@ -450,6 +470,13 @@ class BindSocketHandler:
         mechanically on a SPECIFIC class, not just "something's wrong",
         needs this rather than parsing `.error`'s free text.
         """
+        # umwelt#1071: first, before ANY filesystem call (mkdir/exists/
+        # unlink below would otherwise hit ENAMETOOLONG on a >255-byte
+        # final component and misreport it as stale_socket_removal).
+        path_len = len(os.fsencode(self._sock_path))
+        if path_len > _AF_UNIX_PATH_MAX:
+            raise self._path_too_long_error(path_len)
+
         try:
             sock_gid = grp.getgrnam(self._sock_group).gr_gid
         except KeyError:
@@ -511,28 +538,41 @@ class BindSocketHandler:
         try:
             self._server_sock.bind(self._sock_path)
         except OSError as e:
-            # umwelt#534 (Ariadne): the directory can exist and pass the
-            # path-squatting safety check above -- which only tests
-            # group/world write bits, not who OWNS it -- and this
-            # process's own uid can still be unable to write into it
-            # (a root-owned 0755 directory from a plain `mkdir -p` rather
-            # than the documented install command is exactly this case,
-            # and it is the FIRST thing a human unfamiliar with the
-            # `-o <server-uid>` requirement will actually run). bind()
-            # raises a bare OSError here, not a RuntimeError -- reraised
-            # as RuntimeError so main() has exactly one exception type to
-            # catch regardless of which of this method's four failure
-            # points fired.
+            # umwelt#1071: classify instead of treating every bind() OSError
+            # as a permission problem. bind() raises a bare OSError, not a
+            # RuntimeError -- reraised as RuntimeError so main() has exactly
+            # one exception type to catch whichever class fired.
+            if e.errno in (errno.EACCES, errno.EPERM):
+                # umwelt#534 (Ariadne): the directory can exist and pass the
+                # path-squatting safety check above -- which only tests
+                # group/world write bits, not who OWNS it -- and this
+                # process's own uid can still be unable to write into it
+                # (a root-owned 0755 directory from a plain `mkdir -p` rather
+                # than the documented install command is exactly this case,
+                # and it is the FIRST thing a human unfamiliar with the
+                # `-o <server-uid>` requirement will actually run). bind()
+                # raises a bare OSError here, not a RuntimeError -- reraised
+                # as RuntimeError so main() has exactly one exception type to
+                # catch regardless of which of this method's four failure
+                # points fired.
+                exc = RuntimeError(
+                    f"cannot bind identity-bind socket at {self._sock_path!r} "
+                    f"-- {e}. The directory exists and passed the path-"
+                    "squatting safety check, but this process's own uid "
+                    "cannot write into it -- confirm it was provisioned with "
+                    f"the documented command: `{_BIND_SOCKET_INSTALL_HINT}` "
+                    "(a plain `mkdir -p` run as root creates a root-owned "
+                    "directory no other uid, including the server's own, can "
+                    "write into).")
+                exc.reason_class = "socket_bind_permission"
+                raise exc from e
+            if e.errno == errno.ENAMETOOLONG or (
+                    e.errno is None and "path too long" in str(e).lower()):
+                raise self._path_too_long_error(path_len) from e
             exc = RuntimeError(
                 f"cannot bind identity-bind socket at {self._sock_path!r} "
-                f"-- {e}. The directory exists and passed the path-"
-                "squatting safety check, but this process's own uid "
-                "cannot write into it -- confirm it was provisioned with "
-                f"the documented command: `{_BIND_SOCKET_INSTALL_HINT}` "
-                "(a plain `mkdir -p` run as root creates a root-owned "
-                "directory no other uid, including the server's own, can "
-                "write into).")
-            exc.reason_class = "socket_bind_permission"
+                f"-- {e}.")
+            exc.reason_class = "socket_bind_failed"
             raise exc from e
         # See module docstring's "Socket file mode" -- filesystem
         # eligibility (group membership + mode) is defense in depth

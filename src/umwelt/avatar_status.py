@@ -17,7 +17,7 @@ prefix and the timestamp suffix are exactly the parts that legitimately
 differ per client.
 
 `activity_line` is caller-declared public text (the #268 heartbeat
-endpoint, forgeable v0 identity — ob_0938). This module never interprets it
+endpoint, forgeable v0 identity). This module never interprets it
 as markup, only ever returns it as a plain string for a caller to place
 directly into terminal/tool-result text. Any future HTML consumer (the
 web-render gateway, forum #267/M3/M5) MUST escape it before inserting into

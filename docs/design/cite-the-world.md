@@ -1,7 +1,7 @@
 # Cite the World — engine-attested event records as ENGRAM evidence
 
 **Status:** design draft for Lei's review (issue #134). Nothing here is built.
-**Author:** Kepler, 2026-07-12. Source vision: Lei's morning notes (ob_0276).
+**Author:** Kepler, 2026-07-12. Source vision: Lei's morning notes.
 
 ## 1. What this is
 
@@ -140,7 +140,7 @@ history).
 ## 5. The Library surface
 
 The Library (place) gets an **evidence archive**: search and fetch of event
-records. Per dv_0020 (the world exposes scoping primitives, not query verbs),
+records. Per the rule that the world exposes scoping primitives, not query verbs,
 v0 is deliberately thin:
 
 - A Library **thing** (engine-view, like the desk) rendering recent/searched

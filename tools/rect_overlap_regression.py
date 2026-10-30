@@ -38,6 +38,8 @@ into `ci.yml`. Instead:
     (an internal CI workflow, not in this release) by hand
     (`workflow_dispatch` only — it never runs on push/PR) when a reviewer's
     local environment has no browser to test with.
+  - The check also runs nightly, as steps of `nightly.yml`'s `full-suite`
+    job (umwelt #1144).
 
 See the internal webrender test file (search "umwelt #282"; not in this release) for the
 pointer left next to the served-source tests this tool complements, and
@@ -58,7 +60,8 @@ What this script does:
   3. Reads back `getBoundingClientRect()` for the self-cursor
      (`.avatar-cursor`) and for the first non-self avatar in DOM order
      (the one PR#277's bug made invisible, since `cursorIndex` defaults to
-     0 on every fresh scene and both lanes share the same left origin).
+     0 on every fresh scene and column 0 puts the cursor exactly on that
+     avatar -- see MOCK_SCENE's comment below).
   4. Asserts the two rects are NOT byte-for-byte identical -- if they are,
      the occluded avatar is being fully painted-over again, i.e. the
      regression this tool exists to catch has come back.
@@ -83,12 +86,28 @@ Exit codes:
        pip install playwright && playwright install chromium
   3  the gateway subprocess never became ready (environment/startup
      problem unrelated to the regression itself).
+  4  the page was not laid out: a measured rect has zero width or height
+     (e.g. the street is hidden behind the login gate). Not a verdict on
+     the regression either way -- two zero rects are trivially "identical"
+     and were once reported as exit 1 (umwelt #1132).
+  5  the render check could not run: Playwright raised an error (a selector
+     that matches nothing, a launch failure, a navigation or networkidle
+     timeout). Not a verdict on the regression either way; the first stderr
+     line is an ERROR line naming the exception, the first line of its
+     message and the step; Playwright's call log follows indented
+     (umwelt #1147). It was once exit 1, the regression code, which is how
+     #1132 hid. A dead Playwright driver also exits 5 (umwelt #1151). In the
+     runs measured through this tool (6, 2 scenarios) it surfaced as a
+     Playwright error (TargetClosedError). Run standalone it raised a plain
+     Exception, which this tool never showed; that case is recognised by
+     its full message.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -105,14 +124,17 @@ EXIT_OK = 0
 EXIT_REGRESSION = 1
 EXIT_MISSING_DEPENDENCY = 2
 EXIT_GATEWAY_NOT_READY = 3
+EXIT_NOT_LAID_OUT = 4
+EXIT_COULD_NOT_RUN = 5
 
 # Same scene shape proven (during PR#277's original manual investigation)
-# to reproduce the bug: `cursorIndex` defaults to 0 on every fresh scene,
-# targeting the single upper-lane thing below -- and since the self-cursor
-# avatar (removed from #street-lower's normal flex flow) and the first
-# *other* avatar left in #street-lower's flex flow both align to the same
-# left origin, the self-cursor's computed position lands exactly on top of
-# that first other avatar.
+# to reproduce the bug: `cursorIndex` defaults to 0 on every fresh scene.
+# Column 0 holds the land-lane sign and the first non-self road avatar,
+# which sit at the same x in #street's frame, so the self-cursor (pulled
+# out of the road band's flow) lands exactly on top of that avatar. That
+# alignment holds only while nav x is measured in one frame (umwelt #1132:
+# from #807 until the streetX() fix, the cursor sat 16px left of road
+# items and this check could not fail).
 MOCK_SCENE: dict[str, Any] = {
     "place": {"label": "The Square", "description": "test"},
     "parent": None,
@@ -120,13 +142,13 @@ MOCK_SCENE: dict[str, Any] = {
     "exits": [],
     "avatars": [
         {"agent": a, "avatar_id": f"a-{a}", "name": a.capitalize(), "emotion": "neutral"}
-        for a in ["luria", "kepler", "borges", "ariadne", "sol"]
+        for a in ["agent-a", "agent-b", "agent-c", "agent-d", "agent-e"]
     ],
 }
 
 # The mock scene's `identity` (self) and the expected first-non-self avatar
-# by DOM order (avatars list order, minus self) -- "kepler" here.
-SELF_IDENTITY = "luria"
+# by DOM order (avatars list order, minus self) -- "agent-b" here.
+SELF_IDENTITY = "agent-a"
 
 
 def _free_port() -> int:
@@ -197,7 +219,19 @@ def _start_gateway(port: int) -> subprocess.Popen:
     )
 
 
+# umwelt #1151: when Playwright's Node driver process dies, the sync API can raise
+# a plain `Exception`, not a `playwright.sync_api.Error`, so the Error catch in
+# run_check misses it. Raised at playwright/_impl/_transport.py:171 (Playwright
+# 1.64.1); the sync layer prefixes `<Class>.<method>: `. Measured sample:
+#   Page.evaluate: Connection closed while reading from the driver
+# Recognised only by a FULL match of that shape: a different message, the text
+# inside a longer message, or the bare text without the prefix still propagates.
+_DRIVER_CLOSED = "Connection closed while reading from the driver"
+_DRIVER_DEAD_RE = re.compile(r"^\w+\.\w+: " + re.escape(_DRIVER_CLOSED) + r"$")
+
+
 def run_check(port: int) -> int:
+    from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
 
     base_url = f"http://127.0.0.1:{port}"
@@ -215,44 +249,87 @@ def run_check(port: int) -> int:
             )
             return EXIT_GATEWAY_NOT_READY
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch()
-            try:
-                page = browser.new_page()
-                page.goto(f"{base_url}/")
-                page.evaluate(
-                    "(identity) => { state.identity = identity; }", SELF_IDENTITY,
-                )
-                page.evaluate("(scene) => { render(scene); }", MOCK_SCENE)
-                # `.avatar-cursor` carries `transition: left .12s ease, top
-                # .12s ease` -- give any transition triggered by this
-                # render() call a moment to settle before measuring, so a
-                # mid-transition rect never gets mistaken for the resting
-                # position.
-                page.wait_for_timeout(200)
+        step = "starting Playwright"
+        try:
+            with sync_playwright() as p:
+                step = "launching the browser"
+                browser = p.chromium.launch()
+                try:
+                    step = "loading the page"
+                    page = browser.new_page()
+                    page.goto(f"{base_url}/")
+                    # umwelt #384 (#388): a logged-out page loads behind the
+                    # login gate (body.gate-active hides #app-shell), so nothing
+                    # is laid out. Let the page's own refreshSessionStatus()
+                    # settle (it can reset state.identity), then drop the gate
+                    # the same way a login does.
+                    step = "waiting for networkidle"
+                    page.wait_for_load_state("networkidle")
+                    step = "driving the page (setGateActive / identity / render)"
+                    page.evaluate("() => { setGateActive(false); }")
+                    page.evaluate(
+                        "(identity) => { state.identity = identity; }", SELF_IDENTITY,
+                    )
+                    page.evaluate("(scene) => { render(scene); }", MOCK_SCENE)
+                    # `.avatar-cursor` carries `transition: left .12s ease, top
+                    # .12s ease` -- give any transition triggered by this
+                    # render() call a moment to settle before measuring, so a
+                    # mid-transition rect never gets mistaken for the resting
+                    # position.
+                    page.wait_for_timeout(200)
 
-                self_rect = page.eval_on_selector(
-                    ".avatar-cursor",
-                    "el => { const r = el.getBoundingClientRect(); "
-                    "return {left: r.left, top: r.top, right: r.right, bottom: r.bottom}; }",
-                )
-                overlapped_rect = page.eval_on_selector(
-                    "#street-lower .item.avatar",
-                    "el => { const r = el.getBoundingClientRect(); "
-                    "return {left: r.left, top: r.top, right: r.right, bottom: r.bottom}; }",
-                )
-                overlapped_style = page.eval_on_selector(
-                    "#street-lower .item.avatar",
-                    "el => { const cs = getComputedStyle(el); "
-                    "return {opacity: cs.opacity, outline: cs.outline, "
-                    "transform: cs.transform}; }",
-                )
-            finally:
-                browser.close()
+                    step = "measuring rects and styles"
+                    self_rect = page.eval_on_selector(
+                        ".avatar-cursor",
+                        "el => { const r = el.getBoundingClientRect(); "
+                        "return {left: r.left, top: r.top, right: r.right, bottom: r.bottom}; }",
+                    )
+                    overlapped_rect = page.eval_on_selector(
+                        "#street-road .item.avatar",
+                        "el => { const r = el.getBoundingClientRect(); "
+                        "return {left: r.left, top: r.top, right: r.right, bottom: r.bottom}; }",
+                    )
+                    overlapped_style = page.eval_on_selector(
+                        "#street-road .item.avatar",
+                        "el => { const cs = getComputedStyle(el); "
+                        "return {opacity: cs.opacity, outline: cs.outline, "
+                        "transform: cs.transform}; }",
+                    )
+                finally:
+                    browser.close()
+        except Exception as exc:  # noqa: BLE001 - re-raised below unless recognised
+            # A Playwright failure is "could not run", never a verdict: it
+            # once exited 1, the regression code (umwelt #1147, #1132). Only
+            # Playwright's own error base class, or the dead-driver plain
+            # Exception (umwelt #1151, matched in full by message), is caught;
+            # a bug in this script's Python should still traceback.
+            if not isinstance(exc, PlaywrightError) and not _DRIVER_DEAD_RE.fullmatch(str(exc)):
+                raise
+            # str(exc) is multi-line (a `Call log:` block): keep the ERROR line
+            # a true single line, and indent the rest for diagnosis.
+            first, *rest = (str(exc).splitlines() or [""])
+            print(
+                f"ERROR: the render check could not run: "
+                f"{type(exc).__name__}: {first} (while {step})",
+                file=sys.stderr,
+            )
+            for line in rest:
+                print(f"  {line}", file=sys.stderr)
+            return EXIT_COULD_NOT_RUN
 
         print(f"self-cursor (.avatar-cursor) rect:      {self_rect}")
-        print(f"occluded avatar (first in #street-lower) rect: {overlapped_rect}")
+        print(f"occluded avatar (first in #street-road) rect: {overlapped_rect}")
         print(f"occluded avatar computed style:          {overlapped_style}")
+
+        for label, rect in (("self-cursor", self_rect), ("occluded avatar", overlapped_rect)):
+            if rect["right"] <= rect["left"] or rect["bottom"] <= rect["top"]:
+                print(
+                    f"\nERROR: the {label}'s rect has zero width or height, so "
+                    "the page was not laid out (is the street hidden, e.g. "
+                    "behind the login gate?). No verdict on the regression.",
+                    file=sys.stderr,
+                )
+                return EXIT_NOT_LAID_OUT
 
         identical = (
             self_rect["left"] == overlapped_rect["left"]

@@ -50,6 +50,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from umwelt import client_auth  # noqa: E402
+from umwelt import engine_api  # noqa: E402
 from umwelt.gh_reconcile import default_poster  # noqa: E402
 
 _TOOL_ACTOR = "gh-backfill"
@@ -63,7 +64,7 @@ def default_fetch_json(url: str) -> dict:
     """Real HTTP GET, JSON-decoded. Injectable (mirrors default_poster's
     role for writes) so tests can drive _walk_bare_number_tasks against a
     fake tree with no network call."""
-    req = urllib.request.Request(url)
+    req = urllib.request.Request(url, headers=engine_api.client_headers())  # umwelt#1105
     with client_auth.urlopen_with_cert_fallback(req, 10) as r:
         return json.loads(r.read().decode())
 
